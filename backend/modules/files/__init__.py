@@ -1,0 +1,38 @@
+"""Descriptor for the always-on Files base."""
+from __future__ import annotations
+
+from pathlib import Path
+
+from module_descriptor import BackupComponent, ModuleDescriptor
+
+
+def _routers() -> list:
+    """The Files base HTTP surface, imported lazily at app-composition time."""
+    from routers.files import router as files_router
+
+    return [files_router]
+
+
+def _backup_components() -> tuple[BackupComponent, ...]:
+    # User-authored rows are in the suite user DB; only attachment bytes need
+    # separate coverage. The disposable Files index is deliberately excluded.
+    return (BackupComponent("file_attachments", "files", "file_attachments", "attachments"),)
+
+
+def descriptor(suite_home: Path, version: str) -> ModuleDescriptor:
+    home = suite_home / "base"
+    return ModuleDescriptor(
+        slug="files",
+        name="Files",
+        description="Browse and organize your local files.",
+        home=home,
+        database=home / "files.sqlite",
+        credentials=None,
+        api_prefix="/api/files",
+        log_prefix="files",
+        user_agent=f"Keivotos/{version} (Files)",
+        disableable=False,
+        is_base=True,
+        router_provider=_routers,
+        backup_components_provider=_backup_components,
+    )

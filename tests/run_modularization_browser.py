@@ -1,0 +1,187 @@
+"""Build current UI into scratch space and run timed modularization checks.
+
+Requires external Node, Playwright and Chromium; does not install dependencies,
+change frontend/dist, restart the live server or use the real library.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import socket
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+
+ROOT = Path(__file__).resolve().parents[1]
+SERVER = """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd() / 'backend'))
+import server
+from fastapi.staticfiles import StaticFiles
+import uvicorn
+server.FRONTEND_DIST = Path(sys.argv[1])
+for route in server.app.routes:
+    if getattr(route, 'name', None) == 'frontend':
+        route.app = StaticFiles(directory=sys.argv[1], html=True)
+if len(sys.argv)>3 and sys.argv[3]=='youtube':
+    sys.path.insert(0, str(Path.cwd() / 'tests'))
+    from browser_youtube_fixture import install
+    install(Path(sys.argv[4]))
+uvicorn.run(server.app, host='127.0.0.1', port=int(sys.argv[2]))
+"""
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--node', default=shutil.which('node'))
+    parser.add_argument('--dist', type=Path, help='Prebuilt scratch frontend; skip the runner build')
+    parser.add_argument('--script', choices=('modularization', 'backup', 'danbooru', 'settings', 'import', 'modules', 'settings_failures', 'appearance', 'video', 'manga', 'youtube', 'language', 'ost', 'module_locations', 'storage', 'absence'), default='modularization')
+    parser.add_argument('--output', required=True, type=Path, help='New directory for logs, screenshots and timing report')
+    args = parser.parse_args()
+    if not args.node:
+        parser.error('Provide --node /path/to/node')
+    windows_node = str(args.node).lower().endswith('.exe')
+
+    def node_path(path: Path) -> str:
+        if not windows_node:
+            return str(path)
+        return subprocess.check_output(['wslpath', '-w', str(path)], text=True).strip()
+
+    output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    with tempfile.TemporaryDirectory(prefix='keivotos-modularization-') as temporary:
+        base = Path(temporary)
+        home = base / 'home'
+        home.mkdir()
+        (home / 'config.json').write_text(json.dumps({'default_library_created': True}))
+        if args.script == 'storage':
+            thumbnails=home/'base/thumbnails';thumbnails.mkdir(parents=True)
+            for suffix in ('','_600','_1200'):
+                (thumbnails/('a'*32+'_v4'+suffix+'.webp')).write_bytes(b'x'*1048576)
+            (thumbnails/('b'*32+'_v3.webp')).write_bytes(b'x'*1048576)
+            (thumbnails/'keep.json').write_text('preserved')
+            media=base/'media';media.mkdir()
+            (media/'indexed.bin').write_bytes(b'x'*1536)
+        if args.script == 'danbooru':
+            from browser_library import seed_library
+            seed_library(home)
+        if args.script == 'video':
+            from browser_video_fixture import seed_videos
+            seed_videos(base / 'media')
+        if args.script == 'manga':
+            from browser_manga_fixture import seed_manga
+            seed_manga(base / 'media')
+        if args.script == 'youtube':
+            from browser_youtube_fixture import seed
+            seed(base / 'media')
+        if args.script == 'language':
+            from browser_language_fixture import seed_language
+            seed_language(base / 'media')
+        if args.script == 'ost':
+            from browser_ost_fixture import seed_ost
+            seed_ost(base / 'media')
+        if args.script == 'module_locations':
+            media = base / 'media'
+            (media / 'Deep' / '子').mkdir(parents=True)
+            (media / 'Nested').mkdir()
+            (media / 'Deep' / '子' / 'same.txt').write_text('outer', encoding='utf-8')
+            (media / 'Nested' / 'same.txt').write_text('inner', encoding='utf-8')
+        project = ROOT
+        if args.script == 'absence':
+            project = base / 'source'
+            project.mkdir()
+            shutil.copytree(ROOT / 'backend', project / 'backend',
+                            ignore=shutil.ignore_patterns('danbooru', 'video', 'manga', 'youtube', 'language', 'ost', '__pycache__'))
+            for name in ('app.py', 'config.json'):
+                shutil.copy2(ROOT / name, project / name)
+            shutil.copytree(ROOT / 'frontend', project / 'frontend',
+                            ignore=shutil.ignore_patterns('node_modules', 'dist', 'danbooru', 'video', 'manga', 'youtube', 'language', 'ost'))
+            (project / 'frontend/node_modules').symlink_to(ROOT / 'frontend/node_modules', target_is_directory=True)
+            media = base / 'media'
+            media.mkdir()
+            (media / 'preserved.txt').write_text('Files-only preservation fixture')
+        dist = args.dist.resolve() if args.dist else (
+            project / 'frontend/dist' if args.script == 'absence' else base / 'frontend')
+        if args.script == 'module_locations':
+            # Expose only the internal navigation action in a disposable build.
+            # The actual Files/registry code is copied unchanged and exercised
+            # from the same origin as the isolated backend.
+            scratch_frontend = base / 'frontend-source'
+            shutil.copytree(ROOT / 'frontend', scratch_frontend,
+                            ignore=shutil.ignore_patterns('node_modules', 'dist', '__pycache__'))
+            (scratch_frontend / 'node_modules').symlink_to(ROOT / 'frontend/node_modules', target_is_directory=True)
+            app_source = scratch_frontend / 'src/App.svelte'
+            app_text = app_source.read_text()
+            app_text = app_text.replace("  import { onMount } from 'svelte';",
+                                        "  import { onMount } from 'svelte';\n  import { showInFiles } from './modules/registry';")
+            app_text = app_text.replace('  onMount(() => { void initializeModules(); });',
+                                        '  onMount(() => { (window as any).__showInFiles = showInFiles; void initializeModules(); });')
+            app_source.write_text(app_text)
+            dist = base / 'frontend'
+            build_node = shutil.which('node') or args.node
+            with (output / 'build.log').open('w') as build_log:
+                subprocess.run([build_node, 'node_modules/vite/bin/vite.js', 'build', '--outDir', str(dist)],
+                               cwd=scratch_frontend, stdout=build_log, stderr=subprocess.STDOUT, check=True)
+        if args.dist and args.script == 'absence':
+            placeholder = project / 'frontend/dist/index.html'
+            placeholder.parent.mkdir(parents=True, exist_ok=True)
+            placeholder.write_text('scratch frontend route placeholder')
+        if not args.dist and args.script != 'module_locations':
+            with (output / 'build.log').open('w') as log:
+                subprocess.run([args.node, 'node_modules/vite/bin/vite.js', 'build', '--outDir', str(dist)],
+                               cwd=project / 'frontend', stdout=log, stderr=subprocess.STDOUT, check=True)
+        with socket.socket() as probe:
+            probe.bind(('127.0.0.1', 0))
+            port = probe.getsockname()[1]
+        url = f'http://127.0.0.1:{port}'
+        context = base / 'context.json'
+        context.write_text(json.dumps({'url': url, 'home': str(home), 'output': node_path(output),
+                                       'media': str(base / 'media'), 'mediaLocal': node_path(base / 'media')}))
+        env = {**os.environ, 'KEIVOTOS_HOME': str(home)}
+        with (output / 'server.log').open('w') as log:
+            server = subprocess.Popen([sys.executable, '-c', SERVER, str(dist), str(port), args.script, str(base / 'media')],
+                                      cwd=project, env=env, stdout=log, stderr=subprocess.STDOUT)
+            try:
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    if server.poll() is not None:
+                        raise RuntimeError('Isolated server exited; inspect server.log')
+                    try:
+                        with urllib.request.urlopen(url, timeout=.5):
+                            break
+                    except OSError:
+                        time.sleep(.1)
+                else:
+                    raise RuntimeError('Isolated server startup timed out')
+                result = subprocess.run([args.node, node_path(ROOT / 'tests' / f'browser_{args.script}.cjs'),
+                                         node_path(context)],
+                                        cwd=ROOT, env=env, timeout=180)
+            finally:
+                server.terminate()
+                try:
+                    server.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait()
+        if args.script == 'absence':
+            assert not (home / 'modules/danbooru').exists(), 'Absent module created storage'
+            with sqlite3.connect(home / 'user.sqlite') as connection:
+                tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            assert 'user_settings' in tables
+            assert not {'favorites', 'collections', 'collection_items'} & tables
+            assert (base / 'media/preserved.txt').read_text() == 'Files-only preservation fixture'
+        log_text = (output / 'server.log').read_text()
+        if 'Traceback (most recent call last)' in log_text or 'ERROR:' in log_text:
+            raise RuntimeError('Isolated server logged errors; inspect server.log')
+        return result.returncode
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
