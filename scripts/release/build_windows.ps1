@@ -219,7 +219,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $Root ".github\SECURITY.md") -Destination (Join-Path $StageRoot "SECURITY.md")
     New-Item -ItemType Directory -Path (Join-Path $StageRoot "docs") -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $Root "docs\user") -Destination (Join-Path $StageRoot "docs\user") -Recurse
-    .\.venv\Scripts\python.exe .\scripts\release\collect_licenses.py (Join-Path $StageRoot "licenses")
+    .\.venv\Scripts\python.exe .\scripts\release\collect_licenses.py (Join-Path $StageRoot "licenses") --all-installed
     if ($LASTEXITCODE -ne 0) { throw "License collection failed" }
     $FfmpegLicenseDirectory = Join-Path $StageRoot "licenses\FFmpeg-7.1"
     New-Item -ItemType Directory -Path $FfmpegLicenseDirectory -Force | Out-Null
