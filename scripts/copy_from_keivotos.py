@@ -1,7 +1,11 @@
+#!/usr/bin/env python3
 """Refresh this build checkout from its sibling Keivotos checkout.
 
-Preview: python scripts/copy_from_keivotos.py
-Copy:    python scripts/copy_from_keivotos.py --apply
+Preview: scripts/copy_from_keivotos.py
+Copy:    scripts/copy_from_keivotos.py --apply
+
+Alternatively, use Keivotos's existing Python environment:
+../Keivotos/.venv/bin/python scripts/copy_from_keivotos.py --apply
 
 Use --source PATH when Keivotos is elsewhere. Existing project files are
 updated; destination-only files are retained. Git metadata, Windows zone
@@ -26,6 +30,7 @@ SKIP_NAMES = {
     ".pytest_cache", ".mypy_cache", ".ruff_cache", ".svelte-kit",
 }
 SKIP_ROOT_NAMES = {
+    ".local", ".reconstruction",
     "config.json", "run-lan.local.bat", "data", "library", "library_test",
     "_gallery-dl", "_gallery_dl", "gallery-dl", "artifacts", "downloads",
     "backups", "sidecars", "sidecar_history", "thumbnails", "build", "dist",
@@ -46,7 +51,7 @@ def excluded(relative: Path) -> bool:
         ))
         or names[:3] in (("packaging", "windows", "build"),
                          ("packaging", "windows", "dist"))
-        or names[:3] == ("scripts", "local", "state")
+        or names[:2] in (("docs", "important"), ("scripts", "local"))
     )
 
 
