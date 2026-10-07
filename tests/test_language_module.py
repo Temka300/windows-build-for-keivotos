@@ -373,3 +373,114 @@ def test_concurrent_complete_revision_publication_never_overwrites_winner(local,
     assert len(histories) == 1 and histories[0].read_bytes() == winner
     assert saved["content"] == note.read_text() == "Next edit"
     assert not list(history_home.rglob("*.tmp"))
+
+
+# Exercise the real ASGI response, without adding a TestClient dependency.
+def language_http(monkeypatch, method, path, payload):
+    import asyncio
+    import json
+    from fastapi import FastAPI
+    monkeypatch.setattr(router, "require_enabled", lambda slug: None)
+    app = FastAPI()
+    app.include_router(router.router)
+
+    async def request():
+        messages = []
+        async def receive():
+            return {"type": "http.request", "body": json.dumps(payload).encode(), "more_body": False}
+        async def send(message):
+            messages.append(message)
+        try:
+            await app({"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+                       "method": method, "scheme": "http", "path": path, "raw_path": path.encode(),
+                       "root_path": "", "query_string": b"", "headers": [(b"content-type", b"application/json")],
+                       "client": ("127.0.0.1", 1), "server": ("127.0.0.1", 80)}, receive, send)
+        except Exception:
+            if not any(m.get("status") == 500 for m in messages):
+                raise
+        status = next(m["status"] for m in messages if m["type"] == "http.response.start")
+        body = b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
+        return status, json.loads(body) if status != 500 else body.decode()
+    return asyncio.run(request())
+
+
+@pytest.mark.parametrize("operation", ["save", "create", "rename"])
+def test_committed_mutation_acknowledged_under_real_index_lock(local, monkeypatch, operation):
+    source, media, home, db, connect = local
+    original = b"# Original before index contention\n"
+    (media / "Original.md").write_bytes(original)
+    opened = router.read_document(source.source_id, "Original.md")
+    documents.refresh_index(source, db, "Original.md")
+    payload = {"source_id": source.source_id}
+    if operation == "save":
+        method, path = "PUT", "/api/language/document"
+        payload.update(name="Original.md", content="Saved during index contention", revision=opened["revision"], session_id="f" * 32)
+    elif operation == "rename":
+        method, path = "POST", "/api/language/document/rename"
+        payload.update(name="Original.md", new_name="Renamed.md", revision=opened["revision"])
+    else:
+        method, path = "POST", "/api/language/documents"
+    lock = sqlite3.connect(db)
+    lock.execute("BEGIN IMMEDIATE")
+    try:
+        status, result = language_http(monkeypatch, method, path, payload)
+    finally:
+        lock.rollback()
+        lock.close()
+    assert status == 200, result
+    assert result["index_refresh"]["status"] == "failed"
+    assert (media / result["name"]).read_text() == result["content"]
+    assert hashlib.sha256((media / result["name"]).read_bytes()).hexdigest() == result["revision"]
+    if operation == "save":
+        assert [p.read_bytes() for p in (home / "modules/language/revisions").rglob("*.md")] == [original]
+    repaired_status, repaired = language_http(monkeypatch, "POST", "/api/language/document/index", {
+        "source_id": source.source_id, "name": result["name"],
+        "previous_names": ["Original.md"] if operation == "rename" else []})
+    assert repaired_status == 200 and repaired["status"] == "complete"
+    with index.open_index(db) as connection:
+        row = connection.execute("SELECT size,available FROM files_index WHERE source_id=? AND name=?", (source.source_id, result["name"])).fetchone()
+        assert row["available"] and row["size"] == len(result["content"].encode())
+        if operation == "rename":
+            assert not connection.execute("SELECT available FROM files_index WHERE name='Original.md'").fetchone()[0]
+    second = router.save_document(router.SaveRequest(source_id=source.source_id, name=result["name"],
+        content="Another edit after repair", revision=result["revision"], session_id="f" * 32))
+    assert second["content"] == (media / result["name"]).read_text()
+
+
+@pytest.mark.parametrize("failure", ["corrupt", "directory"])
+def test_index_failure_keeps_original_acknowledgement(local, failure):
+    source, media, home, db, connect = local
+    if failure == "corrupt":
+        db.write_bytes(b"preserve this invalid index")
+    else:
+        db.mkdir()
+    created = router.create_document(router.CreateRequest(source_id=source.source_id))
+    assert created["index_refresh"]["status"] == "failed"
+    assert (media / created["name"]).read_bytes() == b""
+    saved = router.save_document(router.SaveRequest(source_id=source.source_id, name=created["name"],
+        content="Original persists", revision=created["revision"], session_id="e" * 32))
+    assert saved["index_refresh"]["status"] == "failed"
+    assert (media / saved["name"]).read_text() == "Original persists"
+    if failure == "corrupt":
+        assert db.read_bytes() == b"preserve this invalid index"
+
+
+def test_index_retry_checks_fresh_original_and_preserves_recreated_name(local, monkeypatch):
+    source, media, home, db, connect = local
+    (media / "Current.md").write_text("current")
+    (media / "Old.md").write_text("recreated externally")
+    status, result = language_http(monkeypatch, "POST", "/api/language/document/index", {
+        "source_id": source.source_id, "name": "Current.md", "previous_names": ["Old.md"]})
+    assert status == 200 and result["status"] == "complete"
+    with index.open_index(db) as connection:
+        assert connection.execute("SELECT available FROM files_index WHERE name='Old.md'").fetchone()[0]
+    for name, previous_names, expected in [("Missing.md", [], 404), ("Current.md", ["../outside.md"], 400)]:
+        status, _ = language_http(monkeypatch, "POST", "/api/language/document/index", {
+            "source_id": source.source_id, "name": name, "previous_names": previous_names})
+        assert status == expected
+    with connect() as connection:
+        sources.update_source(connection, source.source_id, visible=False)
+    assert language_http(monkeypatch, "POST", "/api/language/document/index", {
+        "source_id": source.source_id, "name": "Current.md"})[0] == 404
+    assert (media / "Current.md").read_text() == "current"
+    assert (media / "Old.md").read_text() == "recreated externally"
