@@ -617,9 +617,9 @@ const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
   assert(iconBox.x>=fsBox.x+fsBox.width&&iconBox.x-fsBox.x-fsBox.width<16);
   await page.locator('video').evaluate(n=>{n.currentTime=.75;window.__queueVideo=n;});
   const initialTime=await page.locator('video').evaluate(n=>n.currentTime),initialSrc=await page.locator('video').getAttribute('src');
-  await page.evaluate(()=>{window.__panelTransforms=[];let count=0;const sample=()=>{const n=document.querySelector('.playlist-queue-panel');window.__panelTransforms.push(getComputedStyle(n).transform);if(count++<30)requestAnimationFrame(sample);};requestAnimationFrame(sample);});
+  await page.evaluate(()=>{window.__panelTransforms=[];const started=performance.now();const sample=()=>{const n=document.querySelector('.playlist-queue-panel');window.__panelTransforms.push(getComputedStyle(n).transform);if(performance.now()-started<750)requestAnimationFrame(sample);};requestAnimationFrame(sample);});
   await queueButton.click();await page.waitForTimeout(340);
-  const transforms=await page.evaluate(()=>window.__panelTransforms);
+  await page.waitForFunction(()=>window.__panelTransforms.some(value=>Math.abs(new DOMMatrix(value).m41)<.1));
   assert(await page.evaluate(()=>window.__panelTransforms.some(value=>{const x=new DOMMatrix(value).m41;return x>1&&x<document.querySelector('.playlist-queue-panel').getBoundingClientRect().width+31;})));assert(await page.evaluate(()=>window.__panelTransforms.some(value=>Math.abs(new DOMMatrix(value).m41)<.1)));
   assert(await page.locator('video').evaluate(n=>n===window.__queueVideo));
   assert(Math.abs((await page.locator('video').evaluate(n=>n.currentTime))-initialTime)<.1);assert.equal(await page.locator('video').getAttribute('src'),initialSrc);
@@ -703,7 +703,12 @@ const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
   await page.evaluate(()=>{delete document.documentElement.dataset.motion;});
   await page.getByRole('button',{name:'Fullscreen',exact:true}).click();await page.waitForFunction(()=>!!document.fullscreenElement);
   assert(await panel.evaluate(n=>document.fullscreenElement.contains(n)));
-  await page.keyboard.press('Escape');await page.waitForFunction(()=>!document.fullscreenElement);
+  await page.evaluate(()=>{window.__fullscreenEscapePrevented=null;document.addEventListener('keydown',event=>{if(event.key==='Escape')window.__fullscreenEscapePrevented=event.defaultPrevented;},{once:true});});
+  await page.keyboard.press('Escape');assert.equal(await page.evaluate(()=>window.__fullscreenEscapePrevented),false);
+  // Headless Edge does not perform browser-chrome Escape handling. Leave the
+  // key to the browser, then verify native fullscreen exit through its control.
+  if(await page.evaluate(()=>!!document.fullscreenElement))await page.getByRole('button',{name:'Fullscreen',exact:true}).click();
+  await page.waitForFunction(()=>!document.fullscreenElement);
   assert.equal(await queuePlayer.count(),1);
   if(await queueButton.getAttribute('aria-expanded')==='true')await page.keyboard.press('Escape');
   await queueButton.click();await page.waitForTimeout(330);
@@ -719,7 +724,7 @@ const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
   await page.getByRole('button',{name:'Back to playlist',exact:true}).click();await queuePlayer.waitFor({state:'detached'});
   await detail.getByRole('button',{name:'Back to playlists',exact:true}).click();
   await page.getByRole('button',{name:'Open playlist '+orderedName,exact:true}).waitFor();
-  check('Panel remains in native fullscreen, Escape preserves the viewer, reduced motion/narrow layout work, and an open panel prevents idle/edge hiding without remounting media');
+  check('Panel remains inside native fullscreen, Escape stays unprevented for the browser, reduced motion/narrow layout work, and an open panel prevents idle/edge hiding without remounting media');
 
   await page.getByRole('button',{name:'Open playlist '+singleName,exact:true}).click();
   await detail.getByRole('button',{name:'Open Playlist video 002',exact:true}).click();await queuePlayer.waitFor();
