@@ -3,10 +3,10 @@
   import AppDrawer from '../../components/AppDrawer.svelte';
   import ModuleLocationMenu from '../../components/ModuleLocationMenu.svelte';
   import {settingsInitialSection,settingsOpen} from '../../lib/suiteStores';
-  import {languageApi,type IndexRefresh,type LanguageDocument,type LanguageFile,type LanguageFolder} from './api';
+  import {languageApi,type LanguageDocument,type LanguageFile,type LanguageFolder} from './api';
   import MarkdownEditor from './MarkdownEditor.svelte';
 
-  type OpenNote = LanguageDocument & {sourceId:string; savedContent:string; sessionId:string; dirty:boolean; saving:boolean; error:string; indexNames?:string[]; indexBusy?:boolean; indexGeneration?:number};
+  type OpenNote = LanguageDocument & {sourceId:string; savedContent:string; sessionId:string; dirty:boolean; saving:boolean; error:string};
   type Decision = 'save'|'keep'|'discard';
   let drawer=false, loading=true, error='';
   let folders:LanguageFolder[]=[], sourceId='', files:LanguageFile[]=[], tabs:OpenNote[]=[], openNames:string[]=[], activeName='', openSourceId='';
@@ -93,28 +93,6 @@
     files=result.files;
     if(openSourceId!==owner){openNames=files.map(file=>file.name);openSourceId=owner;}
   }
-  function indexAcknowledgement(tab:OpenNote,result:IndexRefresh|undefined,names:string[]){
-    const pending=new Set(tab.indexNames??[]);
-    if(result?.status==='failed')names.forEach(name=>pending.add(name));
-    else names.forEach(name=>pending.delete(name));
-    tab.indexNames=[...pending];
-    tab.index_refresh=pending.size?{status:'failed',warning:'The file change is saved; the Files listing needs refresh.'}:result;
-    tab.indexGeneration=(tab.indexGeneration??0)+1;
-  }
-  async function refreshListing(tab:OpenNote){
-    if(tab.indexBusy)return;
-    const name=tab.name,generation=tab.indexGeneration??0;
-    const previous=(tab.indexNames??[]).filter(value=>value!==name).slice(0,64);
-    tab.indexBusy=true;tabs=[...tabs];
-    try{
-      const result=await languageApi.refreshIndex(tab.sourceId,name,previous);
-      if(alive&&tab.name===name&&(tab.indexGeneration??0)===generation)indexAcknowledgement(tab,result,[name,...previous]);
-    }catch(caught){
-      if(alive&&tab.name===name&&(tab.indexGeneration??0)===generation){
-        tab.index_refresh={status:'failed',warning:caught instanceof Error?caught.message:'Could not refresh the Files listing.'};
-      }
-    }finally{tab.indexBusy=false;if(alive)tabs=[...tabs];}
-  }
   function saveTab(tab:OpenNote):Promise<boolean>{
     const source=tab.sourceId, name=tab.name, session=tab.sessionId;
     saveQueue=saveQueue.then(async()=>{
@@ -123,7 +101,6 @@
       tab.saving=true;tab.error='';tabs=[...tabs];
       try{
         const saved=await languageApi.save(source,name,content,tab.revision,session);
-        indexAcknowledgement(tab,saved.index_refresh,[name]);
         tab.revision=saved.revision;
         tab.savedContent=content;
         tab.dirty=tab.content!==content;
@@ -233,7 +210,7 @@
       const result=await languageApi.create(owner);
       if(!ownsFolder(owner,epoch))return;
       if(!files.some(file=>file.name===result.name))files=[...files,{name:result.name,size:0}].sort((a,b)=>a.name.localeCompare(b.name));
-      if(!tabs.some(tab=>tab.sourceId===owner&&tab.name===result.name))tabs=[...tabs,{...result,sourceId:owner,savedContent:result.content,sessionId:crypto.randomUUID().replaceAll('-',''),dirty:false,saving:false,error:'',indexNames:result.index_refresh?.status==='failed'?[result.name]:[]}];
+      if(!tabs.some(tab=>tab.sourceId===owner&&tab.name===result.name))tabs=[...tabs,{...result,sourceId:owner,savedContent:result.content,sessionId:crypto.randomUUID().replaceAll('-',''),dirty:false,saving:false,error:''}];
       if(!openNames.includes(result.name))openNames=[...openNames,result.name];
       if(request!==openRequest)return;
       activeName=result.name;
@@ -267,7 +244,6 @@
       const result=await languageApi.rename(tab.sourceId,oldName,nextName,tab.revision);
       if(!ownsFolder(owner,epoch))return;
       const wasActive=activeName===oldName;
-      indexAcknowledgement(tab,result.index_refresh,[oldName,result.name]);
       tab.name=result.name;
       files=files.map(file=>file.name===oldName?{...file,name:result.name}:file).sort((a,b)=>a.name.localeCompare(b.name));
       openNames=openNames.map(name=>name===oldName?result.name:name);
@@ -357,8 +333,6 @@
       {/key}
       <div class="save-status" role="status">
         {#if active.error}<span class="failed">{active.error}</span>{/if}
-        {#if active.index_refresh?.status==='failed'}<span class="failed">{active.index_refresh.warning}</span>{/if}
-        <button disabled={active.indexBusy||active.saving||renameBusy} aria-label={`${active.index_refresh?.status==='failed'?'Retry Files refresh':'Refresh Files listing'} for ${active.name}`} on:click={()=>refreshListing(active)}>{active.indexBusy?'Refreshing…':active.index_refresh?.status==='failed'?'Retry Files refresh':'Refresh Files listing'}</button>
         <span>{#if active.saving}Saving…{:else if active.dirty}Unsaved changes…{:else}Saved{/if}</span>
         {#if active.dirty}<button aria-label={`Save ${active.name}`} on:click={()=>saveTab(active)}>{active.error?'Retry save':'Save'}</button>{/if}
       </div>

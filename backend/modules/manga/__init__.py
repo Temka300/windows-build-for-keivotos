@@ -1,7 +1,6 @@
-"""Basic local Manga: shared Files discovery, personal progress in shared user data."""
+"""Basic local Manga: shared Files discovery, no separate durable reading state."""
 from pathlib import Path
 from module_descriptor import ModuleDescriptor
-from modules.manga.user_schema import SCHEMA, publish
 
 
 def _routers():
@@ -40,5 +39,4 @@ def descriptor(suite_home: Path, version: str) -> ModuleDescriptor:
         credentials=None, api_prefix="/api/manga", log_prefix="manga",
         user_agent=f"Keivotos/{version} (Manga)", disableable=True, is_base=False,
         router_provider=_routers, adopt_hook=adopt, release_hook=release,
-        user_schema_provider=lambda: SCHEMA, publish_hook=publish,
     )

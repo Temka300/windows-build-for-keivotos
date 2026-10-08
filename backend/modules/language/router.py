@@ -8,7 +8,7 @@ import config
 import lifecycle
 from database import get_user_db
 from files_base import sources
-from modules.language import documents, index_refresh
+from modules.language import documents
 from suite_modules import require_enabled
 
 
@@ -38,11 +38,6 @@ def _document_call(operation, *args):
 
 class CreateRequest(BaseModel):
     source_id: str = Field(min_length=1, max_length=256)
-
-
-class IndexRefreshRequest(CreateRequest):
-    name: str = Field(min_length=1, max_length=256)
-    previous_names: list[str] = Field(default_factory=list, max_length=64)
 
 
 class RenameRequest(CreateRequest):
@@ -86,7 +81,7 @@ def create_document(payload: CreateRequest):
         with get_user_db() as connection:
             source = _source(connection, payload.source_id)
             result = _document_call(documents.create_document, source, config.SUITE_HOME)
-            result["index_refresh"] = index_refresh.attempt(source, config.FILES_DB_PATH, result["name"])
+            documents.refresh_index(source, config.FILES_DB_PATH, result["name"])
             return result
 
 
@@ -98,8 +93,7 @@ def rename_document(payload: RenameRequest):
             source = _source(connection, payload.source_id)
             result = _document_call(documents.rename_document, source, config.SUITE_HOME,
                                     payload.name, payload.new_name, payload.revision)
-            result["index_refresh"] = index_refresh.attempt(
-                source, config.FILES_DB_PATH, result["name"], [payload.name])
+            documents.refresh_index(source, config.FILES_DB_PATH, result["name"], payload.name)
             return result
 
 
@@ -113,18 +107,5 @@ def save_document(payload: SaveRequest):
                                     config.MODULE_REGISTRY.require("language").home,
                                     payload.name, payload.content, payload.revision,
                                     payload.session_id)
-            result["index_refresh"] = index_refresh.attempt(source, config.FILES_DB_PATH, result["name"])
+            documents.refresh_index(source, config.FILES_DB_PATH, result["name"])
             return result
-
-
-@router.post("/document/index")
-def refresh_document_index(payload: IndexRefreshRequest):
-    with lifecycle.module_change_lock:
-        _enabled()
-        with get_user_db() as connection:
-            source = _source(connection, payload.source_id)
-            # Read and validate the current original, without replacing editor text.
-            _document_call(documents.read_document, source, config.SUITE_HOME, payload.name)
-            for name in payload.previous_names:
-                _document_call(documents.valid_name, name)
-            return index_refresh.attempt(source, config.FILES_DB_PATH, payload.name, payload.previous_names)

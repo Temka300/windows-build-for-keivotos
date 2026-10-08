@@ -1,6 +1,6 @@
 export const SUITE_NAME = 'Keivotos';
-export const VERSION = '1.2.2';
-export const RELEASED_AT = '2026-10-30T00:00:00+09:00';
+export const VERSION = '1.2.3';
+export const RELEASED_AT = '';
 export const DISPLAY_NAME = SUITE_NAME;
 export const DEFAULT_PROFILE_NAME = SUITE_NAME;
 

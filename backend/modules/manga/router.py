@@ -6,10 +6,6 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Header, HTTPException, Query, Response
 import config
-from pydantic import BaseModel, Field
-import lifecycle
-from suite_modules import require_enabled
-from modules.manga import progress
 from database import get_user_db
 from files_base import sources, serving
 from modules.manga import library as engine
@@ -121,92 +117,3 @@ def page(source_id: str = Query(..., max_length=256), path: str = Query('', max_
                                 headers={'Cache-Control': 'no-store'}) from exc
         except Exception as exc:
             failed(source_id, path, exc)
-
-
-# Personal-state mutations share lifecycle coordination with module disable/restore.
-
-
-class ProgressChapter(BaseModel):
-    source_id: str = Field(min_length=1, max_length=256)
-    series_path: str = Field(default='', max_length=4096)
-    path: str = Field(default='', max_length=4096)
-    kind: Literal['folder', 'archive'] = 'folder'
-    revision: str = Field(pattern=r'^[0-9a-f]{64}$')
-
-
-class ProgressSession(ProgressChapter):
-    expected_generation: int = Field(ge=0, le=9007199254740990)
-
-
-class ProgressUpdate(ProgressChapter):
-    generation: int = Field(ge=1, le=9007199254740991)
-    sequence: int = Field(ge=1, le=9007199254740991)
-    page: int = Field(ge=0)
-    mode: Literal['paged', 'vertical']
-    anchor: float = Field(default=0.5, ge=0, le=1, allow_inf_nan=False)
-
-
-def progress_owner(payload):
-    try:
-        require_enabled('manga')
-    except RuntimeError as error:
-        raise HTTPException(409, str(error)) from error
-    source = find_chapter(payload.source_id, payload.path, payload.kind)
-    series = next((item for item in engine.catalog(config.FILES_DB_PATH, [source])
-                   if item['path'] == payload.series_path), None)
-    if not series or not any(c['path'] == payload.path and c['kind'] == payload.kind for c in series['chapters']):
-        raise HTTPException(404, 'Chapter is unavailable in this series')
-    try:
-        metadata = engine.chapter_metadata(source, payload.path, payload.kind,
-                                           config.FILES_DB_PATH, [config.SUITE_HOME])
-    except Exception as error:
-        failed(payload.source_id, payload.path, error)
-    if metadata['revision'] != payload.revision:
-        raise HTTPException(409, 'Chapter changed; reopen it before saving progress.')
-    if not metadata['count']:
-        raise HTTPException(404, 'Chapter has no readable pages')
-    return metadata
-
-
-@router.post('/api/manga/progress/read')
-def read_progress(payload: ProgressChapter):
-    with lifecycle.module_change_lock:
-        progress_owner(payload)
-        with get_user_db() as connection:
-            return progress.read(connection, payload.source_id, payload.path, payload.kind, payload.revision)
-
-
-@router.post('/api/manga/progress/session')
-def begin_progress(payload: ProgressSession):
-    with lifecycle.module_change_lock:
-        progress_owner(payload)
-        with get_user_db() as connection:
-            return progress.begin(connection, payload.source_id, payload.path, payload.kind, payload.expected_generation)
-
-
-@router.post('/api/manga/progress')
-def save_progress(payload: ProgressUpdate):
-    with lifecycle.module_change_lock:
-        metadata = progress_owner(payload)
-        if payload.page >= metadata['count']:
-            raise HTTPException(409, 'Observed page is outside this chapter.')
-        with get_user_db() as connection:
-            return progress.save(connection, payload, metadata['count'])
-
-
-@router.get('/api/manga/progress/series')
-def series_progress(source_id: str = Query(..., max_length=256),
-                    series_path: str = Query('', max_length=4096)):
-    with lifecycle.module_change_lock:
-        try:
-            require_enabled('manga')
-        except RuntimeError as error:
-            raise HTTPException(409, str(error)) from error
-        if not any(s.source_id == source_id for s in owners()):
-            raise HTTPException(404, 'Manga folder is unavailable')
-        with get_user_db() as connection:
-            rows = connection.execute("""SELECT * FROM manga_reading_progress
-                WHERE source_id=? AND series_path=? ORDER BY updated_at DESC, generation DESC, sequence DESC
-                LIMIT 120""", (source_id, series_path)).fetchall()
-        # Selection must still pass fresh chapter guards; these are personal records only.
-        return {'items': [dict(row) for row in rows]}

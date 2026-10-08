@@ -126,26 +126,6 @@ class MetadataBackupBundleTests(unittest.TestCase):
         self.assertEqual(archived.read_bytes(), b"previous draft")
         self.assertEqual(original.read_bytes(), b"current original note")
 
-    def test_manga_progress_survives_complete_user_backup_restore(self) -> None:
-        from modules.manga.user_schema import publish
-        with sqlite3.connect(self.user_db) as connection:
-            publish(connection)
-            connection.execute("INSERT INTO manga_reading_sessions VALUES ('source','Story/Chapter','folder',4)")
-            connection.execute("""INSERT INTO manga_reading_progress VALUES
-                ('source','Story','Story/Chapter','folder',?,3,1,'vertical',0.35,4,7,'2026-10-07T01:00:00Z')""", ('a'*64,))
-            connection.commit()
-        with patch('suite_modules.enabled_ids', side_effect=AssertionError('Personal backup ignores enablement')):
-            created = backup_bundle.create_backup_bundle()
-        with sqlite3.connect(self.user_db) as connection:
-            connection.execute('UPDATE manga_reading_progress SET page=2')
-            connection.commit()
-        backup_bundle.restore_backup_bundle(created['name'])
-        with sqlite3.connect(self.user_db) as connection:
-            self.assertEqual(connection.execute('SELECT page,anchor,generation,sequence FROM manga_reading_progress').fetchone(), (1,0.35,4,7))
-            self.assertEqual(connection.execute('SELECT generation FROM manga_reading_sessions').fetchone(), (4,))
-            self.assertEqual(connection.execute('SELECT value FROM marker').fetchone(), ('user-original',))
-        self.assertEqual(self.external_image.read_bytes(), b'original-image-must-stay')
-
     def test_missing_optional_artifacts_are_reported_without_creating_them(self) -> None:
         self.data_db.unlink()  # Disposable fixture only.
         created = backup_bundle.create_backup_bundle()
