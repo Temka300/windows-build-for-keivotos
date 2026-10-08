@@ -77,6 +77,32 @@ assert.match(config.home,/[/\\]keivotos-modularization-[^/\\]+[/\\]home$/);
   await waitDisk('Welcome.md','# Mouse save\n');
   check('Ctrl+S and the visible Save action write only on request; undo to saved text returns clean');
 
+  let savedRequests=0;
+  const failedIndexRoute=async route=>{
+   if(route.request().method()!=='PUT'){await route.continue();return;}
+   savedRequests++;
+   const response=await route.fetch();
+   assert.equal(response.status(),200);
+   const data=await response.json();
+   await route.fulfill({response,json:{...data,index_refresh:{status:'failed',warning:'The file change is saved; the Files listing needs refresh.'}}});
+  };
+  await page.route('**/api/language/document',failedIndexRoute);
+  await editor.fill('# Saved despite index warning\n');
+  await page.getByRole('button',{name:'Save Welcome.md'}).click();
+  const retryIndex=page.getByRole('button',{name:'Retry Files refresh for Welcome.md'});
+  await retryIndex.waitFor();
+  await waitDisk('Welcome.md','# Saved despite index warning\n');
+  assert.equal(await page.getByRole('button',{name:'Save Welcome.md'}).count(),0);
+  await editor.fill('# New unsaved edit\n');
+  await retryIndex.click();
+  await page.getByRole('button',{name:'Refresh Files listing for Welcome.md'}).waitFor();
+  assert.equal(await editorText(editor),'# New unsaved edit\n');
+  assert.equal(await page.getByRole('button',{name:'Save Welcome.md'}).count(),1);
+  assert.equal(savedRequests,1,'index repair must never repeat a file mutation');
+  await waitDisk('Welcome.md','# Saved despite index warning\n');
+  await page.unroute('**/api/language/document',failedIndexRoute);
+  check('saved index warning acknowledges disk bytes; index-only repair preserves newer unsaved text');
+
   await editor.fill('# Close and save\n');
   await closeWelcome.click();
   const decision=page.getByRole('dialog',{name:'Unsaved Markdown changes'});

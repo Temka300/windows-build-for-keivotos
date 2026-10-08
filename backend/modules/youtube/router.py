@@ -1,6 +1,10 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Path as ApiPath
 from pydantic import BaseModel, Field
-from typing import Literal
+from typing import Literal, Annotated
+from uuid import UUID
+import lifecycle
+from suite_modules import require_enabled
+from modules.youtube import playlists
 from database import get_user_db
 from files_base import sources, serving
 from modules.youtube import jobs
@@ -92,3 +96,63 @@ def playback_error(payload:YouTubePlaybackFailure):
     jobs.logger.warning('Playback failed: job=%s source=%r file=%r reason=%s',
                         item['id'],item['source_id'],item['path'],payload.reason)
     return {'status':'logged'}
+
+
+class PlaylistCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=120)
+    request_id: UUID
+
+
+class PlaylistMembership(BaseModel):
+    playlist_ids: list[UUID] = Field(max_length=256)
+    version: int = Field(ge=0, le=9007199254740990)
+
+
+def _playlist_enabled():
+    try:
+        require_enabled('youtube')
+    except lifecycle.ModuleStartError as error:
+        raise HTTPException(503,str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(409,str(error)) from error
+
+
+@router.get('/api/youtube/playlists')
+def list_playlists(offset:int=Query(0,ge=0),limit:int=Query(60,ge=1,le=120)):
+    with lifecycle.module_change_lock:
+        _playlist_enabled()
+        with get_user_db() as connection:
+            return playlists.listing(connection,offset,limit)
+
+
+@router.post('/api/youtube/playlists')
+def create_playlist(payload:PlaylistCreate):
+    with lifecycle.module_change_lock:
+        _playlist_enabled()
+        with get_user_db() as connection:
+            return playlists.create(connection,payload.title,str(payload.request_id))
+
+
+@router.get('/api/youtube/playlists/{playlist_id}/items')
+def playlist_items(playlist_id:UUID,offset:int=Query(0,ge=0),limit:int=Query(60,ge=1,le=120)):
+    with lifecycle.module_change_lock:
+        _playlist_enabled()
+        with get_user_db() as connection:
+            return playlists.items(connection,str(playlist_id),offset,limit)
+
+
+@router.get('/api/youtube/videos/{job_id}/playlists')
+def video_playlists(job_id:Annotated[str,ApiPath(min_length=1,max_length=64)]):
+    with lifecycle.module_change_lock:
+        _playlist_enabled()
+        with get_user_db() as connection:
+            playlists.require_video(connection,job_id)
+            return playlists.membership(connection,job_id)
+
+
+@router.post('/api/youtube/videos/{job_id}/playlists')
+def save_video_playlists(job_id:Annotated[str,ApiPath(min_length=1,max_length=64)],payload:PlaylistMembership):
+    with lifecycle.module_change_lock:
+        _playlist_enabled()
+        with get_user_db() as connection:
+            return playlists.set_membership(connection,job_id,[str(value) for value in payload.playlist_ids],payload.version)

@@ -1,6 +1,7 @@
 """Experimental YouTube acquisition; originals belong to registered Files folders."""
 from pathlib import Path
 from module_descriptor import ModuleDescriptor
+from modules.youtube.user_schema import SCHEMA as PERSONAL_SCHEMA
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS youtube_preferences (
@@ -30,7 +31,7 @@ def _tasks():
 
 
 def _publish(connection):
-    connection.executescript(SCHEMA)
+    connection.executescript(SCHEMA + PERSONAL_SCHEMA)
     columns={row[0] if not isinstance(row,dict) else row['name']
              for row in connection.execute('SELECT name FROM pragma_table_info(\'youtube_downloads\')')}
     for name in ('retry_of','superseded_by','failure_phase'):
@@ -74,5 +75,5 @@ def descriptor(suite_home: Path, version: str):
         experimental=True, home=suite_home/'modules/youtube', database=suite_home/'base/files.sqlite',
         credentials=None, api_prefix='/api/youtube', log_prefix='youtube',
         user_agent=f'Keivotos/{version} (YouTube)', disableable=True, is_base=False,
-        user_schema_provider=lambda: SCHEMA, publish_hook=_publish, router_provider=_routers,
+        user_schema_provider=lambda: SCHEMA + PERSONAL_SCHEMA, publish_hook=_publish, router_provider=_routers,
         adopt_hook=adopt, release_hook=release, startup_hook=_startup, background_tasks_hook=_tasks)

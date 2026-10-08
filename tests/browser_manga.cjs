@@ -12,6 +12,12 @@ const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
  const check=x=>{report.checks.push(x);console.log('PASS: '+x);};
  async function api(url,method='GET',body){return page.evaluate(async({url,method,body})=>{const r=await fetch(url,{method,headers:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});return {status:r.status,data:await r.json()};},{url,method,body});}
  async function shot(name){await page.screenshot({path:path.join(config.output,name+'.png')});}
+ async function startOverIfOffered(target=page){
+  await target.waitForFunction(()=>document.querySelector('.resume-choice')||document.querySelector('.reader-error')||document.querySelector('.reader .paged-page img')||document.querySelector('.reader .page img'));
+  const choice=target.getByRole('alertdialog',{name:'Resume manga'});
+  if(await choice.count())await choice.getByRole('button',{name:'Start over',exact:true}).click();
+ }
+
  try{
   await page.goto(config.url);
   assert.equal((await api('/api/manga/library')).status,409);
@@ -111,6 +117,7 @@ const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
   assert.equal(await reader.locator('img').count(),1);
   assert.equal(await page.getByLabel('Reading layout').inputValue(),'paged');
   async function assertPagedImageFits(){
+    await startOverIfOffered();
     await page.waitForFunction(()=>{const image=document.querySelector('.paged-page img');return image?.complete&&image.naturalWidth>0;});
     const bounds=await reader.locator('.paged-page img').evaluate(image=>{
       const page=image.closest('.paged-page').getBoundingClientRect();
@@ -247,7 +254,7 @@ const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
   await tile.click();await dialog.getByRole('button',{name:'Chapter 1',exact:true}).click();
   await page.getByRole('alert').filter({hasText:'See Logs'}).waitFor();
   assert.equal(await reader.locator('.page-counter').textContent(),'— / —');
-  await back.click();await page.keyboard.press('Escape');
+  await back.click();await reader.waitFor({state:'detached'});await page.keyboard.press('Escape');
   await context.unroute('**/api/manga/pages?*');
   check('chapter errors remain concise and preserve the route back to the library');
   const pendingCount=async route=>{
@@ -263,7 +270,7 @@ const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
    await dialog.getByRole('button',{name:'Chapter 2',exact:true}).click();await assertPagedImageFits();
    await page.waitForTimeout(550);assert.equal(await reader.locator('.page-counter').textContent(),'1 / 4');
    assert((await reader.locator('img').getAttribute('src')).includes('Chapter+2.cbz'));
-   await back.click();await page.keyboard.press('Escape');
+   await back.click();await reader.waitFor({state:'detached'});await page.keyboard.press('Escape');
   }finally{await page.unroute('**/api/manga/pages?*',pendingCount);}
   check('Escape cancels delayed chapter counts, restores chapter focus and ignores their late response after opening another chapter');
   await tile.click();await dialog.getByRole('button',{name:'Chapter 1',exact:true}).click();await assertPagedImageFits();
@@ -311,16 +318,18 @@ const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
   await page.unroute('**/api/manga/library?*',pagination);await page.getByLabel('Search manga').fill('');
   await page.waitForFunction(()=>document.querySelectorAll('.manga-tile').length===8);
   check('focus refresh preserves expanded Load more results and library scroll position');
-  let readerTitle='boku ni onnanoko',metadataMode='normal';
+  let readerTitle='boku ni onnanoko',metadataMode='normal',countRoutes=0;
   const titleRoute=async route=>{
    const response=await route.fetch(),body=await response.json();
    await route.fulfill({response,json:{...body,items:body.items.map(item=>item.path==='The Quiet Valley'?{...item,name:readerTitle}:item)}});
   };
   const countRoute=async route=>{
    if(metadataMode==='normal'){await route.continue();return;}
+   countRoutes++;try{
    const response=await route.fetch(),body=await response.json();await new Promise(resolve=>setTimeout(resolve,260));
    if(metadataMode==='error'){await route.fulfill({status:422,json:{detail:'This chapter cannot be opened. See Logs.'}});return;}
    await route.fulfill({response,json:{...body,count:1,revisions:body.revisions.slice(0,1)}});
+   }finally{countRoutes--;}
   };
   await page.route('**/api/manga/library?*',titleRoute);await page.route('**/api/manga/pages?*',countRoute);
   try{
@@ -352,7 +361,7 @@ const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
     await shot('manga-header-compact');await page.setViewportSize({width:1440,height:1000});
     await reader.focus();await page.keyboard.press('ArrowRight');await assertPagedImageFits();
     assert.equal(await reader.locator('.page-counter').textContent(),'2 / 13');await shot('manga-header-bright');
-    await back.click();await page.keyboard.press('Escape');
+    await back.click();await reader.waitFor({state:'detached'});await page.keyboard.press('Escape');
    }
    check('real series names appear beside Back with two-line full titles; translucent header and centered counter avoid collisions across widths and hover');
    metadataMode='single';await page.setViewportSize({width:360,height:1000});
@@ -363,14 +372,15 @@ const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
    await assertPagedImageFits();assert.equal(await reader.locator('.page-counter').textContent(),'1 / 1');
    await reader.focus();await page.keyboard.press('ArrowRight');assert.equal(await reader.locator('.page-counter').textContent(),'1 / 1');
    await page.getByLabel('Reading layout').selectOption('vertical');await page.waitForTimeout(120);assert.equal(await reader.locator('.page-counter').textContent(),'1 / 1');
-   await page.getByLabel('Reading layout').selectOption('paged');await back.click();
+   await page.getByLabel('Reading layout').selectOption('paged');await back.click();await reader.waitFor({state:'detached'});
    metadataMode='error';await namedDialog.getByRole('button',{name:'Chapter 1',exact:true}).click();
    assert.equal(await reader.locator('.page-counter').textContent(),'— / —');
    await reader.getByRole('alert').waitFor();assert.equal(await reader.locator('.page-counter').textContent(),'— / —');
    const errorBox=await reader.getByRole('alert').boundingBox(),controlsBox=await reader.locator('.reader-controls').boundingBox();assert(errorBox.y>=controlsBox.y+controlsBox.height);
-   await back.click();await page.keyboard.press('Escape');
+   await back.click();await reader.waitFor({state:'detached'});await page.keyboard.press('Escape');
    check('loading and errors keep a neutral page count; a single-page chapter stays 1/1 in both layouts and compact errors clear the header');
   }finally{
+   while(countRoutes)await new Promise(resolve=>setTimeout(resolve,25));
    await page.unroute('**/api/manga/library?*',titleRoute);await page.unroute('**/api/manga/pages?*',countRoute);
    await page.setViewportSize({width:1440,height:1000});await page.evaluate(()=>window.dispatchEvent(new Event('focus')));await tile.waitFor();
   }
@@ -411,7 +421,7 @@ const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
    await warm.locator('.app-drawer').getByRole('button',{name:'Manga',exact:true}).click();
    const warmTile=warm.getByRole('button',{name:'The Quiet Valley',exact:true}),warmReader=warm.getByRole('dialog',{name:'Manga reader'});
    const warmDialog=warm.getByRole('dialog',{name:'The Quiet Valley chapters'});
-   async function openChapter(name){await warmTile.click();await warmDialog.getByRole('button',{name,exact:true}).click();}
+   async function openChapter(name){await warmTile.click();await warmDialog.getByRole('button',{name,exact:true}).click();await startOverIfOffered(warm);}
    async function exitChapter(){await warm.getByRole('button',{name:'Back to chapters'}).click();await warmReader.waitFor({state:'detached'});assert.equal((await warmerImages()).length,0);}
    async function ready(index){await warm.waitForFunction(index=>{const image=document.querySelector('.paged-page img');return image?.complete&&image.naturalWidth>0&&Number(image.closest('.paged-page').dataset.page)===index;},index);}
    const firstRequest=warm.waitForRequest(request=>new URL(request.url()).searchParams.get('cover')==='false');
@@ -454,7 +464,7 @@ const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
    await warm.waitForTimeout(250);assert((await warmReader.locator('img').count())>0&&(await warmReader.locator('img').count())<13);
    await warm.getByLabel('Reading layout').selectOption('paged');await exitChapter();
    holdNeighbor=false;await warm.evaluate(()=>window.__largeWarmPages=true);
-   await warmDialog.getByRole('button',{name:'Chapter 2',exact:true}).click();await ready(0);
+   await warmDialog.getByRole('button',{name:'Chapter 2',exact:true}).click();await startOverIfOffered(warm);await ready(0);
    await warm.waitForTimeout(500);await settled();
    const capped=await warmerImages();assert.equal(capped.length,1);
    assert.equal(capped.reduce((sum,image)=>sum+image.width*image.height*4,0),31360000);
@@ -462,7 +472,7 @@ const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
    report.prefetch.budgetProbe={method:'2800x2800 dimension override on detached previews; no corresponding pixel allocation',retainedImages:capped.length,estimatedDecodedBytes:31360000,limitBytes:32*1024*1024};
    await warm.evaluate(()=>window.__largeWarmPages=false);
    assert((await warmerImages()).every(image=>new URL(image.url,config.url).searchParams.get('path')==='The Quiet Valley/Chapter 2.cbz'));
-   await exitChapter();await warmDialog.getByRole('button',{name:'Chapter 10',exact:true}).click();await ready(0);
+   await exitChapter();await warmDialog.getByRole('button',{name:'Chapter 10',exact:true}).click();await startOverIfOffered(warm);await ready(0);
    await warmReader.focus();for(let index=0;index<3;index++)await warm.keyboard.press('ArrowRight');await ready(3);
    await warm.waitForTimeout(450);assert.equal(await warmReader.getByRole('alert').count(),0);
    assert(requests.some(request=>request.chapter==='The Quiet Valley/Chapter 10.cbz'&&request.index===5));
@@ -489,6 +499,7 @@ const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
    await corrupt.locator('.app-drawer').getByRole('button',{name:'Manga',exact:true}).click();
    await corrupt.getByRole('button',{name:'The Quiet Valley',exact:true}).click();
    await corrupt.getByRole('dialog',{name:'The Quiet Valley chapters'}).getByRole('button',{name:'Chapter 2',exact:true}).click();
+   await startOverIfOffered(corrupt);
    const failedReader=corrupt.getByRole('dialog',{name:'Manga reader'});
    await failedReader.getByRole('alert').filter({hasText:'Original page 1'}).waitFor();
    assert.equal(await failedReader.locator('.page-counter').textContent(),'1 / 4');
@@ -505,6 +516,95 @@ const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
   }finally{
    await corruptContext.tracing.stop({path:path.join(config.output,'navigation-error-trace.zip')});await corruptContext.close();
   }
+  let progressContext=await browser.newContext({viewport:{width:1440,height:1000}});
+  let progressPage=await progressContext.newPage();progressPage.on('pageerror',e=>report.errors.push(e.message));
+  async function enterProgress(){
+   await progressPage.goto(config.url);
+   await progressPage.getByRole('button',{name:'Open Keivotos menu'}).click();
+   await progressPage.locator('.app-drawer').getByRole('button',{name:'Manga',exact:true}).click();
+   await progressPage.getByRole('button',{name:'The Quiet Valley',exact:true}).click();
+   await progressPage.getByRole('dialog',{name:'The Quiet Valley chapters'}).getByRole('button',{name:'Chapter 1',exact:true}).click();
+  }
+  async function progressData(){return progressPage.evaluate(async source_id=>{
+   const metadata=await(await fetch('/api/manga/pages?'+new URLSearchParams({source_id,path:'The Quiet Valley/Chapter 1',kind:'folder',metadata:'true'}))).json();
+   return (await fetch('/api/manga/progress/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_id,series_path:'The Quiet Valley',path:'The Quiet Valley/Chapter 1',kind:'folder',revision:metadata.revision})})).json();
+  },sourceId);}
+  async function progressReady(index){await progressPage.waitForFunction(index=>{
+   const image=document.querySelector('.paged-page img');return image?.complete&&image.naturalWidth>0&&Number(image.closest('.paged-page').dataset.page)===index;
+  },index);}
+  await enterProgress();await startOverIfOffered(progressPage);await progressReady(0);
+  const progressReader=()=>progressPage.getByRole('dialog',{name:'Manga reader'});
+  await progressReader().focus();for(let i=0;i<3;i++)await progressPage.keyboard.press('ArrowRight');await progressReady(3);
+  await progressPage.getByRole('button',{name:'Back to chapters'}).click();await progressReader().waitFor({state:'detached'});
+  assert.equal((await progressData()).position.page,3,'prefetched pages cannot overwrite displayed progress');
+  await progressContext.close();
+  progressContext=await browser.newContext({viewport:{width:1440,height:1000}});progressPage=await progressContext.newPage();progressPage.on('pageerror',e=>report.errors.push(e.message));
+  await enterProgress();
+  const resume=progressPage.getByRole('alertdialog',{name:'Resume manga'});await resume.waitFor();
+  assert.match(await resume.textContent(),/page 4/);
+  assert(await resume.getByRole('button',{name:'Resume',exact:true}).evaluate(n=>n===document.activeElement));
+  await resume.press('Shift+Tab');assert(await resume.getByRole('button',{name:'Back to chapters',exact:true}).evaluate(n=>n===document.activeElement));
+  await resume.press('Tab');await resume.getByRole('button',{name:'Resume',exact:true}).click();await progressReady(3);
+  check('displayed Paged position survives a new browser session; Resume choice traps focus and prefetch never advances progress');
+  await progressPage.getByLabel('Reading layout').selectOption('vertical');
+  await progressPage.waitForFunction(()=>document.querySelector('.page[data-page="3"] img')?.naturalWidth>0);
+  await progressReader().evaluate(node=>{const target=node.querySelector('.page[data-page="5"]'),rect=target.getBoundingClientRect(),bounds=node.getBoundingClientRect();node.scrollTop+=rect.top+rect.height*0.4-(bounds.top+bounds.height/2);});
+  await progressPage.waitForFunction(()=>document.querySelector('.page[data-page="5"] img')?.naturalWidth>0&&document.querySelector('.page-counter').textContent==='6 / 13');
+  await progressPage.waitForTimeout(100);
+  await progressPage.getByRole('button',{name:'Back to chapters'}).click();await progressReader().waitFor({state:'detached'});
+  const verticalSaved=(await progressData()).position;
+  assert.equal(verticalSaved.page,5);assert.equal(verticalSaved.mode,'vertical');assert(Math.abs(verticalSaved.anchor-0.4)<0.03);
+  await progressPage.getByRole('dialog',{name:'The Quiet Valley chapters'}).getByRole('button',{name:'Chapter 1',exact:true}).click();
+  await progressPage.getByRole('alertdialog',{name:'Resume manga'}).getByRole('button',{name:'Resume',exact:true}).click();
+  await progressPage.waitForFunction(()=>document.querySelector('.page[data-page="5"] img')?.naturalWidth>0&&document.querySelector('.page-counter').textContent==='6 / 13');
+  const restoredAnchor=await progressReader().evaluate(node=>{const rect=node.querySelector('.page[data-page="5"]').getBoundingClientRect(),bounds=node.getBoundingClientRect();return (bounds.top+bounds.height/2-rect.top)/rect.height;});
+  assert(Math.abs(restoredAnchor-verticalSaved.anchor)<0.03);
+  await progressPage.screenshot({path:path.join(config.output,'manga-progress-resume.png')});
+  await progressPage.getByLabel('Reading layout').selectOption('paged');await progressReady(5);
+  await progressPage.getByRole('button',{name:'Back to chapters'}).click();await progressReader().waitFor({state:'detached'});
+  await progressPage.getByRole('dialog',{name:'The Quiet Valley chapters'}).getByRole('button',{name:'Chapter 1',exact:true}).click();
+  await progressPage.getByRole('alertdialog',{name:'Resume manga'}).getByRole('button',{name:'Start over',exact:true}).click();await progressReady(0);
+  await progressPage.getByRole('button',{name:'Back to chapters'}).click();await progressReader().waitFor({state:'detached'});
+  assert.equal((await progressData()).position.page,0);
+  check('Vertical resumes the loaded reading-center page and relative anchor; layout switch keeps the page and Start over records the first displayed page');
+  const continued=progressPage.getByRole('button',{name:/Continue reading — Chapter 1, page 1/});await continued.waitFor();await continued.click();
+  await progressPage.getByRole('alertdialog',{name:'Resume manga'}).getByRole('button',{name:'Resume',exact:true}).click();await progressReady(0);
+  const failedPositionRoute=route=>route.fulfill({status:503,json:{detail:'Generated temporary storage failure'}});
+  await progressPage.route('**/api/manga/progress',failedPositionRoute);
+  await progressReader().focus();await progressPage.keyboard.press('ArrowRight');await progressReady(1);
+  await progressReader().getByRole('status').filter({hasText:'Reading position could not be saved'}).waitFor();
+  assert.equal((await progressData()).position.page,0);
+  await progressPage.unroute('**/api/manga/progress',failedPositionRoute);
+  await progressPage.getByRole('button',{name:'Retry saving position',exact:true}).click();
+  await progressReader().getByRole('status').filter({hasText:'Reading position could not be saved'}).waitFor({state:'detached'});
+  assert.equal((await progressData()).position.page,1);
+  assert.equal(await progressReader().locator('.page-counter').textContent(),'2 / 13');
+  check('Continue reading selects the last valid chapter; failed position saves keep the confirmed position and retry the displayed page');
+
+  const staleCandidateRoute=async route=>{
+   const response=await route.fetch(),data=await response.json();
+   const candidate=data.items.find(p=>p.path==='The Quiet Valley/Chapter 1');
+   await route.fulfill({response,json:{...data,items:candidate?[{...candidate,revision:'f'.repeat(64)},...data.items]:data.items}});
+  };
+  await progressPage.route('**/api/manga/progress/series?*',staleCandidateRoute);
+  await progressPage.getByRole('button',{name:'Back to chapters'}).click();await progressReader().waitFor({state:'detached'});
+  await progressPage.getByRole('button',{name:/Continue reading — Chapter 1, page 2/}).waitFor();
+  await progressPage.unroute('**/api/manga/progress/series?*',staleCandidateRoute);
+  check('Continue reading can use a matching retained revision after a newer stale candidate for the same chapter');
+  await progressContext.close();
+  const startupContext=await browser.newContext({viewport:{width:1440,height:1000}});
+  const startup=await startupContext.newPage();startup.on('pageerror',e=>report.errors.push(e.message));
+  await startup.goto(config.url);await startup.getByRole('button',{name:'Open Keivotos menu'}).click();
+  await startup.locator('.app-drawer').getByRole('button',{name:'Manga',exact:true}).click();
+  await startup.getByRole('button',{name:'Blue Hour',exact:true}).click();
+  const starting=startup.waitForRequest(r=>r.url().endsWith('/api/manga/progress/session'));
+  await startup.route('**/api/manga/progress/session',async route=>{const response=await route.fetch();await new Promise(resolve=>setTimeout(resolve,350));await route.fulfill({response});});
+  await startup.getByRole('dialog',{name:'Blue Hour chapters'}).getByRole('button',{name:'Chapter 1',exact:true}).click();await starting;
+  assert.equal(await startup.getByRole('alertdialog',{name:'Resume manga'}).count(),0);
+  assert.match(await startup.getByRole('dialog',{name:'Manga reader'}).textContent(),/Loading/);
+  await startup.waitForFunction(()=>document.querySelector('.paged-page img')?.naturalWidth>0);
+  await startup.getByRole('button',{name:'Back to chapters'}).click();await startup.getByRole('dialog',{name:'Manga reader'}).waitFor({state:'detached'});
+  await startupContext.close();check('a fresh chapter stays in Loading while its session starts and never shows a false changed-chapter prompt');
   assert.deepEqual(report.errors,[]);
   check('disable rejects Manga work and preserves source registration and rediscovery');
  }finally{fs.writeFileSync(path.join(config.output,'report.json'),JSON.stringify(report,null,2));await context.tracing.stop({path:path.join(config.output,'trace.zip')});await browser.close();}
