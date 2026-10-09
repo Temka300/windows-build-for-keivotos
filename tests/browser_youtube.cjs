@@ -185,6 +185,8 @@ const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
   await toggle.click();await page.waitForTimeout(250);assert.equal(await page.getByLabel('Video quality').count(),0);
   await toggle.click();await page.waitForTimeout(250);await page.getByRole('button',{name:'Download',exact:true}).click();
   await page.getByRole('progressbar').waitFor();
+  await page.getByRole('status').filter({hasText:/Download queued:|Downloading:/}).waitFor();
+  assert.equal(await page.locator('.action-notification[data-notification-id^="youtube-download-"]').count(),1);
   await page.locator('.download-grid article').first().click({button:'right'});
   const unfinishedMenu=page.getByRole('menu');
   assert(await unfinishedMenu.getByRole('menuitem',{name:'Show in Files'}).isDisabled());
@@ -201,6 +203,8 @@ const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
   await page.waitForFunction(()=>document.querySelector('.thumbnail img')?.naturalWidth>0);
   await page.screenshot({path:path.join(config.output,'youtube-library.png')});
   const result=(await api('/api/youtube/library')).data.items[0];assert.equal(result.status,'complete');
+  await page.getByRole('status').filter({hasText:'Download complete:'}).waitFor();
+  assert.equal(await page.locator('.action-notification[data-notification-id="youtube-download-'+result.id+'"]').count(),1);
   assert(result.path.endsWith('Valley.mp4'));
   const youtubeTitle=page.locator(`[data-job-id="${result.id}"] .download-title`);
   for(const width of [1440,360]){
@@ -802,6 +806,87 @@ const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
   assert.deepEqual(fs.readFileSync(originalLocal),queueBytes);
   check('Closing aborts stale playlist navigation; a new selection keeps its source, exit pauses the old video and disable/re-enable preserves every playlist member'+(videoPresent?'':' with Video physically absent'));
 
+
+  await sections.getByRole('button',{name:'All videos',exact:true}).click();
+  await input.fill('A quiet journey');await card.waitFor();await page.waitForTimeout(300);
+  const notices=page.getByRole('region',{name:'Notifications'}),noticeRows=notices.locator('.action-notification');
+  while(await noticeRows.count())await noticeRows.first().getByRole('button',{name:'Dismiss notification'}).click();
+  const gridBefore=await page.locator('.download-grid').boundingBox();
+  const cardBefore=await card.boundingBox(),scrollBefore=await page.locator('.youtube-body main').evaluate(n=>n.scrollTop);
+  let oldestNotice='',movedNotice='',oldY=0;const noticeStart=Date.now();
+  for(let index=0;index<6;index++){
+    await selectPlaylists();const choice=membershipDialog.getByRole('checkbox').first();
+    await choice.setChecked(!await choice.isChecked());await membershipDialog.getByRole('button',{name:'Save',exact:true}).click();
+    await membershipDialog.waitFor({state:'detached'});
+    await page.waitForFunction(count=>document.querySelectorAll('.action-notification').length===count,Math.min(index+1,5));
+    if(index===0)oldestNotice=await noticeRows.first().getAttribute('data-notification-id');
+    if(index===4){movedNotice=await noticeRows.last().getAttribute('data-notification-id');oldY=(await noticeRows.last().boundingBox()).y;}
+    assert(await card.evaluate(n=>n===document.activeElement));
+  }
+  assert(Date.now()-noticeStart<6000,'Six actual Saves must complete inside the notice lifetime');
+  const liveIds=await noticeRows.evaluateAll(nodes=>nodes.map(n=>n.dataset.notificationId));
+  assert.equal(liveIds.length,5);assert(!liveIds.includes(oldestNotice));assert.equal(new Set(liveIds).size,5);
+  await page.waitForTimeout(230);
+  assert((await notices.locator('[data-notification-id="'+movedNotice+'"]').boundingBox()).y<oldY-20);
+  assert.deepEqual(await page.locator('.download-grid').boundingBox(),gridBefore);
+  assert.deepEqual(await card.boundingBox(),cardBefore);
+  assert.equal(await page.locator('.youtube-body main').evaluate(n=>n.scrollTop),scrollBefore);
+  assert.equal(await page.locator('.membership-notice').count(),0);
+  check('Six real membership Saves create at most five notices, older notices move upward, the oldest is replaced and grid/scroll/focus stay fixed');
+
+  const heldNotice=noticeRows.last(),heldId=await heldNotice.getAttribute('data-notification-id');
+  await heldNotice.hover();await page.waitForTimeout(6400);
+  assert.equal(await noticeRows.count(),1);assert.equal(await noticeRows.first().getAttribute('data-notification-id'),heldId);
+  await heldNotice.getByRole('button',{name:'Dismiss notification'}).focus();await page.mouse.move(600,120);await page.waitForTimeout(400);
+  assert.equal(await noticeRows.count(),1);
+  await input.focus();await page.waitForTimeout(6100);assert.equal(await noticeRows.count(),0);
+  check('Real six-second expiry pauses independently for hover and keyboard focus, resumes afterwards and leaves no stale notices');
+
+  await selectPlaylists();await membershipDialog.getByRole('button',{name:'Save',exact:true}).click();await membershipDialog.waitFor({state:'detached'});
+  const retainedId=await noticeRows.first().getAttribute('data-notification-id');
+  await page.getByRole('button',{name:'Open Keivotos menu'}).click();await page.locator('.app-drawer').getByRole('button',{name:'Settings',exact:true}).click();
+  const noticeSettings=page.getByRole('dialog',{name:'Settings',exact:true});
+  await noticeSettings.getByRole('navigation',{name:'Settings sections'}).getByRole('button',{name:'Appearance',exact:true}).first().click();
+  for(const corner of ['bottom-left','top-left','top-right','bottom-right']){
+    await page.getByLabel('Notification position',{exact:true}).selectOption(corner);await page.waitForTimeout(60);
+    assert.equal(await notices.getAttribute('data-position'),corner);
+    assert.equal(await noticeRows.first().getAttribute('data-notification-id'),retainedId);
+    const box=await notices.boundingBox();
+    assert(corner.endsWith('left')?box.x<30:box.x>1000);
+    assert(corner.startsWith('top')?box.y<30:box.y>700);
+  }
+  await page.getByLabel('Search settings',{exact:true}).fill('notification position');
+  await noticeSettings.getByRole('button',{name:/Notification position/}).click();await page.getByLabel('Notification position',{exact:true}).waitFor();
+  await page.getByLabel('Notification position',{exact:true}).selectOption('top-left');
+  await page.getByRole('button',{name:'Close settings',exact:true}).click();
+  await page.setViewportSize({width:360,height:780});
+  const narrow=await notices.boundingBox();assert(narrow.x>=0&&narrow.x+narrow.width<=360);
+  await page.screenshot({path:path.join(config.output,'notifications-corner.png')});
+  await page.setViewportSize({width:1440,height:1000});await page.reload();await input.waitFor();
+  assert.equal(await notices.getAttribute('data-position'),'top-left');assert.equal(await noticeRows.count(),0);
+  assert(await notices.evaluate(n=>{const r=n.getBoundingClientRect();return !n.contains(document.elementFromPoint(r.x+r.width/2,r.y+2));}));
+  check('All four corners reposition existing notices, Settings search finds the control, narrow geometry fits and reload retains only the corner');
+
+  await input.fill('A quiet journey');await card.waitFor();await page.waitForTimeout(250);
+  await page.emulateMedia({reducedMotion:'reduce'});
+  await selectPlaylists();await membershipDialog.getByRole('button',{name:'Save',exact:true}).click();await membershipDialog.waitFor({state:'detached'});
+  assert(await noticeRows.first().evaluate(n=>n.getAnimations().every(a=>a.playState!=='running')));
+  await noticeRows.first().getByRole('button',{name:'Dismiss notification'}).click();assert.equal(await noticeRows.count(),0);
+  await selectPlaylists();await membershipDialog.getByRole('button',{name:'Save',exact:true}).click();await membershipDialog.waitFor({state:'detached'});
+  await card.locator('.play-download').click();const notificationPlayer=page.getByRole('dialog',{name:'YouTube player',exact:true});
+  await notificationPlayer.waitFor();await notificationPlayer.getByRole('button',{name:'Fullscreen',exact:true}).click();
+  await page.waitForFunction(()=>!!document.fullscreenElement);
+  assert(await notices.evaluate(n=>document.fullscreenElement.contains(n)));
+  assert.equal(await noticeRows.count(),1);
+  await notificationPlayer.getByRole('button',{name:'Fullscreen',exact:true}).click();await page.waitForFunction(()=>!document.fullscreenElement);
+  assert(await notices.evaluate(n=>!n.closest('.video-viewer')));
+  await notices.evaluate(n=>window.__notificationHost=n);
+  await notificationPlayer.getByRole('button',{name:'Fullscreen',exact:true}).click();await page.waitForFunction(()=>!!document.fullscreenElement);
+  await notificationPlayer.getByRole('button',{name:'Back to downloads',exact:true}).click();await notificationPlayer.waitFor({state:'detached'});await page.waitForFunction(()=>!document.fullscreenElement);
+  await notices.waitFor();assert(await notices.evaluate(n=>n===window.__notificationHost&&!n.closest('.video-viewer')));
+  if(await noticeRows.count())await noticeRows.first().getByRole('button',{name:'Dismiss notification'}).click();assert.equal(await noticeRows.count(),0);
+  await page.emulateMedia({reducedMotion:'no-preference'});
+  check('Reduced motion suppresses entry animation; the same host enters/exits native fullscreen, survives closing the fullscreen viewer and permits manual dismissal');
   assert.deepEqual(report.errors,[]);
  }finally{fs.writeFileSync(path.join(config.output,'report.json'),JSON.stringify(report,null,2));await context.tracing.stop({path:path.join(config.output,'trace.zip')});await browser.close();}
 })().catch(e=>{console.error(e);process.exitCode=1;});

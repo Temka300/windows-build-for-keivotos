@@ -1,5 +1,6 @@
 <script lang="ts">
   import { accentStyle, accents, type AccentStyle } from '../lib/appearance';
+  import { notificationPosition, type NotificationPosition } from '../lib/notifications';
   import ModulesSettings from './ModulesSettings.svelte';
   import AdvancedSettings from './AdvancedSettings.svelte';
   import { getContext } from 'svelte';
@@ -32,6 +33,10 @@
     { value: 'default', label: 'Default' },
     { value: 'comfortable', label: 'Comfortable' },
   ];
+  const notificationPositions: { value: NotificationPosition; label: string }[] = [
+    { value: 'bottom-right', label: 'Bottom right' }, { value: 'bottom-left', label: 'Bottom left' },
+    { value: 'top-right', label: 'Top right' }, { value: 'top-left', label: 'Top left' },
+  ];
 
 </script>
 
@@ -59,6 +64,12 @@
                 <div id="setting-interface-scale" class="flex items-center justify-between gap-5 px-4 py-3">
                   <div class="text-sm font-medium text-gray-200">Interface scale</div>
                   <div class="flex divide-x divide-[#303040] overflow-hidden rounded-lg border border-[#303040]">{#each interfaceScaleOptions as option}<button class={compactSegmentClass($interfaceScale === option.value)} type="button" on:click={() => interfaceScale.set(option.value)}>{option.label}</button>{/each}</div>
+                </div>
+                <div id="setting-notification-position" class="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
+                  <label for="notification-position" class="text-sm font-medium text-gray-200">Notification position</label>
+                  <select id="notification-position" class="rounded-lg border border-[#303040] bg-[#0d0d13] px-3 py-2 text-xs text-gray-200" value={$notificationPosition} on:change={event => notificationPosition.set(event.currentTarget.value as NotificationPosition)}>
+                    {#each notificationPositions as option}<option value={option.value}>{option.label}</option>{/each}
+                  </select>
                 </div>
               </div>
             </section>

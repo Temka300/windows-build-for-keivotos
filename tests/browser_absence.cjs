@@ -51,8 +51,14 @@ const report={checks:[],errors:[],requests:[]};
   for(const name of ['Startup','Data & storage','Backup','Folders','Attachments','Appearance']){
    await dialog.getByRole('navigation',{name:'Settings sections'}).getByRole('button',{name,exact:true}).click();
   }
+  await dialog.getByRole('navigation',{name:'Settings sections'}).getByRole('button',{name:'Appearance',exact:true}).first().click();
+  await page.getByLabel('Notification position',{exact:true}).selectOption('top-right');
+  assert.equal(await page.locator('.notification-overlay').getAttribute('data-position'),'top-right');
+  assert.equal(await page.locator('.action-notification').count(),0);
+  check('Shared notification host and saved position setting work with all optional modules physically absent');
   await page.getByRole('button',{name:'Close settings',exact:true}).click();
   check('suite drawer and every remaining Settings section work without module UI');
+
   const paths=(await (await context.request.get(config.url+'/openapi.json')).json()).paths;
   assert(!paths['/api/images']);assert(!paths['/api/danbooru/credentials']);assert(!paths['/api/language/documents']);assert(paths['/api/files/sources']);
   assert(!paths['/api/ost/folders']);assert(!paths['/api/ost/library']);

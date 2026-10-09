@@ -12,13 +12,14 @@
  import PlaylistQueuePanel from './PlaylistQueuePanel.svelte';
  import {filesApi} from '../../lib/filesApi';
  import {moduleSidebarPreferences} from '../../lib/moduleSidebarPreferences';
+ import {notify,updateNotification,dismissNotification} from '../../lib/notifications';
  import {youtubeApi,type Download,type EngineStatus,type Playlist,type PlaylistItem} from './api';
  let drawer=false,query='',video='best',audio='best',optionsOpen=false;
  let section:'videos'|'playlists'='videos',createOpen=false,createAnchor:HTMLButtonElement|null=null,playlistsView:PlaylistsView;
  function chooseSection(next:'videos'|'playlists'){abandonPlaylist();if(window.matchMedia('(max-width:700px)').matches)moduleSidebarPreferences('youtube').open.set(false);section=next;optionsOpen=false;clearTimeout(debounce);request?.abort();loading=false;if(next==='videos')void load(false,true);}
  function createPlaylist(anchor:HTMLButtonElement){createAnchor=anchor;createOpen=true;}
  async function closeCreate(){createOpen=false;await tick();if(createAnchor?.isConnected)createAnchor.focus();}
- async function created(playlist:Playlist){playlistsView?.acceptCreated(playlist);await closeCreate();}
+ async function created(playlist:Playlist){playlistsView?.acceptCreated(playlist);notify('Playlist created: '+playlist.title+'.',{tone:'success'});await closeCreate();}
  let status:EngineStatus|null=null,items:Download[]=[],total=0,error='',busy=false,loading=false;
  let request:AbortController|null=null,timer:ReturnType<typeof setTimeout>,debounce:ReturnType<typeof setTimeout>,alive=true;
  let selected:Download|null=null,returnFocus:HTMLElement|null=null,navigating=false,navigationNotice='';
@@ -115,11 +116,11 @@
  $: queueWrap=activePlaylist?playlistTotal>1:playable.length>1||items.length<total;
 
  let locationMenu:{x:number;y:number;label:string;sourceId:string|null;relativePath:string|null;anchor:HTMLElement;unavailableReason:string}|null=null;
- let locationMenuSerial=0,membershipVideo:Download|null=null,membershipAnchor:HTMLElement|null=null,membershipNotice='';
+ let locationMenuSerial=0,membershipVideo:Download|null=null,membershipAnchor:HTMLElement|null=null;
  let locationVideo:Download|null=null;
  $: addReason=locationVideo?.status!=='complete'?'This download has no completed local file.':locationVideo&&(locationVideo.video==='audio'||isAudio(locationVideo))?'Audio-only downloads cannot be added to video playlists.':'';
- function chooseMembership(){if(!locationVideo||addReason)return;membershipVideo=locationVideo;membershipNotice='';}
- async function closeMembership(saved=false){if(saved)membershipNotice='Playlists updated for '+(membershipVideo?.title||'YouTube video')+'.';membershipVideo=null;await tick();membershipAnchor?.focus();}
+ function chooseMembership(){if(!locationVideo||addReason)return;membershipVideo=locationVideo;}
+ async function closeMembership(saved=false){if(saved)notify('Playlists updated for '+(membershipVideo?.title||'YouTube video')+'.',{tone:'success'});membershipVideo=null;await tick();membershipAnchor?.focus();}
  let changing=new Set<string>();
  function openLocation(event:MouseEvent|KeyboardEvent,item:Download){
   event.preventDefault();event.stopPropagation();
@@ -177,6 +178,26 @@
  $: urlMode=isVideoUrl(query);
  $: searchQuery=urlMode?'':query;
  const active=(item:Download)=>['queued','downloading','merging'].includes(item.status);
+ const noticedJobs=new Map<string,string>();
+ const downloadNoticeId=(item:Download)=>'youtube-download-'+item.id;
+ function announceDownload(item:Download){
+  const title=item.title||item.url||'YouTube video';
+  const message=(item.status==='queued'?'Download queued: ':item.status==='merging'?'Finishing download: ':'Downloading: ')+title;
+  const values={message,tone:'info' as const,progress:item.progress};
+  if(noticedJobs.has(item.id))updateNotification(downloadNoticeId(item),values);
+  else notify(message,{id:downloadNoticeId(item),tone:'info',progress:item.progress});
+  noticedJobs.set(item.id,item.status);
+  if(noticedJobs.size>256)noticedJobs.delete(noticedJobs.keys().next().value!);
+ }
+ function observeDownloads(rows:Download[]){
+  for(const item of rows){
+   if(active(item)){announceDownload(item);continue;}
+   if(!noticedJobs.delete(item.id))continue;
+   const title=item.title||item.url||'YouTube video';
+   if(item.status==='complete')notify('Download complete: '+title+'.',{id:downloadNoticeId(item),tone:'success'});
+   else if(item.status==='failed')notify('Download failed: '+title+'. '+item.error,{id:downloadNoticeId(item),tone:'error'});
+  }
+ }
  async function engine(){try{status=await youtubeApi.status();}catch(e){error=String(e);}}
  async function load(more=false,refresh=false){
    request?.abort();const current=new AbortController();request=current;loading=true;
@@ -193,6 +214,7 @@
     // that another retry/cancellation has already removed from the server.
     items=[...new Map((more?[...items,...rows]:rows).filter(row=>row.status!=='cancelled'&&!row.superseded_by).map(row=>[row.id,row])).values()];
     total=count;
+    observeDownloads(items);
    }
    catch(e){if(!current.signal.aborted&&alive)error=e instanceof Error?e.message:'Could not load downloads.';}
    finally{if(current===request)loading=false;}
@@ -200,7 +222,7 @@
  function input(){request?.abort();clearTimeout(debounce);debounce=setTimeout(()=>void load(),200);}
  async function start(){
   busy=true;error='';
-  try{const item=await youtubeApi.download(query.trim(),video,audio);query='';optionsOpen=false;items=[item,...items];total++;await load();}
+  try{const item=await youtubeApi.download(query.trim(),video,audio);if(!alive)return;announceDownload(item);query='';optionsOpen=false;items=[item,...items];total++;await load();}
   catch(e){error=e instanceof Error?e.message:'Could not start download.';}
   finally{busy=false;}
  }
@@ -210,6 +232,8 @@
   try{
    const updated=await(retry?youtubeApi.retry(item.id):youtubeApi.cancel(item.id));
    if(!alive)return;
+   if(retry){noticedJobs.delete(item.id);dismissNotification(downloadNoticeId(item));announceDownload(updated);}
+   else {noticedJobs.delete(item.id);notify('Download canceled: '+(item.title||item.url||'YouTube video')+'.',{id:downloadNoticeId(item)});}
    request?.abort();
    const removed=items.filter(row=>row.id===item.id||row.id===updated.id).length;
    items=items.filter(row=>row.id!==item.id&&row.id!==updated.id);
@@ -239,7 +263,6 @@
  {#if section==='videos'}
  <main>
   {#if error}<p role="alert">{error}</p>{/if}
-  {#if membershipNotice}<p class="membership-notice" role="status">{membershipNotice}</p>{/if}
   {#if !items.length&&!loading&&!error}<p class="empty">{searchQuery?'No videos match your search.':'No videos yet.'}</p>{/if}
   <div class="download-grid" aria-busy={loading}>
    {#each items as item (item.id)}
@@ -324,7 +347,6 @@
  .download{width:100%;background:var(--accent);color:#111118;padding:9px 12px;border-radius:20px;font-size:13px;font-weight:600}.download:disabled{opacity:.4}.download-options p{grid-column:1/-1;font-size:12px;color:#aaa;padding:0 8px}
  @media(max-width:700px){.module-title{display:none}}
  @media(max-width:400px){header{gap:8px;padding-inline:8px}.search-controls{gap:6px}.download-reveal{width:92px}.download{padding-inline:6px}}
- .membership-notice{font-size:13px;color:#d8b4fe;margin-bottom:16px}
  .youtube-body{display:flex;position:relative;flex:1;min-width:0;min-height:0;overflow:hidden}
  main{overflow:auto;flex:1;padding:24px;min-width:0;min-height:0}.empty{color:#9ca3af;font-size:14px}.download-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(260px,100%),1fr));gap:24px 18px}
  article{min-width:0}.thumbnail{aspect-ratio:16/9;background:#1a1a24;border-radius:10px;position:relative;overflow:hidden}.thumbnail a,.thumbnail .play-download{display:grid;place-items:center;width:100%;height:100%}.thumbnail img{width:100%;height:100%;object-fit:cover;position:absolute}.thumbnail svg{width:28px;height:28px;fill:none;stroke:#ddd;stroke-width:1.5;position:relative;opacity:.7}
