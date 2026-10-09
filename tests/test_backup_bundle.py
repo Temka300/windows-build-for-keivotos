@@ -128,7 +128,7 @@ class MetadataBackupBundleTests(unittest.TestCase):
 
     def test_manga_progress_survives_complete_user_backup_restore(self) -> None:
         from modules.manga.user_schema import publish
-        with sqlite3.connect(self.user_db) as connection:
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
             publish(connection)
             connection.execute("INSERT INTO manga_reading_sessions VALUES ('source','Story/Chapter','folder',4)")
             connection.execute("""INSERT INTO manga_reading_progress VALUES
@@ -136,11 +136,11 @@ class MetadataBackupBundleTests(unittest.TestCase):
             connection.commit()
         with patch('suite_modules.enabled_ids', side_effect=AssertionError('Personal backup ignores enablement')):
             created = backup_bundle.create_backup_bundle()
-        with sqlite3.connect(self.user_db) as connection:
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
             connection.execute('UPDATE manga_reading_progress SET page=2')
             connection.commit()
         backup_bundle.restore_backup_bundle(created['name'])
-        with sqlite3.connect(self.user_db) as connection:
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
             self.assertEqual(connection.execute('SELECT page,anchor,generation,sequence FROM manga_reading_progress').fetchone(), (1,0.35,4,7))
             self.assertEqual(connection.execute('SELECT generation FROM manga_reading_sessions').fetchone(), (4,))
             self.assertEqual(connection.execute('SELECT value FROM marker').fetchone(), ('user-original',))
@@ -148,7 +148,7 @@ class MetadataBackupBundleTests(unittest.TestCase):
 
     def test_youtube_playlists_survive_complete_user_backup_restore(self) -> None:
         from modules.youtube import _publish
-        with sqlite3.connect(self.user_db) as connection:
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
             _publish(connection)
             connection.execute("INSERT INTO youtube_playlists(id,request_id,title) VALUES ('playlist','request','공부 음악')")
             connection.execute("INSERT INTO youtube_playlist_items(playlist_id,job_id,position) VALUES ('playlist','retained-job',7)")
@@ -156,12 +156,12 @@ class MetadataBackupBundleTests(unittest.TestCase):
             connection.commit()
         with patch('suite_modules.enabled_ids', side_effect=AssertionError('Personal backup ignores enablement')):
             created=backup_bundle.create_backup_bundle()
-        with sqlite3.connect(self.user_db) as connection:
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
             connection.execute("UPDATE youtube_playlists SET title='later title'")
             connection.execute('UPDATE youtube_playlist_versions SET version=4')
             connection.commit()
         backup_bundle.restore_backup_bundle(created['name'])
-        with sqlite3.connect(self.user_db) as connection:
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
             self.assertEqual(connection.execute('SELECT title FROM youtube_playlists').fetchone(), ('공부 음악',))
             self.assertEqual(connection.execute('SELECT job_id,position FROM youtube_playlist_items').fetchone(), ('retained-job',7))
             self.assertEqual(connection.execute('SELECT version FROM youtube_playlist_versions').fetchone(), (3,))
