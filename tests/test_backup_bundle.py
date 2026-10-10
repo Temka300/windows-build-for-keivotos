@@ -173,6 +173,28 @@ class MetadataBackupBundleTests(unittest.TestCase):
             self.assertEqual(connection.execute('SELECT value FROM marker').fetchone()[0],'user-original')
         self.assertEqual(self.external_image.read_bytes(),b'original-image-must-stay')
 
+    def test_compound_practice_and_preserved_legacy_choices_roundtrip(self) -> None:
+        from modules.language import study
+        from modules.language.user_schema import publish
+        legacy = (1,'native','korean',17,20)
+        choice = study.StudyPreferences(category='date_time',answer_language='english',minimum=1,maximum=262800)
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
+            publish(connection)
+            connection.execute('INSERT INTO language_study_preferences VALUES (?,?,?,?,?)',legacy)
+            study.save(connection,choice)
+        with patch('suite_modules.enabled_ids',side_effect=AssertionError('Personal backup ignores enablement')):
+            created=backup_bundle.create_backup_bundle()
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
+            study.save(connection,study.StudyPreferences())
+        backup_bundle.restore_backup_bundle(created['name'])
+        with closing(sqlite3.connect(self.user_db)) as connection:
+            connection.row_factory=sqlite3.Row
+            publish(connection)
+            self.assertEqual(study.read(connection),choice)
+            self.assertEqual(tuple(connection.execute('SELECT * FROM language_study_preferences').fetchone()),legacy)
+            self.assertEqual(connection.execute('SELECT value FROM marker').fetchone()[0],'user-original')
+        self.assertEqual(self.external_image.read_bytes(),b'original-image-must-stay')
+
     def test_manga_progress_survives_complete_user_backup_restore(self) -> None:
         from modules.manga.user_schema import publish
         with closing(sqlite3.connect(self.user_db)) as connection, connection:

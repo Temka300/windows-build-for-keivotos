@@ -1,7 +1,7 @@
 <script lang="ts">
   import {onMount,onDestroy,tick} from 'svelte';
   import {languageApi} from './api';
-  import {accepts,categories,defaultPreferences,nextQuestion,validPreferences,type StudyPreferences} from './koreanPractice';
+  import {accepts,categories,defaultPreferences,isCompound,nextQuestion,validPreferences,type StudyPreferences} from './koreanPractice';
 
   export let active=true;
   let preferences:StudyPreferences={...defaultPreferences};
@@ -16,10 +16,12 @@
   async function focusAnswer(){await tick();if(alive&&active)input?.focus();}
   function next(){current=nextQuestion(preferences,current);answer='';checked=null;void focusAnswer();}
   function check(){if(loading||rangeWarning||composing||checked!==null||!answer.trim())return;checked=accepts(current,answer);}
+  function advance(){if(loading||rangeWarning||composing)return;if(checked===null)check();else next();}
   function answerKey(event:KeyboardEvent){
     if(event.key!=='Enter')return;
+    event.preventDefault();
     if(event.isComposing||event.keyCode===229||composing||event.repeat)return;
-    event.preventDefault();check();
+    advance();
   }
   async function load(){
     loading=true;
@@ -73,24 +75,23 @@
           <option value="korean">Korean</option><option value="english">English</option>
         </select></label>
       </div>
-      <div class="practice-range">
+      {#if !isCompound(preferences.category)}<div class="practice-range">
         <label>From<input type="number" min="1" max={categoryMaximum} step="1" bind:value={preferences.minimum} on:change={()=>choose()} disabled={loading}/></label>
         <label>To<input type="number" min="1" max={categoryMaximum} step="1" bind:value={preferences.maximum} on:change={()=>choose()} disabled={loading}/></label>
-      </div>
+      </div>{/if}
       {#if rangeWarning}<p class="warning" role="alert">{rangeWarning}</p>{/if}
       <p class="practice-system">{categories.find(c=>c.id===current.category)?.label}</p>
       <p class="practice-prompt" lang={current.answerLanguage==='english'?'ko':'en'}>{current.prompt}</p>
-      <label class="answer-label" for="korean-practice-answer">Your answer in {current.answerLanguage==='korean'?'Korean':'English'}</label>
+      <label class="answer-label" for="korean-practice-answer">Your answer in {current.answerLanguage==='korean'?'Korean':'English'}{current.answerLanguage==='english'&&(current.category==='month_date'||current.category==='date_time')?' (month/day)':''}</label>
       <input id="korean-practice-answer" class="practice-answer" bind:this={input} bind:value={answer}
         lang={current.answerLanguage==='korean'?'ko':'en'} maxlength="256" autocomplete="off" spellcheck="false"
-        disabled={loading||!!rangeWarning||checked!==null} on:keydown={answerKey}
+        disabled={loading||!!rangeWarning} readonly={checked!==null} on:keydown={answerKey}
         on:compositionstart={()=>composing=true} on:compositionend={()=>composing=false}/>
       <div class="practice-feedback" aria-live="polite" aria-atomic="true">
         {#if checked!==null}<p class:correct={checked}>{checked?'Correct':'Not quite'}<span>Answer: <strong lang={current.answerLanguage==='korean'?'ko':'en'}>{current.answer}</strong></span></p>{/if}
       </div>
       <div class="practice-actions">
-        <button on:click={check} disabled={loading||!!rangeWarning||composing||!answer.trim()||checked!==null}>Check</button>
-        <button on:click={next} disabled={loading||!!rangeWarning||checked===null}>Next</button>
+        <button on:click={advance} on:keydown={answerKey} disabled={loading||!!rangeWarning||composing||(checked===null&&!answer.trim())}>{checked===null?'Check':'Next'}</button>
       </div>
       {#if settingsWarning}<div class="settings-warning" role="status"><p>{settingsWarning}</p><button on:click={retrySettings} disabled={loading||saving||!!rangeWarning}>Retry settings</button></div>{/if}
     </div>

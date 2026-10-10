@@ -50,5 +50,47 @@ try {
     assert.equal(nextQuestion({...settings,minimum:1,maximum:1},previous).value,1);
     assert.throws(()=>question(category,0,'korean'),RangeError);assert.throws(()=>question(category,answers.length+1,'korean'),RangeError);
   }
+  const cases=[
+    ['month_date',74,'삼월 십오일','March 15',['3/15','03/15','March fifteenth','march fifteen'],['15/3','April 15','15']],
+    ['month_date',59,'이월 이십팔일','February 28',['2/28','February twenty-eighth'],['February 29','2/29']],
+    ['month_date',60,'삼월 일일','March 1',['3/1','March first'],['2/29','3/2']],
+    ['month_date',152,'유월 일일','June 1',['6/1','June first'],['6/2']],
+    ['month_date',274,'시월 일일','October 1',['10/1','October first'],['10/2']],
+    ['hour_minute',146,'세 시 이십오 분','3:25',['03:25','three twenty-five','three hours twenty-five minutes'],['3:26','25','25:3']],
+    ['hour_minute',121,'세 시','3:00',["three o'clock",'03:00'],['3:01','3']],
+    ['hour_minute',126,'세 시 오 분','3:05',['three oh five','three zero five'],['3:50']],
+    ['hour_minute',720,'열두 시 오십구 분','12:59',['twelve fifty-nine'],['13:59','12:60']],
+    ['date_time',52706,'삼월 십오일 세 시 이십오 분','March 15, 3:25',['3/15 3:25','March fifteenth, three twenty-five'],['March 15','3:25','15/3 3:25','March 15 3:26']],
+    ['date_time',262800,'십이월 삼십일일 열두 시 오십구 분','December 31, 12:59',['12/31 12:59','December thirty-first twelve fifty-nine'],['December 32 12:59']],
+  ];
+  for(const [category,index,korean,english,good,bad] of cases){
+    const k=question(category,index,'korean'),e=question(category,index,'english');
+    assert.equal(k.answer,korean);assert.equal(e.prompt,korean);assert.equal(e.answer,english);
+    assert(accepts(k,korean));assert(accepts(k,korean.normalize('NFD')));assert(accepts(k,korean.replace(/ /g,'')));
+    assert(accepts(e,english));for(const alias of good)assert(accepts(e,alias),alias);
+    for(const alias of bad)assert(!accepts(e,alias),alias);
+    assert(!accepts(k,korean.replace('세 시','셋 시'))||!korean.includes('세 시'));
+    assert(!accepts(k,korean+'요'));assert(!accepts(k,korean.replace('십오','십 오'))||!korean.includes('십오'));
+    assert(!accepts(e,String(index)));assert(!accepts(e,'x'.repeat(257)));
+  }
+  assert(accepts(question('date_time',52706,'korean'),'삼 월 십오 일 세시 이십오분'));
+  assert(!accepts(question('month_date',152,'korean'),'육월 일일'));
+  assert(!accepts(question('month_date',274,'korean'),'십 월 일일'));
+  let dates=0,times=0;
+  const lengths=[31,28,31,30,31,30,31,31,30,31,30,31];
+  for(let m=1;m<=12;m++)for(let d=1;d<=lengths[m-1];d++){
+    dates++;assert.equal(question('month_date',dates,'english').prompt,months[m-1]+' '+sino[d-1]+'일');
+  }
+  for(let h=1;h<=12;h++)for(let m=0;m<60;m++){
+    times++;assert.equal(question('hour_minute',times,'english').prompt,hours[h-1]+(m?' '+sino[m-1]+' 분':''));
+  }
+  assert.equal(dates,365);assert.equal(times,720);
+  for(const [category,maximum] of [['month_date',365],['hour_minute',720],['date_time',262800]]){
+    const p={category,answer_language:'english',minimum:1,maximum};assert(validPreferences(p));
+    assert.equal(nextQuestion(p,undefined,()=>0).value,1);assert.equal(nextQuestion(p,undefined,()=>1).value,maximum);
+    assert.equal(nextQuestion(p,question(category,maximum,'english'),()=>1).value,1);
+    assert(!validPreferences({...p,maximum:maximum+1}));assert.throws(()=>question(category,maximum+1,'korean'),RangeError);
+  }
   console.log(`PASS: all ${finite} finite questions in both directions, written exceptions, bounded aliases, wrong systems, ranges and non-repeating selection`);
+  console.log('PASS: all 365 dates/720 times, combined date/time boundaries, digits/words, Korean units, component order and bounded non-repeating generation');
 } finally {await rm(temporary,{recursive:true,force:true});}

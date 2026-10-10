@@ -70,6 +70,7 @@ const report={checks:[],errors:[],requests:[]};
   assert.equal(await page.getByRole('navigation',{name:'YouTube sections'}).count(),0);
   assert.equal(await page.getByRole('navigation',{name:'Language sections'}).count(),0);
   assert.equal(await page.locator('[data-sidebar-owner]').count(),0);
+  assert.equal(await page.locator('.module-sidebar-grip-track,.practice-actions,.practice-card').count(),0);
   assert.equal(await page.getByRole('menuitem',{name:'Add to playlists'}).count(),0);
   assert.equal(await page.getByRole('dialog',{name:'Add to playlists'}).count(),0);
   check('Files-only UI has no YouTube sidebar or playlist routes/requests when optional owners are absent');

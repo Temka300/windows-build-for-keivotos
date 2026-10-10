@@ -593,6 +593,8 @@ assert.match(config.home,/[/\\]keivotos-modularization-[^/\\]+[/\\]home$/);
   await nav.locator('.app-drawer').getByRole('button',{name:'Language',exact:true}).click();
   const navSections=nav.getByRole('navigation',{name:'Language sections'}),navDock=nav.locator('[data-sidebar-owner="language"]'),navGrip=navDock.locator('[data-module-sidebar-grip]');
   await navSections.waitFor();await nav.waitForTimeout(350);
+  assert.equal(await navGrip.locator('.dots > span').count(),3);
+  assert.equal(await navGrip.locator('.dots').textContent(),'');
   const entry=await nav.evaluate(()=>window.__languageEntryWidths);
   assert(entry.some(width=>width<1)&&entry.some(width=>width>1&&width<255)&&entry.some(width=>width>=255),JSON.stringify(entry));
   await nav.evaluate(()=>{
@@ -687,6 +689,14 @@ assert.match(config.home,/[/\\]keivotos-modularization-[^/\\]+[/\\]home$/);
 
   for(const viewport of [{width:1280,height:140},{width:360,height:700}]){
    await nav.setViewportSize(viewport);
+   if(viewport.width===360){
+    await nav.waitForTimeout(330);
+    const panel=await navDock.locator('.module-sidebar-panel').boundingBox(),handle=await navGrip.boundingBox();
+    assert(Math.abs(handle.x-(panel.x+panel.width))<1);assert(handle.x+handle.width<=viewport.width);
+    await navGrip.hover();await nav.waitForTimeout(200);assert(Number(await navVisual.evaluate(node=>getComputedStyle(node).opacity))>.95);
+    await navGrip.click();await nav.waitForTimeout(330);assert.equal(await navGrip.getAttribute('aria-expanded'),'false');assert((await navGrip.boundingBox()).x<1);
+    await navGrip.click();await nav.waitForTimeout(330);assert.equal(await navGrip.getAttribute('aria-expanded'),'true');
+   }
    if(viewport.height===140){assert(await navSections.evaluate(node=>node.scrollHeight>node.clientHeight));await navSections.hover();await nav.mouse.wheel(0,160);await nav.waitForTimeout(100);assert(await navSections.evaluate(node=>node.scrollTop>0));}
    const bounds=await navEditor.boundingBox();assert(bounds.x>=0&&bounds.x+bounds.width<=viewport.width);
   }
@@ -701,7 +711,7 @@ assert.match(config.home,/[/\\]keivotos-modularization-[^/\\]+[/\\]home$/);
   assert.equal(await restoredNav.evaluate(()=>localStorage.getItem('keivotos:youtube-sidebar-handle-position')),'41');
   await reloadContext.close();await navGrip.click();await nav.waitForTimeout(330);
   await nav.screenshot({path:path.join(config.output,'language-study-navigation.png')});
-  check('Language sections scroll in short windows, editor fits a narrow window, and a fresh browser session restores Language dock preferences independently of YouTube');
+  check('Language three-dot Danbooru-style grip stays reachable at the narrow panel edge, closes/reopens and restores independently; sections scroll in short windows');
 
   await navSections.getByRole('button',{name:'Practice',exact:true}).click();
   const practice=nav.getByRole('region',{name:'Practice',exact:true});
@@ -727,11 +737,21 @@ assert.match(config.home,/[/\\]keivotos-modularization-[^/\\]+[/\\]home$/);
   await category.waitFor();await nav.waitForFunction(()=>!document.querySelector('.practice-card select').disabled);
   await choosePractice('sino','english',17);assert.equal(await prompt.textContent(),'십칠');
   await answerBox().fill('17');await answerBox().press('Enter');assert.match(await feedback.textContent(),/^Correct/);
-  await nav.keyboard.press('Enter');assert.equal(await prompt.textContent(),'십칠');assert.match(await feedback.textContent(),/^Correct/);
-  await practiceNext.click();assert.equal(await answerBox().inputValue(),'');assert.equal(await feedback.textContent(),'');
+  assert.equal(await practice.locator('.practice-actions button').count(),1);
+  assert(await answerBox().evaluate(node=>node.readOnly&&!node.disabled&&node===document.activeElement));
+  await answerBox().dispatchEvent('keydown',{key:'Enter',repeat:true});assert.match(await feedback.textContent(),/^Correct/);
+  await answerBox().dispatchEvent('keydown',{key:'Enter',isComposing:true});assert.match(await feedback.textContent(),/^Correct/);
+  await answerBox().dispatchEvent('keydown',{key:'Enter',keyCode:229});assert.match(await feedback.textContent(),/^Correct/);
+  await nav.keyboard.press('Enter');assert.equal(await answerBox().inputValue(),'');assert.equal(await feedback.textContent(),'');
   assert(await answerBox().evaluate(node=>node===document.activeElement));
   await answerBox().fill('Seventeen');await practiceCheck.click();assert.match(await feedback.textContent(),/^Correct/);
-  check('centered practice card accepts English digits and words; Enter checks once and Next explicitly clears feedback and focuses the answer');
+  await practiceNext.dispatchEvent('keydown',{key:'Enter',repeat:true});assert.match(await feedback.textContent(),/^Correct/);
+  await practiceNext.dispatchEvent('keydown',{key:'Enter',isComposing:true});assert.match(await feedback.textContent(),/^Correct/);
+  await practiceNext.focus();await nav.keyboard.press('Enter');assert.equal(await feedback.textContent(),'');assert(await answerBox().evaluate(node=>node===document.activeElement));
+  await answerBox().fill('wrong');await practiceCheck.click();assert.match(await feedback.textContent(),/^Not quite/);
+  await practiceNext.click();assert.equal(await feedback.textContent(),'');
+  assert(await practiceCheck.isDisabled());await answerBox().press('Enter');assert.equal(await feedback.textContent(),'');
+  check('one Check/Next button and two separate Enter presses work for correct/incorrect answers; graded input retains focus/read-only text; held/composing/229 keys cannot advance');
 
   const koreanExamples=[['sino',16,'십육','심뉵'],['native',20,'스물','스무'],['months',6,'유월','육월'],['months',10,'시월','십월'],['dates',31,'삼십일일','삼십일'],['hours',11,'열한 시','열하나 시'],['minutes',59,'오십구 분','쉰아홉 분']];
   for(const [id,value,written,wrong] of koreanExamples){
@@ -748,9 +768,38 @@ assert.match(config.home,/[/\\]keivotos-modularization-[^/\\]+[/\\]home$/);
   await answerBox().press('Enter');assert.match(await feedback.textContent(),/^Correct/);
   await practiceNext.click();await direction.selectOption('english');assert.equal(await prompt.textContent(),'세 시');
   await answerBox().fill("three o'clock");await answerBox().press('Enter');assert.match(await feedback.textContent(),/^Correct/);
-  await from.fill('13');await from.press('Tab');await practice.getByRole('alert').waitFor();assert(await practiceCheck.isDisabled());
+  await from.fill('13');await from.press('Tab');await practice.getByRole('alert').waitFor();assert(await practice.locator('.practice-actions button').isDisabled());
   await from.fill('3');await from.press('Tab');assert.equal(await practice.getByRole('alert').count(),0);
   check('composing Hangul and keyCode 229 never grade an unfinished answer; a later Enter grades once; category-specific unit spacing and range guards work');
+
+  await nav.evaluate(()=>{window.__practiceOriginalRandom=Math.random;});
+  const compoundCases=[
+   ['month_date',365,74,'삼월 십오일','3/15','March fifteenth'],
+   ['hour_minute',720,146,'세 시 이십오 분','3:25','three twenty-five'],
+   ['date_time',262800,52706,'삼월 십오일 세 시 이십오 분','3/15 3:25','March fifteenth, three twenty-five'],
+  ];
+  for(const [id,maximum,index,korean,digits,words] of compoundCases){
+   await category.selectOption('sino');await direction.selectOption('english');
+   await nav.evaluate(({maximum,index})=>{Math.random=()=>(index-.75)/maximum;},{maximum,index});
+   await category.selectOption(id);assert.equal(await prompt.textContent(),korean);
+   assert.equal(await practice.getByRole('spinbutton').count(),0);
+   await answerBox().fill(digits);await answerBox().press('Enter');assert.match(await feedback.textContent(),/^Correct/);
+   await category.selectOption('sino');await category.selectOption(id);
+   await answerBox().fill(words);await practiceCheck.click();assert.match(await feedback.textContent(),/^Correct/);
+   await category.selectOption('sino');await direction.selectOption('korean');await category.selectOption(id);
+   await answerBox().fill(korean.replace(/ /g,''));await practiceCheck.click();assert.match(await feedback.textContent(),/^Correct/);
+   await savedPractice({category:id,answer_language:'korean',minimum:1,maximum});
+  }
+  await nav.screenshot({path:path.join(config.output,'language-compound-practice.png')});
+  const compoundContext=await browser.newContext({viewport:{width:1280,height:850}}),compoundPage=await compoundContext.newPage();
+  compoundPage.on('pageerror',error=>report.errors.push(error.message));await compoundPage.goto(config.url);
+  await compoundPage.getByRole('button',{name:'Open Keivotos menu'}).click();await compoundPage.locator('.app-drawer').getByRole('button',{name:'Language',exact:true}).click();
+  await compoundPage.getByRole('navigation',{name:'Language sections'}).getByRole('button',{name:'Practice',exact:true}).click();
+  await compoundPage.waitForFunction(()=>document.querySelector('.practice-card select')?.value==='date_time');
+  assert.equal(await compoundPage.locator('.practice-card select').nth(1).inputValue(),'korean');assert.equal(await compoundPage.locator('.practice-range').count(),0);
+  await compoundContext.close();await nav.evaluate(()=>{Math.random=window.__practiceOriginalRandom;delete window.__practiceOriginalRandom;});
+  await choosePractice('hours','english',3);
+  check('all three compound modes hide single-value ranges, accept English digits/words and Korean unit spacing, and restore their SQLite category/direction in a fresh browser');
 
   const savedChoice={category:'hours',answer_language:'english',minimum:3,maximum:3};await savedPractice(savedChoice);
   const restartContext=await browser.newContext({viewport:{width:1280,height:850}});

@@ -430,6 +430,7 @@ def test_practice_defaults_do_not_write_and_settings_survive_process_restart(stu
     assert status == 200 and defaults == {'category':'sino','answer_language':'english','minimum':1,'maximum':99}
     with connect() as connection:
         assert connection.execute('SELECT COUNT(*) FROM language_study_preferences').fetchone()[0] == 0
+        assert connection.execute('SELECT COUNT(*) FROM language_study_preferences_v2').fetchone()[0] == 0
     choice = {'category':'minutes','answer_language':'korean','minimum':16,'maximum':59}
     assert language_http(monkeypatch, 'PUT', '/api/language/study/preferences', choice) == (200, choice)
     code = '''import json,sqlite3,sys
@@ -445,11 +446,13 @@ with closing(sqlite3.connect(sys.argv[1])) as connection:
     assert json.loads(result.stdout) == choice
     with connect() as connection:
         language.descriptor(path.parent, 'test').publish(connection)
-        assert dict(connection.execute('SELECT * FROM language_study_preferences').fetchone()) == {'id':1,**choice}
+        assert dict(connection.execute('SELECT * FROM language_study_preferences_v2').fetchone()) == {'id':1,**choice}
+        assert connection.execute('SELECT COUNT(*) FROM language_study_preferences').fetchone()[0] == 0
         assert connection.execute('SELECT value FROM precious').fetchone()[0] == 'retained personal data'
 
 
-@pytest.mark.parametrize('category,maximum', [('sino',99),('native',20),('months',12),('dates',31),('hours',12),('minutes',59)])
+@pytest.mark.parametrize('category,maximum', [('sino',99),('native',20),('months',12),('dates',31),('hours',12),('minutes',59),
+                                            ('month_date',365),('hour_minute',720),('date_time',262800)])
 def test_practice_category_ranges_and_payload_bounds(study_local, monkeypatch, category, maximum):
     path, connect = study_local
     choice = {'category':category,'answer_language':'english','minimum':1,'maximum':maximum}
@@ -460,11 +463,35 @@ def test_practice_category_ranges_and_payload_bounds(study_local, monkeypatch, c
     assert language_http(monkeypatch,'GET','/api/language/study/preferences',None) == (200,choice)
 
 
+def test_practice_upgrade_preserves_legacy_choices_and_repeated_publish(study_local, monkeypatch):
+    from modules.language import study
+    path, connect = study_local
+    legacy = {'category':'native','answer_language':'korean','minimum':17,'maximum':20}
+    with connect() as connection:
+        connection.execute('INSERT INTO language_study_preferences VALUES (1,?,?,?,?)', tuple(legacy.values()))
+        connection.commit()
+        original_schema = connection.execute("SELECT sql FROM sqlite_master WHERE name='language_study_preferences'").fetchone()[0]
+        for _ in range(2):language.descriptor(path.parent,'test').publish(connection)
+        assert connection.execute("SELECT sql FROM sqlite_master WHERE name='language_study_preferences'").fetchone()[0] == original_schema
+        assert study.read(connection).model_dump() == legacy
+        assert connection.execute('SELECT COUNT(*) FROM language_study_preferences_v2').fetchone()[0] == 0
+    choice = {'category':'date_time','answer_language':'english','minimum':1,'maximum':262800}
+    assert language_http(monkeypatch,'PUT','/api/language/study/preferences',choice) == (200,choice)
+    for selected in (choice, {'category':'months','answer_language':'korean','minimum':6,'maximum':10}):
+        assert language_http(monkeypatch,'PUT','/api/language/study/preferences',selected) == (200,selected)
+        with connect() as connection:
+            language.descriptor(path.parent,'test').publish(connection)
+            assert study.read(connection).model_dump() == selected
+            assert dict(connection.execute('SELECT * FROM language_study_preferences').fetchone()) == {'id':1,**legacy}
+            assert connection.execute('SELECT value FROM precious').fetchone()[0] == 'retained personal data'
+
+
 @pytest.mark.parametrize('failure', ['locked','corrupt','unavailable'])
-def test_practice_storage_failure_preserves_choices_and_recovers(study_local, monkeypatch, failure):
+@pytest.mark.parametrize('compound', [False,True])
+def test_practice_storage_failure_preserves_choices_and_recovers(study_local, monkeypatch, failure, compound):
     from contextlib import closing
     path, connect = study_local
-    choice = {'category':'native','answer_language':'korean','minimum':1,'maximum':20}
+    choice = {'category':'date_time' if compound else 'native','answer_language':'korean','minimum':1,'maximum':262800 if compound else 20}
     assert language_http(monkeypatch,'PUT','/api/language/study/preferences',choice)[0] == 200
     original = path.read_bytes()
     if failure == 'locked':
