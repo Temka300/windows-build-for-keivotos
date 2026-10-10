@@ -171,9 +171,19 @@ def progress_owner(payload):
 @router.post('/api/manga/progress/read')
 def read_progress(payload: ProgressChapter):
     with lifecycle.module_change_lock:
-        progress_owner(payload)
+        metadata = progress_owner(payload)
         with get_user_db() as connection:
-            return progress.read(connection, payload.source_id, payload.path, payload.kind, payload.revision)
+            state = progress.read(connection, payload.source_id, payload.path, payload.kind, payload.revision)
+        if (not matching_position(state['position'], metadata)
+                or state['position']['series_path'] != payload.series_path):
+            state['position'] = None
+        return state
+
+
+def matching_position(position, metadata):
+    return (position is not None and position['revision'] == metadata['revision']
+            and position['page_count'] == metadata['count']
+            and 0 <= position['page'] < metadata['count'])
 
 
 @router.post('/api/manga/progress/session')
@@ -196,17 +206,41 @@ def save_progress(payload: ProgressUpdate):
 
 @router.get('/api/manga/progress/series')
 def series_progress(source_id: str = Query(..., max_length=256),
-                    series_path: str = Query('', max_length=4096)):
+                    series_path: str = Query('', max_length=4096),
+                    offset: Annotated[int, Query(ge=0)] = 0,
+                    limit: Annotated[int, Query(ge=1, le=120)] = 120):
     with lifecycle.module_change_lock:
         try:
             require_enabled('manga')
         except RuntimeError as error:
             raise HTTPException(409, str(error)) from error
-        if not any(s.source_id == source_id for s in owners()):
+        source = next((s for s in owners() if s.source_id == source_id), None)
+        if source is None:
             raise HTTPException(404, 'Manga folder is unavailable')
+        series = next((s for s in engine.catalog(config.FILES_DB_PATH, [source])
+                       if s['path'] == series_path), None)
+        if series is None:
+            raise HTTPException(404, 'Manga is unavailable')
+        chapters = series['chapters'][offset:offset+limit]
+        result = []
         with get_user_db() as connection:
-            rows = connection.execute("""SELECT * FROM manga_reading_progress
-                WHERE source_id=? AND series_path=? ORDER BY updated_at DESC, generation DESC, sequence DESC
-                LIMIT 120""", (source_id, series_path)).fetchall()
-        # Selection must still pass fresh chapter guards; these are personal records only.
-        return {'items': [dict(row) for row in rows]}
+            for chapter in chapters:
+                # Unread chapters need no page scan. Historical revisions are
+                # retained, but only a fresh matching position can fill a bar.
+                exists = connection.execute("""SELECT 1 FROM manga_reading_progress
+                    WHERE source_id=? AND series_path=? AND path=? AND kind=? LIMIT 1""",
+                    (source_id, series_path, chapter['path'], chapter['kind'])).fetchone()
+                if not exists:
+                    continue
+                try:
+                    metadata = engine.chapter_metadata(source, chapter['path'], chapter['kind'],
+                                                       config.FILES_DB_PATH, [config.SUITE_HOME])
+                except Exception as error:
+                    logger.warning('Manga progress unavailable: source=%r chapter=%r error=%s',
+                                   source_id, chapter['path'], error)
+                    continue
+                position = progress.read(connection, source_id, chapter['path'], chapter['kind'],
+                                         metadata['revision'])['position']
+                if matching_position(position, metadata) and position['series_path'] == series_path:
+                    result.append(position)
+        return {'items': result, 'total': len(series['chapters'])}

@@ -371,6 +371,9 @@ def test_representation_and_revision_query_validation(library):
     query={'source_id':source.source_id,'path':'Story/Chapter 2'}
     for field,value in [('revision','old'),('revision','g'*64),('representation','html')]:
         assert asyncio.run(request({**query,field:value}))[0]==422
+    for field,value in [('offset',-1),('limit',0),('limit',121),('limit','many')]:
+        assert asyncio.run(request({'source_id':source.source_id,'series_path':'Story',field:value},
+                                   '/api/manga/progress/series'))[0]==422
     status,headers,body=asyncio.run(request({**query,'representation':'original'}))
     assert status==200 and body==picture() and headers[b'content-type']==b'image/png'
     assert asyncio.run(request(query))[1][b'content-type']==b'image/webp'
@@ -513,7 +516,7 @@ def test_progress_sessions_revisions_and_original_preservation(library, monkeypa
     metadata = router.pages(source.source_id, 'Story/Chapter 2', 'folder', True)
     identity = dict(source_id=source.source_id, series_path='Story', path='Story/Chapter 2',
                     kind='folder', revision=metadata['revision'])
-    assert router.read_progress(router.ProgressChapter(**identity)) == {'generation':0,'position':None,'stale':False}
+    assert router.read_progress(router.ProgressChapter(**identity)) == {'generation':0,'position':None}
     session = router.begin_progress(router.ProgressSession(**identity, expected_generation=0))
     update = router.ProgressUpdate(**identity, generation=session['generation'], sequence=2,
                                    page=1, mode='vertical', anchor=0.35)
@@ -540,7 +543,8 @@ def test_progress_sessions_revisions_and_original_preservation(library, monkeypa
     with pytest.raises(HTTPException):
         router.save_progress(update.model_copy(update={'generation':2,'sequence':3}))
     fresh = dict(identity, revision=changed['revision'])
-    assert router.read_progress(router.ProgressChapter(**fresh))['stale']
+    assert router.read_progress(router.ProgressChapter(**fresh)) == {'generation':2,'position':None}
+    assert router.series_progress(source.source_id,'Story')['items'] == []
     router.save_progress(router.ProgressUpdate(**fresh,generation=2,sequence=1,page=0,mode='paged'))
     with connect() as connection:
         assert connection.execute('SELECT count(*) FROM manga_reading_progress').fetchone()[0] == 2
@@ -552,6 +556,79 @@ def test_progress_sessions_revisions_and_original_preservation(library, monkeypa
     with pytest.raises(HTTPException) as error:
         router.read_progress(router.ProgressChapter(**fresh))
     assert error.value.status_code == 404
+
+
+def test_chapter_progress_summaries_are_current_bounded_and_preserve_history(library, monkeypatch):
+    from modules.manga.user_schema import publish
+    source, connect, media, db = library
+    manga.adopt(source.source_id)
+    monkeypatch.setattr(router, 'require_enabled', lambda owner: None)
+    with connect() as connection:
+        publish(connection)
+    for n in range(130):
+        folder = media/'Story'/f'Extra {n:03}'
+        folder.mkdir()
+        (folder/'1.png').write_bytes(picture())
+    with index.open_index(db) as connection:
+        index.scan_source(connection, source.source_id, media)
+    originals = {str(p): p.read_bytes() for p in media.rglob('*') if p.is_file()}
+    chapters = router.chapters(source.source_id, 'Story')['items']
+    assert len(chapters) == 132
+    positions = []
+    for item in (chapters[0], chapters[1], chapters[-1]):
+        metadata = router.pages(source.source_id, item['path'], item['kind'], True)
+        identity = dict(source_id=source.source_id, series_path='Story',
+                        path=item['path'], kind=item['kind'], revision=metadata['revision'])
+        router.begin_progress(router.ProgressSession(**identity, expected_generation=0))
+        positions.append(router.save_progress(router.ProgressUpdate(**identity, generation=1,
+                                                                   sequence=1, page=0, mode='paged')))
+    # Many retained revisions of one chapter must not crowd other chapters out.
+    with connect() as connection:
+        for n in range(125):
+            old = positions[0]
+            connection.execute('''INSERT INTO manga_reading_progress
+                (source_id,series_path,path,kind,revision,page_count,page,mode,anchor,generation,sequence)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)''', (source.source_id, 'Story', old['path'], old['kind'],
+                    f'{n:064x}', old['page_count'], 0, 'paged', .5, 1, 1))
+    metadata_calls = []
+    metadata_reader = engine.chapter_metadata
+    def counted(*args, **kwargs):
+        metadata_calls.append(args[1])
+        return metadata_reader(*args, **kwargs)
+    monkeypatch.setattr(engine, 'chapter_metadata', counted)
+    first = router.series_progress(source.source_id, 'Story', 0, 120)
+    last = router.series_progress(source.source_id, 'Story', 120, 120)
+    assert first['total'] == last['total'] == 132
+    assert first['items'] == positions[:2] and last['items'] == positions[2:]
+    assert metadata_calls == [p['path'] for p in positions], 'unread chapters must not scan page bytes'
+    assert router.series_progress(source.source_id, 'Story', 132, 120)['items'] == []
+    with pytest.raises(HTTPException) as missing:
+        router.series_progress(source.source_id, 'missing')
+    assert missing.value.status_code == 404
+    # Changed file identity shows no old bar and retains every historical row.
+    folder = media/positions[0]['path']
+    stamp = (folder/'1.png').stat()
+    (folder/'1.png').write_bytes(picture('red'))
+    assert router.series_progress(source.source_id, 'Story', 0, 1)['items'] == []
+    (folder/'1.png').write_bytes(originals[str(folder/'1.png')])
+    os.utime(folder/'1.png', ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+    with connect() as connection:
+        assert dict(connection.execute('SELECT * FROM manga_reading_progress WHERE revision=?',
+                    (positions[0]['revision'],)).fetchone()) == positions[0]
+    # Invalid stored bounds cannot fill a bar or drive automatic resume.
+    with connect() as connection:
+        connection.execute('UPDATE manga_reading_progress SET page_count=999 WHERE revision=?',
+                           (positions[1]['revision'],))
+    identity = {k: positions[1][k] for k in ('source_id','series_path','path','kind','revision')}
+    assert router.read_progress(router.ProgressChapter(**identity))['position'] is None
+    assert router.series_progress(source.source_id, 'Story', 1, 1)['items'] == []
+    with connect() as connection:
+        assert connection.execute('SELECT count(*) FROM manga_reading_progress').fetchone()[0] == 128
+        sources.update_source(connection, source.source_id, visible=False)
+    with pytest.raises(HTTPException) as hidden:
+        router.series_progress(source.source_id, 'Story')
+    assert hidden.value.status_code == 404
+    assert {str(p): p.read_bytes() for p in media.rglob('*') if p.is_file()} == originals
 
 
 def test_progress_guards_archive_and_disabled_owner(library, monkeypatch):

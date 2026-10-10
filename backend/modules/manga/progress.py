@@ -14,11 +14,8 @@ def read(connection, source_id, path, kind, revision):
         """SELECT * FROM manga_reading_progress
            WHERE source_id=? AND path=? AND kind=? AND revision=?""",
         (source_id, path, kind, revision)).fetchone()
-    exists = connection.execute(
-        'SELECT 1 FROM manga_reading_progress WHERE source_id=? AND path=? AND kind=? LIMIT 1',
-        (source_id, path, kind)).fetchone()
     return {'generation': generation(connection, source_id, path, kind),
-            'position': dict(row) if row else None, 'stale': bool(exists) and row is None}
+            'position': dict(row) if row else None}
 
 
 def begin(connection, source_id, path, kind, expected):

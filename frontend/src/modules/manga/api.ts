@@ -4,7 +4,7 @@ export interface Manga {source_id:string; path:string; name:string; cover:Chapte
 export interface PageMetadata {count:number; revision:string; revisions:string[];}
 
 export interface ReadingPosition {source_id:string;series_path:string;path:string;kind:'folder'|'archive';revision:string;page_count:number;page:number;mode:'paged'|'vertical';anchor:number;generation:number;sequence:number;updated_at:string;}
-export interface ReadingState {generation:number;position:ReadingPosition|null;stale:boolean;}
+export interface ReadingState {generation:number;position:ReadingPosition|null;}
 export const progressIdentity=(manga:Manga,chapter:Chapter,revision:string)=>({source_id:manga.source_id,series_path:manga.path,path:chapter.path,kind:chapter.kind,revision});
 
 /** Keep a small image window alive so native image requests can reuse it. */
@@ -63,7 +63,7 @@ export const mangaApi = {
   progress:(manga:Manga,chapter:Chapter,revision:string)=>post<ReadingState>('/manga/progress/read',progressIdentity(manga,chapter,revision)),
   beginProgress:(manga:Manga,chapter:Chapter,revision:string,expected_generation:number)=>post<{generation:number}>('/manga/progress/session',{...progressIdentity(manga,chapter,revision),expected_generation}),
   saveProgress:(position:Omit<ReadingPosition,'page_count'|'updated_at'>)=>post<ReadingPosition>('/manga/progress',position),
-  seriesProgress:(manga:Manga)=>get<{items:ReadingPosition[]}>('/manga/progress/series',{source_id:manga.source_id,series_path:manga.path}),
+  seriesProgress:(manga:Manga,offset=0,signal?:AbortSignal)=>get<{items:ReadingPosition[];total:number}>('/manga/progress/series',{source_id:manga.source_id,series_path:manga.path,offset,limit:120},signal),
   library:(q:string,offset=0,signal?:AbortSignal)=>get<{items:Manga[];total:number}>('/manga/library',{q,offset},signal),
   chapters:(manga:Manga,signal?:AbortSignal)=>get<{items:Chapter[]}>('/manga/chapters',{source_id:manga.source_id,path:manga.path},signal),
   pages:(manga:Manga,chapter:Chapter,signal?:AbortSignal)=>get<PageMetadata>('/manga/pages',{source_id:manga.source_id,path:chapter.path,kind:chapter.kind,metadata:true},signal),
