@@ -6773,6 +6773,149 @@
         }
       }
     },
+    "/api/language/study/preferences": {
+      "get": {
+        "summary": "Study Preferences",
+        "operationId": "study_preferences_api_language_study_preferences_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StudyPreferences"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Save Study Preferences",
+        "operationId": "save_study_preferences_api_language_study_preferences_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StudyPreferences"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StudyPreferences"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/language/vocabulary": {
+      "get": {
+        "summary": "List Vocabulary",
+        "operationId": "list_vocabulary_api_language_vocabulary_get",
+        "parameters": [
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VocabularyPage"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create Vocabulary",
+        "operationId": "create_vocabulary_api_language_vocabulary_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VocabularyCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VocabularyEntry"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/language/folders": {
       "get": {
         "summary": "Folders",
@@ -11312,6 +11455,49 @@
         ],
         "title": "Stats"
       },
+      "StudyPreferences": {
+        "properties": {
+          "category": {
+            "type": "string",
+            "enum": [
+              "sino",
+              "native",
+              "months",
+              "dates",
+              "hours",
+              "minutes"
+            ],
+            "title": "Category",
+            "default": "sino"
+          },
+          "answer_language": {
+            "type": "string",
+            "enum": [
+              "korean",
+              "english"
+            ],
+            "title": "Answer Language",
+            "default": "english"
+          },
+          "minimum": {
+            "type": "integer",
+            "maximum": 99.0,
+            "minimum": 1.0,
+            "title": "Minimum",
+            "default": 1
+          },
+          "maximum": {
+            "type": "integer",
+            "maximum": 99.0,
+            "minimum": 1.0,
+            "title": "Maximum",
+            "default": 99
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "StudyPreferences"
+      },
       "SubjectRef": {
         "properties": {
           "source_id": {
@@ -12303,6 +12489,104 @@
           "type"
         ],
         "title": "ValidationError"
+      },
+      "VocabularyCreate": {
+        "properties": {
+          "korean": {
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Korean"
+          },
+          "pronunciation": {
+            "type": "string",
+            "maxLength": 256,
+            "title": "Pronunciation",
+            "default": ""
+          },
+          "english": {
+            "type": "string",
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "English"
+          },
+          "request_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Request Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "korean",
+          "english",
+          "request_id"
+        ],
+        "title": "VocabularyCreate"
+      },
+      "VocabularyEntry": {
+        "properties": {
+          "korean": {
+            "type": "string",
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Korean"
+          },
+          "pronunciation": {
+            "type": "string",
+            "maxLength": 256,
+            "title": "Pronunciation",
+            "default": ""
+          },
+          "english": {
+            "type": "string",
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "English"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Id"
+          },
+          "created_at": {
+            "type": "string",
+            "title": "Created At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "korean",
+          "english",
+          "id",
+          "created_at"
+        ],
+        "title": "VocabularyEntry"
+      },
+      "VocabularyPage": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/VocabularyEntry"
+            },
+            "type": "array",
+            "maxItems": 100,
+            "title": "Items"
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Total"
+          }
+        },
+        "type": "object",
+        "required": [
+          "items",
+          "total"
+        ],
+        "title": "VocabularyPage"
       },
       "YouTubePlaybackFailure": {
         "properties": {

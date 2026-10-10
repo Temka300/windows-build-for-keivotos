@@ -68,6 +68,7 @@ const report={checks:[],errors:[],requests:[]};
   assert(!Object.keys(paths).some(p=>p.startsWith('/api/youtube')));
   assert(!report.requests.some(p=>p.startsWith('/api/youtube')));
   assert.equal(await page.getByRole('navigation',{name:'YouTube sections'}).count(),0);
+  assert.equal(await page.getByRole('navigation',{name:'Language sections'}).count(),0);
   assert.equal(await page.locator('[data-sidebar-owner]').count(),0);
   assert.equal(await page.getByRole('menuitem',{name:'Add to playlists'}).count(),0);
   assert.equal(await page.getByRole('dialog',{name:'Add to playlists'}).count(),0);

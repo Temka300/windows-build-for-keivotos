@@ -2,12 +2,22 @@
   import {onMount,onDestroy,tick} from 'svelte';
   import AppDrawer from '../../components/AppDrawer.svelte';
   import ModuleLocationMenu from '../../components/ModuleLocationMenu.svelte';
+  import ModuleSidebarDock from '../../components/ModuleSidebarDock.svelte';
   import {settingsInitialSection,settingsOpen} from '../../lib/suiteStores';
   import {languageApi,type IndexRefresh,type LanguageDocument,type LanguageFile,type LanguageFolder} from './api';
   import MarkdownEditor from './MarkdownEditor.svelte';
+  import LanguageSidebar from './LanguageSidebar.svelte';
+  import KoreanPractice from './KoreanPractice.svelte';
+  import VocabularyView from './VocabularyView.svelte';
 
   type OpenNote = LanguageDocument & {sourceId:string; savedContent:string; sessionId:string; dirty:boolean; saving:boolean; error:string; indexNames?:string[]; indexBusy?:boolean; indexGeneration?:number};
   type Decision = 'save'|'keep'|'discard';
+  type Section = 'markdown'|'practice'|'vocabulary';
+  let section:Section='markdown',sectionBusy=false,sectionRequest=0;
+  let practiceMounted=false;
+  $: if(section==='practice')practiceMounted=true;
+  let vocabularyMounted=false,vocabulary:VocabularyView;
+  $: if(section==='vocabulary')vocabularyMounted=true;
   let drawer=false, loading=true, error='';
   let folders:LanguageFolder[]=[], sourceId='', files:LanguageFile[]=[], tabs:OpenNote[]=[], openNames:string[]=[], activeName='', openSourceId='';
   let editingName='', nameDraft='', renameBusy=false, nameInput:HTMLInputElement;
@@ -222,7 +232,27 @@
     catch(caught){if(ownsFolder(next,selectedEpoch))error=caught instanceof Error?caught.message:'Could not list Language notes.';}
   }
   async function beforeNavigate(slug:string){
-    return slug==='language'||await guardTabs(tabs,'switch modules');
+    if(slug==='language')return true;
+    if(vocabulary&&!await vocabulary.beforeNavigate()){drawer=false;return false;}
+    return await guardTabs(tabs,'switch modules');
+  }
+  async function selectSection(next:Section){
+    if(sectionBusy||pendingDecision||next===section)return;
+    const owner=sourceId,epoch=folderEpoch,request=++sectionRequest;
+    sectionBusy=true;
+    try{
+      if(section==='vocabulary'&&!await vocabulary?.beforeNavigate())return;
+      if(section==='markdown'&&!await guardTabs(tabs,`open ${next==='practice'?'Practice':'Vocabulary'}`)){
+        if(ownsFolder(owner,epoch)&&request===sectionRequest){await tick();editor?.focus();}
+        return;
+      }
+      if(!ownsFolder(owner,epoch)||request!==sectionRequest)return;
+      if(section==='markdown')editor?.suspend();
+      openRequest++;openTarget='';editingName='';locationMenu=null;
+      section=next;
+      await tick();
+      if(section==='markdown'&&ownsFolder(owner,epoch)&&request===sectionRequest)editor?.focus();
+    }finally{if(alive&&request===sectionRequest)sectionBusy=false;}
   }
   async function create(){
     if(!sourceId)return;
@@ -286,20 +316,20 @@
   }
   function keydown(event:KeyboardEvent){
     if(event.key.toLowerCase()!=='s'||(!event.ctrlKey&&!event.metaKey)||event.altKey||event.shiftKey)return;
-    if(!active||editingName||pendingDecision)return;
+    if(section!=='markdown'||!active||editingName||pendingDecision)return;
     const target=event.target;
     if(target!==document.body&&(!(target instanceof Node)||!surface?.contains(target)))return;
     event.preventDefault();
     void saveTab(active);
   }
   function beforeUnload(event:BeforeUnloadEvent){
-    if(!tabs.some(tab=>tab.dirty||tab.saving))return;
+    if(!tabs.some(tab=>tab.dirty||tab.saving)&&!vocabulary?.hasDraft())return;
     event.preventDefault();event.returnValue='';
   }
   function foldersSettings(){settingsInitialSection.set('roots');settingsOpen.set(true);}
   onMount(()=>{window.addEventListener('beforeunload',beforeUnload);void loadFolders();});
   onDestroy(()=>{
-    alive=false;folderEpoch++;openRequest++;
+    alive=false;folderEpoch++;openRequest++;sectionRequest++;
     window.removeEventListener('beforeunload',beforeUnload);
     if(pendingDecision)decide('keep');
     for(const tab of tabs)if(tab.dirty)remember(tab);
@@ -310,6 +340,10 @@
 
 <div class="language-surface" bind:this={surface}>
   <header><button class="menu" aria-label="Open Keivotos menu" on:click={()=>drawer=true}>☰</button><span>Language</span></header>
+  <div class="language-body">
+    <ModuleSidebarDock owner="language" label="Language"><LanguageSidebar {section} busy={sectionBusy||!!pendingDecision} on:select={event=>void selectSection(event.detail)}/></ModuleSidebarDock>
+    <div class="language-content">
+    <div class="markdown-section" hidden={section!=='markdown'} inert={section!=='markdown'} aria-label="Markdown notes">
   {#if error}<p class="notice" role="alert">{error} <button on:click={loadFolders}>Retry</button></p>{/if}
   {#if loading}<p class="notice" role="status">Loading Language folders…</p>{/if}
   {#if !loading&&!folders.length}<div class="empty"><p>Assign a folder the Language role to write Markdown notes.</p><button on:click={foldersSettings}>Add Language folders in Settings</button></div>{/if}
@@ -364,6 +398,11 @@
       </div>
     {:else}<div class="empty"><p>{files.length?'Choose a Markdown tab or create a new file.':'Create a Markdown file with +.'}</p></div>{/if}
   {/if}
+    </div>
+    {#if practiceMounted}<div class="practice-host" hidden={section!=='practice'} inert={section!=='practice'}><KoreanPractice active={section==='practice'}/></div>{/if}
+    {#if vocabularyMounted}<div class="vocabulary-host" hidden={section!=='vocabulary'} inert={section!=='vocabulary'}><VocabularyView bind:this={vocabulary} active={section==='vocabulary'}/></div>{/if}
+    </div>
+  </div>
 </div>
 {#if drawer}<AppDrawer beforeNavigate={beforeNavigate} on:close={()=>drawer=false}/>{/if}
 {#if locationMenu}
@@ -385,6 +424,11 @@
 
 <style>
   .language-surface{display:flex;flex:1;min-height:0;flex-direction:column;background:#0f0f14;color:#e0e0e8}
+  .language-body{display:flex;flex:1;min-height:0;min-width:0;overflow:hidden}
+  .language-content{display:flex;flex-direction:column;flex:1;min-width:0;min-height:0}
+  .markdown-section{display:flex;flex-direction:column;flex:1;min-width:0;min-height:0}.markdown-section[hidden]{display:none}
+  .practice-host{display:flex;flex:1;min-height:0;min-width:0}.practice-host[hidden]{display:none}
+  .vocabulary-host{display:flex;flex:1;min-height:0;min-width:0}.vocabulary-host[hidden]{display:none}
   header{display:flex;align-items:center;gap:16px;min-height:60px;padding:8px 16px;border-bottom:1px solid #292936;font-size:18px;font-weight:600}
   .menu{width:36px;height:36px;border-radius:8px;background:#1e1e2e;font-size:16px}
   .tabs{display:flex;align-items:stretch;min-height:48px;border-bottom:1px solid #393946;background:#17171f;min-width:0}

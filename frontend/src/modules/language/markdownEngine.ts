@@ -7,7 +7,7 @@ import {Decoration,EditorView,ViewPlugin,WidgetType,keymap,type DecorationSet,ty
 export type Format='heading-1'|'heading-2'|'heading-3'|'heading-4'|'heading-5'|'heading-6'|'rule'|'bold'|'italic'|'bold-italic'|'highlight';
 export type EditorAction='cut'|'copy'|'paste'|'table';
 export interface EditorMenu{x:number;y:number;selected:boolean;tableAllowed:boolean;}
-export interface MarkdownEngine{format:(kind:Format)=>void;contextAction:(kind:EditorAction)=>Promise<void>;closeContext:(restore:boolean)=>void;destroy:()=>void;}
+export interface MarkdownEngine{format:(kind:Format)=>void;setContent:(value:string)=>void;focus:()=>void;contextAction:(kind:EditorAction)=>Promise<void>;closeContext:(restore:boolean)=>void;destroy:()=>void;}
 type SyntaxNode=ReturnType<ReturnType<typeof syntaxTree>['resolveInner']>;
 
 function activeTable(state:EditorState,position=state.selection.main.head){
@@ -231,5 +231,8 @@ export function mountMarkdownEditor(host:HTMLDivElement,value:string,label:strin
       '&.cm-focused':{outline:'2px solid var(--accent)',outlineOffset:'-2px'},
     }),
   ]})});
-  return {format,contextAction,closeContext,destroy:()=>{alive=false;context=null;view.destroy();}};
+  return {format,contextAction,closeContext,
+    setContent:content=>{if(alive&&view.state.doc.toString()!==content){closeContext(false);view.dispatch({changes:{from:0,to:view.state.doc.length,insert:content}});}},
+    focus:()=>{if(alive)view.focus();},
+    destroy:()=>{alive=false;context=null;view.destroy();}};
 }

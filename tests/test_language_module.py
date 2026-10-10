@@ -376,11 +376,12 @@ def test_concurrent_complete_revision_publication_never_overwrites_winner(local,
 
 
 # Exercise the real ASGI response, without adding a TestClient dependency.
-def language_http(monkeypatch, method, path, payload):
+def language_http(monkeypatch, method, path, payload, enabled=True):
     import asyncio
     import json
     from fastapi import FastAPI
-    monkeypatch.setattr(router, "require_enabled", lambda slug: None)
+    if enabled:
+        monkeypatch.setattr(router, "require_enabled", lambda slug: None)
     app = FastAPI()
     app.include_router(router.router)
 
@@ -402,6 +403,103 @@ def language_http(monkeypatch, method, path, payload):
         body = b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
         return status, json.loads(body) if status != 500 else body.decode()
     return asyncio.run(request())
+
+
+@pytest.fixture
+def study_local(tmp_path, monkeypatch):
+    from contextlib import closing
+    path = tmp_path / 'personal.sqlite'
+    @contextmanager
+    def connect():
+        with closing(sqlite3.connect(path, timeout=0.02)) as connection:
+            connection.row_factory = sqlite3.Row
+            yield connection
+    with connect() as connection:
+        connection.execute('CREATE TABLE precious(value TEXT)')
+        connection.execute("INSERT INTO precious VALUES ('retained personal data')")
+        connection.commit()
+        language.descriptor(tmp_path, 'test').publish(connection)
+    monkeypatch.setattr(router, 'get_user_db', connect)
+    return path, connect
+
+
+def test_practice_defaults_do_not_write_and_settings_survive_process_restart(study_local, monkeypatch):
+    import json
+    path, connect = study_local
+    status, defaults = language_http(monkeypatch, 'GET', '/api/language/study/preferences', None)
+    assert status == 200 and defaults == {'category':'sino','answer_language':'english','minimum':1,'maximum':99}
+    with connect() as connection:
+        assert connection.execute('SELECT COUNT(*) FROM language_study_preferences').fetchone()[0] == 0
+    choice = {'category':'minutes','answer_language':'korean','minimum':16,'maximum':59}
+    assert language_http(monkeypatch, 'PUT', '/api/language/study/preferences', choice) == (200, choice)
+    code = '''import json,sqlite3,sys
+from contextlib import closing
+sys.path.insert(0,sys.argv[2])
+from modules.language import study
+with closing(sqlite3.connect(sys.argv[1])) as connection:
+ connection.row_factory=sqlite3.Row
+ print(json.dumps(study.read(connection).model_dump()))
+'''
+    result = subprocess.run([sys.executable,'-c',code,str(path),str(Path(__file__).resolve().parents[1]/'backend')],
+                            capture_output=True,text=True,check=True)
+    assert json.loads(result.stdout) == choice
+    with connect() as connection:
+        language.descriptor(path.parent, 'test').publish(connection)
+        assert dict(connection.execute('SELECT * FROM language_study_preferences').fetchone()) == {'id':1,**choice}
+        assert connection.execute('SELECT value FROM precious').fetchone()[0] == 'retained personal data'
+
+
+@pytest.mark.parametrize('category,maximum', [('sino',99),('native',20),('months',12),('dates',31),('hours',12),('minutes',59)])
+def test_practice_category_ranges_and_payload_bounds(study_local, monkeypatch, category, maximum):
+    path, connect = study_local
+    choice = {'category':category,'answer_language':'english','minimum':1,'maximum':maximum}
+    assert language_http(monkeypatch,'PUT','/api/language/study/preferences',choice) == (200,choice)
+    for change in ({'maximum':maximum+1},{'minimum':0},{'minimum':maximum+1},{'minimum':1.5},
+                   {'minimum':True},{'answer_language':'romanized'},{'category':'other'},{'answer':'personal typed answer'}):
+        assert language_http(monkeypatch,'PUT','/api/language/study/preferences',{**choice,**change})[0] == 422
+    assert language_http(monkeypatch,'GET','/api/language/study/preferences',None) == (200,choice)
+
+
+@pytest.mark.parametrize('failure', ['locked','corrupt','unavailable'])
+def test_practice_storage_failure_preserves_choices_and_recovers(study_local, monkeypatch, failure):
+    from contextlib import closing
+    path, connect = study_local
+    choice = {'category':'native','answer_language':'korean','minimum':1,'maximum':20}
+    assert language_http(monkeypatch,'PUT','/api/language/study/preferences',choice)[0] == 200
+    original = path.read_bytes()
+    if failure == 'locked':
+        blocker = sqlite3.connect(path);blocker.execute('BEGIN IMMEDIATE')
+        try:
+            assert language_http(monkeypatch,'PUT','/api/language/study/preferences',{**choice,'maximum':10})[0] == 503
+        finally:
+            blocker.rollback();blocker.close()
+    else:
+        broken = path.parent / 'broken.sqlite'
+        if failure == 'corrupt':broken.write_bytes(b'generated corrupt scratch database')
+        else:broken.mkdir()
+        @contextmanager
+        def broken_connect():
+            with closing(sqlite3.connect(broken)) as connection:yield connection
+        with monkeypatch.context() as m:
+            m.setattr(router,'get_user_db',broken_connect)
+            assert language_http(m,'GET','/api/language/study/preferences',None)[0] == 503
+            assert language_http(m,'PUT','/api/language/study/preferences',{**choice,'maximum':10})[0] == 503
+        assert path.read_bytes() == original
+    assert language_http(monkeypatch,'GET','/api/language/study/preferences',None) == (200,choice)
+    assert language_http(monkeypatch,'PUT','/api/language/study/preferences',{**choice,'maximum':10})[0] == 200
+    with connect() as connection:
+        assert connection.execute('SELECT value FROM precious').fetchone()[0] == 'retained personal data'
+
+
+def test_practice_disabled_owner_rejects_before_database_access(study_local, monkeypatch):
+    path, connect = study_local
+    def disabled(slug):raise RuntimeError('Language is disabled')
+    monkeypatch.setattr(router,'require_enabled',disabled)
+    monkeypatch.setattr(router,'get_user_db',lambda:pytest.fail('disabled request opened user database'))
+    for method,body in [('GET',None),('PUT',{'category':'sino','answer_language':'english','minimum':1,'maximum':99})]:
+        assert language_http(monkeypatch,method,'/api/language/study/preferences',body,enabled=False)[0] == 409
+    with connect() as connection:
+        assert connection.execute('SELECT value FROM precious').fetchone()[0] == 'retained personal data'
 
 
 @pytest.mark.parametrize("operation", ["save", "create", "rename"])

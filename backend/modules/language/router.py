@@ -1,14 +1,16 @@
 """Guarded HTTP operations for local Language Markdown files."""
 from __future__ import annotations
+import logging
+import sqlite3
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 import config
 import lifecycle
 from database import get_user_db
 from files_base import sources
-from modules.language import documents, index_refresh
+from modules.language import documents, index_refresh, study, vocabulary
 from suite_modules import require_enabled
 
 
@@ -20,6 +22,55 @@ def _enabled() -> None:
 
 
 router = APIRouter(prefix="/api/language", dependencies=[Depends(_enabled)])
+logger = logging.getLogger('keivotos.language')
+
+
+def _study_call(operation, *args):
+    try:
+        with get_user_db() as connection:
+            return operation(connection, *args)
+    except (sqlite3.Error, OSError, ValueError) as error:
+        logger.warning('Language practice settings unavailable: %s', error)
+        raise HTTPException(503, 'Practice settings could not be loaded or saved. Retry when user data is available.') from error
+
+
+@router.get('/study/preferences', response_model=study.StudyPreferences)
+def study_preferences(response: Response):
+    response.headers['Cache-Control'] = 'no-store'
+    return _study_call(study.read)
+
+
+@router.put('/study/preferences', response_model=study.StudyPreferences)
+def save_study_preferences(payload: study.StudyPreferences):
+    with lifecycle.module_change_lock:
+        _enabled()
+        return _study_call(study.save, payload)
+
+
+def _vocabulary_call(operation, *args):
+    try:
+        with get_user_db() as connection:
+            return operation(connection, *args)
+    except vocabulary.RequestConflict as error:
+        raise HTTPException(409, str(error)) from error
+    except (sqlite3.Error, OSError, ValueError) as error:
+        # Invalid stored rows are preserved; do not log their authored contents.
+        detail = str(error) if isinstance(error, (sqlite3.Error, OSError)) else 'Invalid stored vocabulary record'
+        logger.warning('Language vocabulary unavailable: %s', detail)
+        raise HTTPException(503, 'Vocabulary is unavailable. Keep your entry and retry when user data is available.') from error
+
+
+@router.get('/vocabulary', response_model=vocabulary.VocabularyPage)
+def list_vocabulary(response: Response, offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=100)):
+    response.headers['Cache-Control'] = 'no-store'
+    return _vocabulary_call(vocabulary.listing, offset, limit)
+
+
+@router.post('/vocabulary', response_model=vocabulary.VocabularyEntry)
+def create_vocabulary(payload: vocabulary.VocabularyCreate):
+    with lifecycle.module_change_lock:
+        _enabled()
+        return _vocabulary_call(vocabulary.create, payload)
 
 
 def _source(connection, source_id: str) -> sources.Source:

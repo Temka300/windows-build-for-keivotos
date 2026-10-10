@@ -126,6 +126,53 @@ class MetadataBackupBundleTests(unittest.TestCase):
         self.assertEqual(archived.read_bytes(), b"previous draft")
         self.assertEqual(original.read_bytes(), b"current original note")
 
+    def test_language_vocabulary_and_retry_receipts_survive_user_backup_restore(self) -> None:
+        from uuid import uuid4
+        from unicodedata import normalize
+        from modules.language import vocabulary, study
+        from modules.language.user_schema import publish
+        data=vocabulary.VocabularyCreate(request_id=uuid4(),korean=normalize('NFD','  한글')+'  단어 ',
+                                          pronunciation='han-geul\t단어',english='  authored  meaning\n🐾 ')
+        with closing(sqlite3.connect(self.user_db)) as connection:
+            connection.row_factory=sqlite3.Row
+            publish(connection)
+            first=vocabulary.create(connection,data)
+            second=vocabulary.create(connection,data.model_copy(update={'request_id':uuid4()}))
+            choice=study.StudyPreferences(category='hours',answer_language='korean',minimum=2,maximum=12)
+            study.save(connection,choice)
+        with patch('suite_modules.enabled_ids',side_effect=AssertionError('Personal backup ignores module enablement')):
+            created=backup_bundle.create_backup_bundle()
+        with closing(sqlite3.connect(self.user_db)) as connection:
+            connection.row_factory=sqlite3.Row
+            vocabulary.create(connection,vocabulary.VocabularyCreate(request_id=uuid4(),korean='나중',english='later'))
+        backup_bundle.restore_backup_bundle(created['name'])
+        with closing(sqlite3.connect(self.user_db)) as connection:
+            connection.row_factory=sqlite3.Row
+            self.assertEqual(vocabulary.listing(connection,0,50).items,[second,first])
+            self.assertEqual(vocabulary.create(connection,data),first)
+            self.assertEqual(vocabulary.listing(connection,0,50).total,2)
+            self.assertEqual(study.read(connection),choice)
+            self.assertEqual(connection.execute('SELECT value FROM marker').fetchone()[0],'user-original')
+        self.assertEqual(self.external_image.read_bytes(),b'original-image-must-stay')
+
+    def test_language_practice_choices_survive_complete_user_backup_restore(self) -> None:
+        from modules.language import study
+        from modules.language.user_schema import publish
+        choice = study.StudyPreferences(category='hours',answer_language='korean',minimum=3,maximum=12)
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
+            publish(connection)
+            study.save(connection,choice)
+        with patch('suite_modules.enabled_ids',side_effect=AssertionError('Personal backup ignores enablement')):
+            created=backup_bundle.create_backup_bundle()
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
+            study.save(connection,study.StudyPreferences())
+        backup_bundle.restore_backup_bundle(created['name'])
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
+            connection.row_factory=sqlite3.Row
+            self.assertEqual(study.read(connection),choice)
+            self.assertEqual(connection.execute('SELECT value FROM marker').fetchone()[0],'user-original')
+        self.assertEqual(self.external_image.read_bytes(),b'original-image-must-stay')
+
     def test_manga_progress_survives_complete_user_backup_restore(self) -> None:
         from modules.manga.user_schema import publish
         with closing(sqlite3.connect(self.user_db)) as connection, connection:
