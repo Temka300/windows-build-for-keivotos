@@ -1,6 +1,6 @@
 """Actual isolated SQLite/filesystem playlist operations; no downloader/network."""
 import asyncio
-from contextlib import contextmanager
+from contextlib import contextmanager, closing
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4, UUID
@@ -23,7 +23,7 @@ def local(tmp_path,monkeypatch):
     user=tmp_path/'user.sqlite'
     @contextmanager
     def connect():
-        with sqlite3.connect(user) as connection:
+        with closing(sqlite3.connect(user)) as connection, connection:
             connection.row_factory=sqlite3.Row
             yield connection
     with connect() as connection:
@@ -255,6 +255,8 @@ def test_all_playlist_routes_enforce_actual_owner_before_storage(local,monkeypat
     for method,path,body in [
       ('GET','/api/youtube/playlists',None),
       ('POST','/api/youtube/playlists',{'title':'No mutation','request_id':identity}),
+      ('POST','/api/youtube/playlists/'+identity+'/rename',{'title':'No mutation','revision':0,'request_id':identity}),
+      ('POST','/api/youtube/playlists/'+identity+'/archive',{'item_count':0,'revision':0,'request_id':identity}),
       ('GET','/api/youtube/playlists/'+identity+'/items',None),
       ('GET','/api/youtube/videos/first/playlists',None),
       ('POST','/api/youtube/videos/first/playlists',{'playlist_ids':[identity],'version':0}),
@@ -274,3 +276,114 @@ def test_disable_and_reenable_preserve_personal_playlist_state(local,monkeypatch
     with local[1]() as connection:
         suite_modules.set_enabled(connection,'youtube',False);suite_modules.set_enabled(connection,'youtube',True)
     assert router.video_playlists('first')['playlist_ids']==[p['id']]
+
+
+def test_legacy_migration_partial_restart_preserves_rows_and_original_title(local):
+    _,connect,_=local
+    p=make('Original')
+    save('first',[p['id']],0)
+    with connect() as connection:
+        before=[tuple(row) for row in connection.execute('SELECT * FROM youtube_playlist_items')]
+        # A scratch legacy database, plus interruption after the first ALTER.
+        connection.execute('CREATE TABLE legacy_copy AS SELECT id,request_id,title,created_at FROM youtube_playlists')
+        connection.execute('DROP TABLE youtube_playlists')
+        connection.execute('ALTER TABLE legacy_copy RENAME TO youtube_playlists')
+        connection.execute('DROP TABLE youtube_playlist_history')
+        connection.execute('ALTER TABLE youtube_playlists ADD COLUMN revision INTEGER NOT NULL DEFAULT 0')
+        connection.commit();_publish(connection);_publish(connection)
+        assert [tuple(row) for row in connection.execute('SELECT * FROM youtube_playlist_items')]==before
+        assert connection.execute('SELECT previous_title,title,operation FROM youtube_playlist_history').fetchone()[:]==('','Original','create')
+        assert playlist_current(p)['deleted_at']==''
+        assert connection.execute('SELECT count(*) FROM youtube_playlist_history').fetchone()[0]==1
+
+
+def playlist_current(p):
+    return router.playlist_items(UUID(p['id']),0,1)['playlist']
+
+
+def rename(p,title,token=None,revision=None):
+    return router.rename_playlist(UUID(p['id']),router.PlaylistRename(title=title,revision=p['revision'] if revision is None else revision,request_id=token or uuid4()))
+
+
+def archive(p,token=None,count=None):
+    return router.archive_playlist(UUID(p['id']),router.PlaylistArchive(revision=p['revision'],item_count=p['item_count'] if count is None else count,request_id=token or uuid4()))
+
+
+def test_rename_archive_retries_preserve_all_rows_files_and_history(local):
+    root,connect,_=local;before={p.name:p.read_bytes() for p in root.iterdir()}
+    create_token=uuid4();p=make('처음',create_token);save('first',[p['id']],0);save('second',[p['id']],0);p=playlist_current(p)
+    rename_token=uuid4();renamed=rename(p,'  新しい 음악  ',rename_token)
+    assert renamed['title']=='新しい 음악' and renamed['revision']==p['revision']+1
+    assert rename(p,'新しい 음악',rename_token)==renamed
+    assert make('처음',create_token)==renamed
+    with pytest.raises(HTTPException):rename(p,'Other',rename_token)
+    with connect() as connection:
+        members=[tuple(r) for r in connection.execute('SELECT * FROM youtube_playlist_items')]
+        jobs=[tuple(r) for r in connection.execute('SELECT * FROM youtube_downloads')]
+    token=uuid4();deleted=archive(renamed,token);assert deleted['deleted_at']
+    assert archive(renamed,token)==deleted
+    assert router.list_playlists(0,60)=={'items':[],'total':0}
+    assert router.video_playlists('first')=={'version':2,'playlist_ids':[]}
+    with pytest.raises(HTTPException):router.playlist_items(UUID(p['id']),0,60)
+    with pytest.raises(HTTPException):save('first',[p['id']],1)
+    save('first',[],2)  # no active membership change must not erase archived rows
+    with connect() as connection:
+        assert [tuple(r) for r in connection.execute('SELECT * FROM youtube_playlist_items')]==members
+        assert [tuple(r) for r in connection.execute('SELECT * FROM youtube_downloads')]==jobs
+        assert [tuple(r) for r in connection.execute('SELECT previous_title,title,operation FROM youtube_playlist_history ORDER BY revision')]==[('','처음','create'),('처음','新しい 음악','rename'),('新しい 음악','新しい 음악','archive')]
+        assert connection.execute('SELECT value FROM preserved').fetchone()[0]=='personal annotation'
+    assert {p.name:p.read_bytes() for p in root.iterdir()}==before
+
+
+def test_conflicting_rename_and_counted_archive_require_fresh_revision(local):
+    p=make();token=uuid4();new=rename(p,'Updated',token)
+    with pytest.raises(HTTPException):rename(p,'Stale')
+    with pytest.raises(HTTPException):archive(p)
+    save('first',[p['id']],0)
+    with pytest.raises(HTTPException):archive(new)
+    current=playlist_current(p)
+    with pytest.raises(HTTPException):archive(current,count=0)
+    assert not playlist_current(p)['deleted_at']
+    rename(current,'Final')
+    with pytest.raises(HTTPException):rename(p,'Updated',token)  # old receipt cannot replace newer acknowledgement
+
+
+def test_concurrent_rename_or_archive_accepts_exactly_one_and_failure_rolls_back(local):
+    p=make('Retain')
+    def operation(index):
+        try:return rename(p,'A') if index==0 else archive(p)
+        except HTTPException as error:return error.status_code
+    with ThreadPoolExecutor(max_workers=2) as pool:results=list(pool.map(operation,range(2)))
+    assert sum(isinstance(result,dict) for result in results)==1 and results.count(409)==1
+    q=make('Failure fixture');save('first',[q['id']],0);q=playlist_current(q)
+    with local[1]() as connection:
+        connection.execute("CREATE TRIGGER reject_archive BEFORE UPDATE OF deleted_at ON youtube_playlists WHEN NEW.id='"+q['id']+"' BEGIN SELECT raise(ABORT,'generated archive failure'); END")
+        connection.commit()
+        before=[tuple(r) for r in connection.execute('SELECT * FROM youtube_playlist_history')]
+    with pytest.raises(sqlite3.IntegrityError):archive(q)
+    assert playlist_current(q)==q
+    with local[1]() as connection:
+        assert [tuple(r) for r in connection.execute('SELECT * FROM youtube_playlist_history')]==before
+    assert router.video_playlists('first')['playlist_ids']==[q['id']]
+
+
+@pytest.mark.parametrize('operation,body',[
+ ('rename',{'title':'','revision':0,'request_id':str(uuid4())}),
+ ('rename',{'title':'x'*121,'revision':0,'request_id':str(uuid4())}),
+ ('rename',{'title':'Okay','revision':-1,'request_id':str(uuid4())}),
+ ('archive',{'item_count':-1,'revision':0,'request_id':str(uuid4())}),
+ ('archive',{'item_count':0,'revision':9007199254740991,'request_id':str(uuid4())}),
+ ('archive',{'item_count':0,'revision':0,'request_id':'bad'}),
+])
+def test_management_http_validation_leaves_personal_data_intact(local,operation,body):
+    p=make();assert request('POST',f"/api/youtube/playlists/{p['id']}/{operation}",body)[0]==422
+    assert playlist_current(p)==p
+
+
+def test_actual_http_rename_and_counted_archive_roundtrip(local):
+    p=make();rename_body={'title':'한국어 new','revision':p['revision'],'request_id':str(uuid4())}
+    status,renamed=request('POST',f"/api/youtube/playlists/{p['id']}/rename",rename_body);assert status==200
+    assert request('POST',f"/api/youtube/playlists/{p['id']}/rename",rename_body)==(200,renamed)
+    deleted=request('POST',f"/api/youtube/playlists/{p['id']}/archive",{'revision':renamed['revision'],'item_count':0,'request_id':str(uuid4())})
+    assert deleted[0]==200 and deleted[1]['deleted_at']
+    assert request('GET',f"/api/youtube/playlists/{p['id']}/items")[0]==404

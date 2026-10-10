@@ -1208,7 +1208,7 @@
     "/api/files/thumbnail": {
       "get": {
         "summary": "Serve File Thumbnail",
-        "description": "Return a cached WebP thumbnail for one browsed file.\n\nContainment is the same chain ``serve_file`` uses — ``resolve_subject``\nrejects absolute and ``..`` paths before touching disk, re-checks that the\ntarget is still inside the source *after* resolving symlinks and junctions,\nand denies Keivotos's own tree.\n\nPrecedence is: an **origin attachment** the user chose, then a **folder\ncover** from the subtree, then the file itself. The attachment wins outright\nbecause it is a deliberate choice and the only way an unrenderable subject —\na 3D model, an archive, a document — gets a picture at all.\n\nA **directory** without an attachment answers with a cover drawn from the\nfirst thumbnailable file in its subtree, so a folder of manga or screenshots\nis recognisable at a glance. Whatever is chosen carries its own cache\nidentity, so replacing it changes the tile.\n\nUnrenderable types are a deliberate 404 rather than a placeholder image:\nthe placeholder is module-owned presentation, and the base falls back to its\nown type glyph in the grid instead.\n\n``v`` exists because the response is ``immutable``. The server ignores it;\nthe client varies it (from mtime/size) so replacing a file in place shows\nthe new thumbnail instead of a cached stale one.",
+        "description": "Return a cached WebP thumbnail for one browsed file.\n\nContainment is the same chain ``serve_file`` uses \u2014 ``resolve_subject``\nrejects absolute and ``..`` paths before touching disk, re-checks that the\ntarget is still inside the source *after* resolving symlinks and junctions,\nand denies Keivotos's own tree.\n\nPrecedence is: an **origin attachment** the user chose, then a **folder\ncover** from the subtree, then the file itself. The attachment wins outright\nbecause it is a deliberate choice and the only way an unrenderable subject \u2014\na 3D model, an archive, a document \u2014 gets a picture at all.\n\nA **directory** without an attachment answers with a cover drawn from the\nfirst thumbnailable file in its subtree, so a folder of manga or screenshots\nis recognisable at a glance. Whatever is chosen carries its own cache\nidentity, so replacing it changes the tile.\n\nUnrenderable types are a deliberate 404 rather than a placeholder image:\nthe placeholder is module-owned presentation, and the base falls back to its\nown type glyph in the grid instead.\n\n``v`` exists because the response is ``immutable``. The server ignores it;\nthe client varies it (from mtime/size) so replacing a file in place shows\nthe new thumbnail instead of a cached stale one.",
         "operationId": "serve_file_thumbnail_api_files_thumbnail_get",
         "parameters": [
           {
@@ -1645,7 +1645,7 @@
     "/api/files/info/copy": {
       "post": {
         "summary": "Copy Info",
-        "description": "Copy one subject's origin note onto another — the unzip workflow.\n\nExtracting an archive loses the provenance you recorded against it, so this\ncarries the description, links and screenshots over to the extracted folder\nwithout retyping them.\n\n**Additive, never destructive.** Links merge as a union keyed by url+kind\nand attachments by content hash, so re-running it is a no-op rather than a\npile of duplicates. A description is only replaced when the caller passes\n``overwrite_description``; otherwise a target that already has text is a 409\nand the UI asks first. Nothing is ever removed from the target.\n\nAttachment **bytes are not copied** — the store is content-addressed, so the\nnew row points at the blob that already exists.",
+        "description": "Copy one subject's origin note onto another \u2014 the unzip workflow.\n\nExtracting an archive loses the provenance you recorded against it, so this\ncarries the description, links and screenshots over to the extracted folder\nwithout retyping them.\n\n**Additive, never destructive.** Links merge as a union keyed by url+kind\nand attachments by content hash, so re-running it is a no-op rather than a\npile of duplicates. A description is only replaced when the caller passes\n``overwrite_description``; otherwise a target that already has text is a 409\nand the UI asks first. Nothing is ever removed from the target.\n\nAttachment **bytes are not copied** \u2014 the store is content-addressed, so the\nnew row points at the blob that already exists.",
         "operationId": "copy_info_api_files_info_copy_post",
         "requestBody": {
           "content": {
@@ -6507,6 +6507,102 @@
         }
       }
     },
+    "/api/youtube/playlists/{playlist_id}/rename": {
+      "post": {
+        "summary": "Rename Playlist",
+        "operationId": "rename_playlist_api_youtube_playlists__playlist_id__rename_post",
+        "parameters": [
+          {
+            "name": "playlist_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Playlist Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlaylistRename"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/youtube/playlists/{playlist_id}/archive": {
+      "post": {
+        "summary": "Archive Playlist",
+        "operationId": "archive_playlist_api_youtube_playlists__playlist_id__archive_post",
+        "parameters": [
+          {
+            "name": "playlist_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Playlist Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlaylistArchive"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/youtube/playlists/{playlist_id}/items": {
       "get": {
         "summary": "Playlist Items",
@@ -10339,6 +10435,33 @@
         ],
         "title": "PlaybackFailure"
       },
+      "PlaylistArchive": {
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "maximum": 9007199254740990.0,
+            "minimum": 0.0,
+            "title": "Revision"
+          },
+          "item_count": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Item Count"
+          },
+          "request_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Request Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "revision",
+          "item_count",
+          "request_id"
+        ],
+        "title": "PlaylistArchive"
+      },
       "PlaylistCreate": {
         "properties": {
           "title": {
@@ -10384,6 +10507,34 @@
           "version"
         ],
         "title": "PlaylistMembership"
+      },
+      "PlaylistRename": {
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Title"
+          },
+          "revision": {
+            "type": "integer",
+            "maximum": 9007199254740990.0,
+            "minimum": 0.0,
+            "title": "Revision"
+          },
+          "request_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Request Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "title",
+          "revision",
+          "request_id"
+        ],
+        "title": "PlaylistRename"
       },
       "PopularityPeriod": {
         "properties": {

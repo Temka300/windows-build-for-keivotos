@@ -2,6 +2,7 @@
 from pathlib import Path
 from module_descriptor import ModuleDescriptor
 from modules.youtube.user_schema import SCHEMA as PERSONAL_SCHEMA
+from modules.youtube.user_schema import migrate as migrate_personal
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS youtube_preferences (
@@ -32,6 +33,8 @@ def _tasks():
 
 def _publish(connection):
     connection.executescript(SCHEMA + PERSONAL_SCHEMA)
+    connection.execute('BEGIN IMMEDIATE')
+    migrate_personal(connection)
     columns={row[0] if not isinstance(row,dict) else row['name']
              for row in connection.execute('SELECT name FROM pragma_table_info(\'youtube_downloads\')')}
     for name in ('retry_of','superseded_by','failure_phase'):

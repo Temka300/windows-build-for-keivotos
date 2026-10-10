@@ -108,6 +108,18 @@ class PlaylistMembership(BaseModel):
     version: int = Field(ge=0, le=9007199254740990)
 
 
+class PlaylistRename(BaseModel):
+    title: str = Field(min_length=1,max_length=120)
+    revision: int = Field(ge=0,le=9007199254740990)
+    request_id: UUID
+
+
+class PlaylistArchive(BaseModel):
+    revision: int = Field(ge=0,le=9007199254740990)
+    item_count: int = Field(ge=0)
+    request_id: UUID
+
+
 def _playlist_enabled():
     try:
         require_enabled('youtube')
@@ -131,6 +143,22 @@ def create_playlist(payload:PlaylistCreate):
         _playlist_enabled()
         with get_user_db() as connection:
             return playlists.create(connection,payload.title,str(payload.request_id))
+
+
+@router.post('/api/youtube/playlists/{playlist_id}/rename')
+def rename_playlist(playlist_id:UUID,payload:PlaylistRename):
+    with lifecycle.module_change_lock:
+        _playlist_enabled()
+        with get_user_db() as connection:
+            return playlists.change(connection,str(playlist_id),payload.revision,str(payload.request_id),title=payload.title)
+
+
+@router.post('/api/youtube/playlists/{playlist_id}/archive')
+def archive_playlist(playlist_id:UUID,payload:PlaylistArchive):
+    with lifecycle.module_change_lock:
+        _playlist_enabled()
+        with get_user_db() as connection:
+            return playlists.change(connection,str(playlist_id),payload.revision,str(payload.request_id),count=payload.item_count)
 
 
 @router.get('/api/youtube/playlists/{playlist_id}/items')

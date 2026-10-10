@@ -10,13 +10,17 @@
  import PlaylistCreateDialog from './PlaylistCreateDialog.svelte';
  import PlaylistMembershipDialog from './PlaylistMembershipDialog.svelte';
  import PlaylistQueuePanel from './PlaylistQueuePanel.svelte';
+ import PlaylistContextMenu from './PlaylistContextMenu.svelte';
+ import PlaylistRenameDialog from './PlaylistRenameDialog.svelte';
+ import PlaylistDeleteDialog from './PlaylistDeleteDialog.svelte';
+ import {ApiError} from '../../lib/http';
  import {filesApi} from '../../lib/filesApi';
  import {moduleSidebarPreferences} from '../../lib/moduleSidebarPreferences';
  import {notify,updateNotification,dismissNotification} from '../../lib/notifications';
  import {youtubeApi,type Download,type EngineStatus,type Playlist,type PlaylistItem} from './api';
  let drawer=false,query='',video='best',audio='best',optionsOpen=false;
  let section:'videos'|'playlists'='videos',createOpen=false,createAnchor:HTMLButtonElement|null=null,playlistsView:PlaylistsView;
- function chooseSection(next:'videos'|'playlists'){abandonPlaylist();if(window.matchMedia('(max-width:700px)').matches)moduleSidebarPreferences('youtube').open.set(false);section=next;optionsOpen=false;clearTimeout(debounce);request?.abort();loading=false;if(next==='videos')void load(false,true);}
+ function chooseSection(next:'videos'|'playlists'){managementRequest?.abort();playlistMenu=null;abandonPlaylist();if(window.matchMedia('(max-width:700px)').matches)moduleSidebarPreferences('youtube').open.set(false);section=next;optionsOpen=false;clearTimeout(debounce);request?.abort();loading=false;if(next==='videos')void load(false,true);}
  function createPlaylist(anchor:HTMLButtonElement){createAnchor=anchor;createOpen=true;}
  async function closeCreate(){createOpen=false;await tick();if(createAnchor?.isConnected)createAnchor.focus();}
  async function created(playlist:Playlist){playlistsView?.acceptCreated(playlist);notify('Playlist created: '+playlist.title+'.',{tone:'success'});await closeCreate();}
@@ -27,6 +31,33 @@
  let activePlaylist:Playlist|null=null,playlistRows:PlaylistItem[]=[],playlistTotal=0,playlistLoading=false,playlistError='';
  let playlistRequest:AbortController|null=null,playlistNavigation:AbortController|null=null,playlistEpoch=0;
  let panelOpen=false,panelAnchor:HTMLButtonElement|null=null,playlistListScroll=0,playlistReturnId='';
+ let playlistMenu:{x:number;y:number;playlist:Playlist;anchor:HTMLElement}|null=null,playlistMenuSerial=0;
+ let management: {kind:'rename'|'delete';playlist:Playlist;anchor:HTMLElement}|null=null;
+ let managementRequest:AbortController|null=null;
+ function openPlaylistMenu(event:MouseEvent|KeyboardEvent,playlist:Playlist){
+  event.preventDefault();event.stopPropagation();locationMenu=null;
+  const current=event.currentTarget as HTMLElement,anchor=event.target instanceof Element?(event.target.closest<HTMLElement>('button,a')??current):current,rect=anchor.getBoundingClientRect();
+  playlistMenu={playlist,anchor,x:event instanceof MouseEvent?event.clientX:rect.left+8,y:event instanceof MouseEvent?event.clientY:rect.bottom};playlistMenuSerial++;
+ }
+ function playlistMenuKey(event:KeyboardEvent){if(activePlaylist&&(event.key==='ContextMenu'||event.shiftKey&&event.key==='F10'))openPlaylistMenu(event,activePlaylist);}
+ async function beginManagement(kind:'rename'|'delete',playlist:Playlist,anchor:HTMLElement){
+  managementRequest?.abort();const current=new AbortController();managementRequest=current;
+  try{const result=await youtubeApi.playlistItems(playlist.id,0,current.signal,1);if(alive&&!current.signal.aborted)management={kind,playlist:result.playlist,anchor};}
+  catch(e){if(alive&&!current.signal.aborted){notify(e instanceof Error?e.message:'Could not load playlist.',{tone:'error'});anchor?.focus({preventScroll:true});}}
+ }
+ async function closeManagement(){const anchor=management?.anchor;management=null;await tick();if(anchor?.isConnected)anchor.focus({preventScroll:true});else document.querySelector<HTMLButtonElement>('.playlists-view .add,.playlist-back')?.focus({preventScroll:true});}
+ async function playlistChanged(playlist:Playlist){
+  const archived=!!playlist.deleted_at;
+  if(activePlaylist?.id===playlist.id){
+   playlistRequest?.abort();playlistNavigation?.abort();playlistEpoch++;navigating=false;
+   if(archived){if(selected)await close();abandonPlaylist();}
+   else activePlaylist=playlist;
+  }
+  await tick();playlistsView?.acceptChanged(playlist);
+  notify((archived?'Playlist deleted: ':'Playlist renamed: ')+playlist.title+'.',{tone:'success'});
+  await closeManagement();
+ }
+ function refreshPlaylist(){if(alive&&activePlaylist&&!management)void loadPlaylist();}
  function abandonPlaylist(){playlistEpoch++;playlistRequest?.abort();playlistNavigation?.abort();activePlaylist=null;playlistRows=[];playlistTotal=0;playlistError='';playlistLoading=false;panelOpen=false;}
  async function openPlaylist(playlist:Playlist){
   playlistListScroll=document.querySelector('.playlists-view')?.scrollTop??0;playlistReturnId=playlist.id;
@@ -47,7 +78,7 @@
    playlistRows=[...new Map((more?[...playlistRows,...result.items]:result.items).map(row=>[row.job_id,row])).values()];
    playlistTotal=result.total;activePlaylist=result.playlist;
    if(selected){const currentMember=playlistRows.find(row=>row.job_id===selected?.id);navigationNotice=!currentMember?'This video is no longer in this playlist.':!currentMember.available?currentMember.unavailable_reason:'';}
-  }catch(e){if(alive&&!current.signal.aborted&&epoch===playlistEpoch)playlistError=e instanceof Error?e.message:'Could not load playlist videos.';}
+  }catch(e){if(alive&&!current.signal.aborted&&epoch===playlistEpoch){playlistError=e instanceof Error?e.message:'Could not load playlist videos.';if(e instanceof ApiError&&e.status===404){playlistRows=[];playlistTotal=0;navigationNotice='This playlist is unavailable. Return to playlists.';}}}
   finally{if(playlistRequest===current)playlistLoading=false;}
  }
  async function playlistSnapshot(context:Playlist,signal:AbortSignal):Promise<{playlist:Playlist;items:PlaylistItem[];total:number}>{
@@ -57,7 +88,7 @@
   const requests=Math.ceil(bound/120);
   for(let page=1;page<requests&&rows.length<bound;page++){
    const next=await youtubeApi.playlistItems(context.id,page*120,signal,120);
-   if(next.total!==bound)throw new Error('This playlist changed while loading. Try again.');
+   if(next.total!==bound||next.playlist.revision!==first.playlist.revision)throw new Error('This playlist changed while loading. Try again.');
    if(!next.items.length)throw new Error('Could not load the remaining playlist videos. Try again.');
    rows.push(...next.items);
   }
@@ -72,7 +103,7 @@
   try{
    const result=await playlistSnapshot(context,current.signal);
    if(!alive||current.signal.aborted||epoch!==playlistEpoch||selected!==currentVideo||activePlaylist?.id!==context.id)return false;
-   playlistRows=result.items;playlistTotal=result.total;playlistError='';
+   playlistRows=result.items;playlistTotal=result.total;activePlaylist=result.playlist;playlistError='';
    const index=playlistRows.findIndex(row=>row.job_id===currentVideo.id);
    if(index<0){navigationNotice='This video is no longer in this playlist.';return false;}
    for(let step=1;step<=playlistRows.length;step++){
@@ -101,7 +132,7 @@
   try{
    const result=await playlistSnapshot(context,current.signal);
    if(!alive||current.signal.aborted||epoch!==playlistEpoch||activePlaylist?.id!==context.id)return;
-   playlistRows=result.items;playlistTotal=result.total;playlistError='';
+   playlistRows=result.items;playlistTotal=result.total;activePlaylist=result.playlist;playlistError='';
    const fresh=playlistRows.find(row=>row.job_id===item.job_id);
    if(!fresh?.available||!fresh.job){navigationNotice=fresh?.unavailable_reason||'This video is no longer in this playlist.';return;}
    open(fresh.job,origin);
@@ -247,10 +278,10 @@
  }
  async function poll(){if(section==='videos'&&!selected&&items.some(active))await load(false,true);if(alive)timer=setTimeout(poll,1000);}
  onMount(()=>{motion=document.documentElement.dataset.motion==='reduced'||window.matchMedia('(prefers-reduced-motion: reduce)').matches?0:200;void engine();void load();timer=setTimeout(poll,1000);});
- onDestroy(()=>{alive=false;playlistRequest?.abort();playlistNavigation?.abort();request?.abort();clearTimeout(timer);clearTimeout(debounce);});
+ onDestroy(()=>{alive=false;managementRequest?.abort();playlistRequest?.abort();playlistNavigation?.abort();request?.abort();clearTimeout(timer);clearTimeout(debounce);});
 </script>
-<svelte:window on:keydown={escape}/>
-<div class="youtube-surface" inert={!!selected||createOpen||!!membershipVideo}>
+<svelte:window on:keydown={escape} on:focus={refreshPlaylist}/>
+<div class="youtube-surface" inert={!!selected||createOpen||!!membershipVideo||!!management}>
  <header><button class="menu" aria-label="Open Keivotos menu" on:click={()=>drawer=true}>☰</button><span class="module-title">YouTube</span>{#if section==='videos'}<div class="search-controls"><div class="options-anchor"><button class="options-toggle" aria-label="Download options" title="Download options" aria-expanded={optionsOpen} aria-controls="download-options" on:click={()=>optionsOpen=!optionsOpen}><svg class:opened={optionsOpen} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="m6 15 6-6 6 6"/></svg></button>
  {#if optionsOpen}
  <div id="download-options" class="download-options" transition:slide={{duration:motion}}>
@@ -294,8 +325,9 @@
   {#if items.length<total}<button class="more" disabled={loading} on:click={()=>load(true)}>Load more</button>{/if}
  </main>
  {:else if activePlaylist}
- <main class="playlist-detail">
-  <header class="playlist-heading"><button type="button" class="playlist-back" aria-label="Back to playlists" on:click={backToPlaylists}>‹</button><h1>{activePlaylist.title}</h1><span>{playlistTotal} {playlistTotal===1?'video':'videos'}</span></header>
+ <!-- svelte-ignore a11y_no_noninteractive_tabindex a11y_no_noninteractive_element_interactions -->
+ <main class="playlist-detail" tabindex="0" on:contextmenu={event=>activePlaylist&&openPlaylistMenu(event,activePlaylist)} on:keydown={playlistMenuKey}>
+  <header class="playlist-heading"><button type="button" class="playlist-back" aria-label="Back to playlists" on:click={backToPlaylists}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15.5 5-7 7 7 7"/></svg></button><h1>{activePlaylist.title}</h1><span>{playlistTotal} {playlistTotal===1?'video':'videos'}</span></header>
   {#if playlistError}<p role="alert">{playlistError} <button on:click={()=>loadPlaylist()}>Retry playlist</button></p>{/if}
   {#if playlistLoading&&!playlistRows.length}<p role="status">Loading playlist videos…</p>{:else if !playlistRows.length&&!playlistError}<p class="empty">No videos in this playlist. Use Add to playlists on a completed video.</p>{/if}
   <div class="download-grid" aria-busy={playlistLoading}>
@@ -311,10 +343,17 @@
   </div>
   {#if playlistRows.length<playlistTotal}<button class="more" disabled={playlistLoading||navigating} on:click={()=>loadPlaylist(true)}>Load more playlist videos</button>{/if}
  </main>
- {:else}<PlaylistsView bind:this={playlistsView} on:create={(event)=>createPlaylist(event.detail)} on:open={event=>openPlaylist(event.detail)}/>{/if}
+ {:else}<PlaylistsView bind:this={playlistsView} on:create={(event)=>createPlaylist(event.detail)} on:open={event=>openPlaylist(event.detail)} on:context={event=>openPlaylistMenu(event.detail.event,event.detail.playlist)}/>{/if}
  </div>
 </div>
 {#if createOpen}<PlaylistCreateDialog on:close={closeCreate} on:created={(event)=>created(event.detail)}/>{/if}
+{#if playlistMenu}
+ {#key playlistMenuSerial}<PlaylistContextMenu {...playlistMenu} on:close={()=>playlistMenu=null} on:rename={event=>beginManagement('rename',event.detail,playlistMenu!.anchor)} on:delete={event=>beginManagement('delete',event.detail,playlistMenu!.anchor)}/>{/key}
+{/if}
+{#if management}
+ {#if management.kind==='rename'}<PlaylistRenameDialog playlist={management.playlist} on:close={closeManagement} on:saved={event=>playlistChanged(event.detail)}/>
+ {:else}<PlaylistDeleteDialog playlist={management.playlist} on:close={closeManagement} on:saved={event=>playlistChanged(event.detail)}/>{/if}
+{/if}
 {#if membershipVideo}{#key membershipVideo.id}<PlaylistMembershipDialog video={membershipVideo} on:close={()=>closeMembership()} on:saved={()=>closeMembership(true)}/>{/key}{/if}
 {#if drawer}<AppDrawer on:close={()=>drawer=false}/>{/if}
 {#if locationMenu}
@@ -332,7 +371,7 @@
  </MediaPlayer>
 {/if}
 <style>
- .playlist-heading{padding:0 0 20px;border:0;min-height:0;gap:12px}.playlist-heading h1{font-size:20px;font-weight:600;overflow-wrap:anywhere}.playlist-heading span{font-size:13px;color:#aaa}.playlist-back{font-size:28px;width:32px;height:32px;border-radius:8px;border:1px solid #303040}.playlist-toggle{display:grid;place-items:center;width:40px;height:40px;flex:none;border-radius:50%;color:#eee}.playlist-toggle svg{width:24px;height:24px}.playlist-toggle:hover,.playlist-toggle[aria-expanded='true']{background:#ffffff20}.playlist-toggle:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+ .playlist-heading{padding:0 0 20px;border:0;min-height:0;gap:12px}.playlist-heading h1{font-size:20px;font-weight:600;overflow-wrap:anywhere}.playlist-heading span{font-size:13px;color:#aaa}.playlist-back{display:grid;place-items:center;flex:none;width:32px;height:32px;border-radius:8px;border:1px solid #303040}.playlist-back svg{display:block;width:20px;height:20px}.playlist-toggle{display:grid;place-items:center;width:40px;height:40px;flex:none;border-radius:50%;color:#eee}.playlist-toggle svg{width:24px;height:24px}.playlist-toggle:hover,.playlist-toggle[aria-expanded='true']{background:#ffffff20}.playlist-toggle:focus-visible,.playlist-back:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
  @media(max-width:600px){.playlist-toggle{width:32px;height:36px}}@media(max-width:400px){.playlist-toggle{width:28px}}
  .youtube-surface{display:flex;flex:1;min-height:0;min-width:0;flex-direction:column;background:#0f0f14;color:#e0e0e8}
  header{display:flex;align-items:center;gap:16px;min-height:60px;border-bottom:1px solid #2a2a3a;padding:8px 16px}

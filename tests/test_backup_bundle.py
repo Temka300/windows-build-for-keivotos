@@ -150,19 +150,23 @@ class MetadataBackupBundleTests(unittest.TestCase):
         from modules.youtube import _publish
         with closing(sqlite3.connect(self.user_db)) as connection, connection:
             _publish(connection)
-            connection.execute("INSERT INTO youtube_playlists(id,request_id,title) VALUES ('playlist','request','공부 음악')")
+            connection.execute("INSERT INTO youtube_playlists(id,request_id,title,revision,deleted_at) VALUES ('playlist','request','공부 음악',2,'2026-10-10T00:00:00Z')")
+            connection.executemany("INSERT INTO youtube_playlist_history(playlist_id,revision,request_id,operation,previous_title,title) VALUES ('playlist',?,?,?,?,?)",[(0,'request','create','','Original'),(1,'rename-request','rename','Original','공부 음악'),(2,'archive-request','archive','공부 음악','공부 음악')])
             connection.execute("INSERT INTO youtube_playlist_items(playlist_id,job_id,position) VALUES ('playlist','retained-job',7)")
             connection.execute("INSERT INTO youtube_playlist_versions VALUES ('retained-job',3)")
             connection.commit()
         with patch('suite_modules.enabled_ids', side_effect=AssertionError('Personal backup ignores enablement')):
             created=backup_bundle.create_backup_bundle()
         with closing(sqlite3.connect(self.user_db)) as connection, connection:
-            connection.execute("UPDATE youtube_playlists SET title='later title'")
+            connection.execute("UPDATE youtube_playlists SET title='later title',revision=3,deleted_at=''")
+            connection.execute('DELETE FROM youtube_playlist_history')  # isolated fixture changes after its backup
             connection.execute('UPDATE youtube_playlist_versions SET version=4')
             connection.commit()
         backup_bundle.restore_backup_bundle(created['name'])
         with closing(sqlite3.connect(self.user_db)) as connection, connection:
             self.assertEqual(connection.execute('SELECT title FROM youtube_playlists').fetchone(), ('공부 음악',))
+            self.assertEqual(connection.execute('SELECT revision,deleted_at FROM youtube_playlists').fetchone(), (2,'2026-10-10T00:00:00Z'))
+            self.assertEqual(connection.execute('SELECT operation,previous_title,title FROM youtube_playlist_history ORDER BY revision').fetchall(), [('create','','Original'),('rename','Original','공부 음악'),('archive','공부 음악','공부 음악')])
             self.assertEqual(connection.execute('SELECT job_id,position FROM youtube_playlist_items').fetchone(), ('retained-job',7))
             self.assertEqual(connection.execute('SELECT version FROM youtube_playlist_versions').fetchone(), (3,))
             self.assertEqual(connection.execute('SELECT value FROM marker').fetchone(), ('user-original',))
