@@ -2,11 +2,22 @@
 from pathlib import Path
 
 from module_descriptor import ModuleDescriptor
+from modules.twitter.user_schema import SCHEMA, publish
 
 
 def _routers():
     from modules.twitter.router import router
     return [router]
+
+
+def _startup():
+    from modules.twitter.jobs import recover
+    recover()
+
+
+def _tasks():
+    from modules.twitter.jobs import run_queue
+    return [('twitter-downloads', run_queue())]
 
 
 def adopt(source_id: str) -> dict:
@@ -40,4 +51,6 @@ def descriptor(suite_home: Path, version: str) -> ModuleDescriptor:
         credentials=None, api_prefix='/api/twitter', log_prefix='twitter',
         user_agent=f'Keivotos/{version} (Twitter)', disableable=True, is_base=False,
         experimental=True, router_provider=_routers, adopt_hook=adopt, release_hook=release,
+        user_schema_provider=lambda: SCHEMA, publish_hook=publish,
+        startup_hook=_startup, background_tasks_hook=_tasks,
     )

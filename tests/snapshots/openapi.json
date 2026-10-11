@@ -7573,6 +7573,265 @@
         }
       }
     },
+    "/api/twitter/settings": {
+      "get": {
+        "summary": "Settings",
+        "operationId": "settings_api_twitter_settings_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Save Settings",
+        "operationId": "save_settings_api_twitter_settings_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TwitterPreferences"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/twitter/downloads": {
+      "get": {
+        "summary": "Downloads",
+        "operationId": "downloads_api_twitter_downloads_get",
+        "parameters": [
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 240,
+              "minimum": 1,
+              "default": 120,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Download",
+        "operationId": "download_api_twitter_downloads_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TwitterDownload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/twitter/downloads/{job_id}": {
+      "get": {
+        "summary": "Download Status",
+        "operationId": "download_status_api_twitter_downloads__job_id__get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/twitter/downloads/{job_id}/cancel": {
+      "post": {
+        "summary": "Cancel Download",
+        "operationId": "cancel_download_api_twitter_downloads__job_id__cancel_post",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/twitter/downloads/{job_id}/retry": {
+      "post": {
+        "summary": "Retry Download",
+        "operationId": "retry_download_api_twitter_downloads__job_id__retry_post",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TwitterRetry"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/": {
       "get": {
         "summary": "Serve Index",
@@ -12651,6 +12910,60 @@
           "status"
         ],
         "title": "ToolStatusInfo"
+      },
+      "TwitterDownload": {
+        "properties": {
+          "url": {
+            "type": "string",
+            "maxLength": 2048,
+            "title": "Url"
+          },
+          "source_id": {
+            "type": "string",
+            "maxLength": 256,
+            "title": "Source Id",
+            "default": ""
+          },
+          "request_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Request Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "url",
+          "request_id"
+        ],
+        "title": "TwitterDownload"
+      },
+      "TwitterPreferences": {
+        "properties": {
+          "source_id": {
+            "type": "string",
+            "maxLength": 256,
+            "title": "Source Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source_id"
+        ],
+        "title": "TwitterPreferences"
+      },
+      "TwitterRetry": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Request Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id"
+        ],
+        "title": "TwitterRetry"
       },
       "UserImageTagCreate": {
         "properties": {

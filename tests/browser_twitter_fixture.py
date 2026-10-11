@@ -55,3 +55,113 @@ def seed_twitter(media: Path):
     value['complete'] = False
     incomplete.write_text(json.dumps(value), encoding='utf-8')
     (media / 'fixture-info.json').write_text(json.dumps({'video_size': len(video), 'raw_text': RAW_TEXT}), encoding='utf-8')
+
+
+def source_response(post_id='333'):
+    return {'id_str': post_id, 'text': RAW_TEXT, 'created_at': '2026-10-10T12:00:00Z',
+            'user': {'id_str': '123', 'name': 'Saved author 이름', 'screen_name': 'SavedAuthor',
+                     'profile_image_url_https': 'https://pbs.twimg.com/generated.jpg'},
+            'mediaDetails': [{'type': 'video', 'video_info': {'variants': [
+                {'content_type': 'video/mp4', 'bitrate': 128000, 'url': 'https://video.twimg.com/generated.mp4'}]}}]}
+
+
+def fixture_worker(endpoint):
+    """Test-only adapter: actual loopback HTTP and installed yt-dlp, no X traffic.
+
+    Production host validation remains in force on the original source/CDN URLs;
+    only the test transport maps their bytes to the generated loopback fixture.
+    This function is called by a private/test helper wrapper, never application code.
+    """
+    from urllib.parse import urlsplit, parse_qs
+    from urllib.request import urlopen
+    from yt_dlp.networking.common import Request
+    from yt_dlp.networking._urllib import UrllibRH
+    from modules.twitter import acquisition, worker
+    endpoint_parts = urlsplit(endpoint)
+    assert endpoint_parts.scheme == 'http' and endpoint_parts.hostname == '127.0.0.1'
+    def read(url, host, limit):
+        acquisition.remote_url(url, host)
+        post_id = parse_qs(urlsplit(url).query).get('id', ['333'])[0]
+        path = '/source.json?id=' + post_id if host == 'cdn.syndication.twimg.com' else '/avatar.jpg'
+        with urlopen(endpoint + path, timeout=10) as response:
+            data = response.read(limit + 1)
+        if not data or len(data) > limit:
+            raise ValueError('Fixture response exceeds the capture limit')
+        return data
+    class Log:
+        def debug(self, value): pass
+        def warning(self, value): pass
+        def error(self, value): pass
+    class Transport:
+        def __init__(self):
+            self.inner = UrllibRH(logger=Log(), proxies={}, timeout=10)
+        def send(self, request):
+            acquisition.remote_url(request.url, 'video.twimg.com')
+            response = self.inner.send(Request(endpoint + '/video.mp4', headers=request.headers,
+                                               method=request.method))
+            response.url = request.url
+            return response
+        def close(self):
+            self.inner.close()
+    acquisition.read_remote = read
+    acquisition.media_transport = Transport
+    return worker.main([])
+
+
+def install(media):
+    """Install a generated loopback source for the actual browser/server harness."""
+    import asyncio
+    import sys
+    import threading
+    import time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlsplit, parse_qs
+    from modules.twitter import jobs
+    first = sorted((media / 'captures').glob('*/*/avatar.jpg'))[0]
+    avatar, video = first.read_bytes(), (media / 'generated.mp4').read_bytes()
+    state = {'fail': False, 'delay': 0, 'source_requests': 0, 'video_requests': 0}
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_POST(self):
+            assert self.path == '/control'
+            value = json.loads(self.rfile.read(int(self.headers.get('Content-Length', '0'))))
+            state.update({key: value[key] for key in ('fail', 'delay') if key in value})
+            self.respond(json.dumps(state).encode(), 'application/json')
+        def do_HEAD(self): self.get(False)
+        def do_GET(self): self.get(True)
+        def get(self, body):
+            url = urlsplit(self.path)
+            if url.path == '/stats':
+                self.respond(json.dumps(state).encode(), 'application/json', body)
+            elif url.path == '/source.json':
+                state['source_requests'] += 1
+                time.sleep(min(5, max(0, state['delay'])))
+                post_id = parse_qs(url.query).get('id', ['333'])[0]
+                value = source_response(post_id)
+                if state['fail']: value['mediaDetails'] = []
+                self.respond(json.dumps(value, ensure_ascii=False).encode('utf-8'), 'application/json', body)
+            elif url.path == '/avatar.jpg': self.respond(avatar, 'image/jpeg', body)
+            elif url.path == '/video.mp4':
+                state['video_requests'] += 1
+                self.respond(video, 'video/mp4', body)
+            else:
+                self.send_error(404)
+        def respond(self, data, kind, body=True):
+            self.send_response(200); self.send_header('Content-Length', str(len(data)))
+            self.send_header('Content-Type', kind); self.end_headers()
+            if body:
+                try: self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError): pass
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    endpoint = f'http://127.0.0.1:{server.server_port}'
+    (media / 'fixture-endpoint.json').write_text(json.dumps({'url': endpoint}), encoding='utf-8')
+    original = asyncio.create_subprocess_exec
+    root = Path(__file__).resolve().parents[1]
+    script = 'import sys;sys.path.insert(0,sys.argv[1]);sys.path.insert(0,sys.argv[2]);from tests.browser_twitter_fixture import fixture_worker;raise SystemExit(fixture_worker(sys.argv[3]))'
+    async def launch(*args, **kwargs):
+        if '--twitter-worker' in args:
+            return await original(sys.executable, '-c', script, str(root), str(root / 'backend'), endpoint, **kwargs)
+        return await original(*args, **kwargs)
+    asyncio.create_subprocess_exec = launch
+    return server

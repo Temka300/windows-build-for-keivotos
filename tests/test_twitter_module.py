@@ -10,6 +10,7 @@ import subprocess
 import sys
 import zipfile
 from unittest.mock import patch
+from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
@@ -21,8 +22,8 @@ import config
 import database
 from files_base import index, sources, serving
 from modules import twitter
-from modules.twitter import archive, router
-from tests.browser_twitter_fixture import RAW_TEXT, write_capture
+from modules.twitter import archive, router, jobs, acquisition
+from tests.browser_twitter_fixture import RAW_TEXT, write_capture, source_response
 
 
 @pytest.fixture
@@ -43,9 +44,11 @@ def catalog(tmp_path, monkeypatch):
             connection.close()
     with connect() as connection:
         sources.ensure_sources_schema(connection)
+        twitter.publish(connection)
         source = sources.register_source(connection, media, 'Saved posts')
     monkeypatch.setattr(router, 'get_user_db', connect)
     monkeypatch.setattr(database, 'get_user_db', connect)
+    monkeypatch.setattr(jobs, 'get_user_db', connect)
     monkeypatch.setattr(config, 'USER_DB_PATH', user)
     monkeypatch.setattr(config, 'FILES_DB_PATH', db)
     monkeypatch.setattr(config, 'SUITE_HOME', home)
@@ -417,3 +420,291 @@ def test_user_backup_retains_role_without_originals_or_extra_artifact(catalog, t
         snapshot.write_bytes(bundle.read('databases/user.sqlite'))
     with sqlite3.connect(snapshot) as connection:
         assert connection.execute('SELECT role FROM files_sources WHERE source_id=?', (source.source_id,)).fetchone()[0] == 'twitter'
+
+
+def new_job(catalog, token=None):
+    source = catalog[0]
+    twitter.adopt(source.source_id)
+    return jobs.create('https://x.com/SavedAuthor/status/333', source.source_id, token or uuid4())
+
+
+def test_job_uuid_receipt_duplicate_concurrency_and_durable_queue(catalog):
+    from concurrent.futures import ThreadPoolExecutor
+    token = uuid4()
+    source = catalog[0]
+    twitter.adopt(source.source_id)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(lambda _: new_job(catalog, token), range(4)))
+    assert len({r['id'] for r in results}) == 1
+    assert jobs.listing()['total'] == 1
+    with pytest.raises(ValueError, match='already downloading'):
+        new_job(catalog)
+    with pytest.raises(ValueError, match='different capture'):
+        jobs.create('https://x.com/SavedAuthor/status/444', source.source_id, token)
+    jobs.update(str(token), status='complete')
+    assert new_job(catalog)['id'] != str(token)
+    assert 'root' not in jobs.listing()['items'][0]
+
+
+def test_committed_lost_acknowledgement_reuses_original_uuid(catalog, monkeypatch):
+    source, _, _, connect = catalog
+    twitter.adopt(source.source_id)
+    token = uuid4()
+    @contextmanager
+    def lost():
+        with connect() as db:
+            yield db
+            if db.execute('SELECT 1 FROM twitter_downloads').fetchone():
+                raise OSError('Intentional committed reply loss')
+    monkeypatch.setattr(jobs, 'get_user_db', lost)
+    with pytest.raises(OSError, match='reply loss'):
+        jobs.create('https://x.com/SavedAuthor/status/333', source.source_id, token)
+    monkeypatch.setattr(jobs, 'get_user_db', connect)
+    assert new_job(catalog, token)['id'] == str(token)
+    assert jobs.listing()['total'] == 1
+
+
+def test_pending_restart_and_retry_receipts_do_not_start_remote_work(catalog):
+    job = new_job(catalog)
+    jobs.recover()
+    assert jobs.get(job['id'])['status'] == 'interrupted'
+    token = uuid4()
+    retry = jobs.retry(job['id'], token)
+    assert retry['status'] == 'queued' and retry['id'] == job['id']
+    assert jobs.retry(job['id'], token) == retry
+    jobs.cancel(job['id'])
+    assert jobs.retry(job['id'], token)['status'] == 'cancelled'
+    assert jobs.retry(job['id'], uuid4())['status'] == 'queued'
+    assert not list(catalog[1].rglob('manifest.json'))
+
+
+def test_explicit_retry_preserves_new_attempt_directories(catalog):
+    job = new_job(catalog)
+    jobs.update(job['id'], status='running')
+    first = jobs.prepare(job)
+    original = acquisition.directory(first) / 'source.json'
+    original.write_bytes(b'preserved failed response')
+    jobs.update(job['id'], status='failed')
+    jobs.retry(job['id'], uuid4())
+    jobs.update(job['id'], status='running')
+    second = jobs.prepare(jobs.get(job['id']))
+    assert first['path'] != second['path'] and second['attempt'] == 2
+    assert original.read_bytes() == b'preserved failed response'
+
+
+@pytest.mark.parametrize('change', ['hide', 'role', 'nested', 'missing'])
+def test_destination_reconciles_fresh_ownership_without_output(catalog, change):
+    source, media, _, connect = catalog
+    job = new_job(catalog)
+    with connect() as db:
+        if change == 'hide':
+            sources.update_source(db, source.source_id, visible=False)
+        elif change == 'role':
+            sources.update_source(db, source.source_id, role='files')
+        elif change == 'nested':
+            child = media / 'captures'; child.mkdir()
+            sources.register_source(db, child, 'Nested owner')
+        else:
+            media.rmdir()
+    jobs.update(job['id'], status='running')
+    with pytest.raises((ValueError, serving.ServeDenied)):
+        jobs.prepare(job)
+    assert not list(media.rglob('manifest.json'))
+
+
+def test_preferences_additive_schema_and_maintenance_exclusion(catalog):
+    import maintenance
+    source, _, _, connect = catalog
+    twitter.adopt(source.source_id)
+    with connect() as db:
+        db.execute('CREATE TABLE marker(value TEXT)')
+        db.execute("INSERT INTO marker VALUES('user original')")
+        db.commit()
+        twitter.publish(db)
+        twitter.publish(db)
+        assert db.execute('SELECT value FROM marker').fetchone()[0] == 'user original'
+    assert jobs.save_preferences(source.source_id)['source_id'] == source.source_id
+    with maintenance.module_transition():
+        with pytest.raises(RuntimeError, match='transition'):
+            new_job(catalog)
+    assert jobs.listing()['total'] == 0
+
+
+def test_jobs_use_the_production_dictionary_row_factory(catalog, monkeypatch):
+    source, _, _, connect = catalog
+    @contextmanager
+    def production_rows():
+        with connect() as db:
+            db.row_factory = database._row_factory
+            yield db
+    monkeypatch.setattr(jobs, 'get_user_db', production_rows)
+    job = new_job(catalog)
+    assert jobs.listing()['total'] == 1
+    assert jobs.get(job['id'])['status'] == 'queued'
+
+
+@pytest.mark.parametrize('url', ['http://video.twimg.com/a.mp4', 'https://video.twimg.com.evil/a.mp4',
+    'https://user:secret@video.twimg.com/a.mp4', 'https://video.twimg.com:123/a.mp4',
+    'file:///video.mp4', 'https://127.0.0.1/video.mp4', 'https://video.twimg.com/a.mp4#fragment'])
+def test_media_host_admission_precedes_any_request(url):
+    with pytest.raises(ValueError):
+        acquisition.remote_url(url, 'video.twimg.com')
+
+
+def test_redirect_host_is_checked_before_following():
+    from urllib.request import Request
+    handler = acquisition.Redirects('video.twimg.com')
+    request = Request('https://video.twimg.com/a.mp4')
+    with pytest.raises(ValueError):
+        handler.redirect_request(request, None, 302, 'Found', {}, 'https://outside.invalid/a.mp4')
+    allowed = handler.redirect_request(request, None, 302, 'Found', {}, 'https://video.twimg.com/b.mp4')
+    assert allowed.full_url == 'https://video.twimg.com/b.mp4'
+
+
+@pytest.mark.parametrize('field', ['multiple', 'hls', 'avatar', 'video', 'author', 'text', 'posted'])
+def test_unsupported_sources_preserve_response_and_refuse_record(field):
+    source = source_response()
+    if field == 'multiple': source['mediaDetails'].append(source['mediaDetails'][0])
+    elif field == 'hls': source['mediaDetails'][0]['video_info']['variants'][0]['content_type'] = 'application/x-mpegURL'
+    elif field == 'avatar': source['user']['profile_image_url_https'] = 'https://evil.invalid/avatar.jpg'
+    elif field == 'video': source['mediaDetails'][0]['video_info']['variants'][0]['url'] = 'https://evil.invalid/video.mp4'
+    elif field == 'author': source['user']['id_str'] = 123
+    elif field == 'text': source['text'] = '\ud800'
+    else: source['created_at'] = '2026-10-11T12:00:00'
+    with pytest.raises(ValueError):
+        acquisition.record({'post_id': '333', 'capture_id': 'fixture', 'url': 'https://x.com/SavedAuthor/status/333',
+                            'captured_at': '2026-10-11T12:00:00Z'}, source)
+
+
+def test_normalization_preserves_exact_text_and_optional_author_id():
+    source = source_response()
+    source['user'].pop('id_str')
+    source.pop('created_at')
+    spec = {'post_id': '333', 'capture_id': 'fixture', 'url': 'https://x.com/SavedAuthor/status/333',
+            'captured_at': '2026-10-11T12:00:00Z'}
+    tweet, _, _ = acquisition.record(spec, source)
+    assert tweet['raw_text'] == RAW_TEXT and tweet['author']['id'] is None and tweet['posted_at'] is None
+
+
+def test_real_helper_download_verify_publish_and_local_registration_retry(catalog, monkeypatch, tmp_path):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+    from io import BytesIO
+    from PIL import Image
+    import imageio_ffmpeg
+    generated = tmp_path / 'video.mp4'
+    subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-v', 'error', '-f', 'lavfi', '-i', 'color=blue:s=48x48:r=4',
+                    '-t', '0.5', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(generated)], check=True, timeout=30)
+    avatar = BytesIO(); Image.new('RGB', (24, 24), 'blue').save(avatar, 'JPEG')
+    bodies = {'/source.json': json.dumps(source_response(), ensure_ascii=False).encode('utf-8'),
+              '/avatar.jpg': avatar.getvalue(), '/video.mp4': generated.read_bytes()}
+    requests = []
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args): pass
+        def do_HEAD(self): self.respond(False)
+        def do_GET(self): self.respond(True)
+        def respond(self, body):
+            requests.append(self.path)
+            from urllib.parse import urlsplit
+            path = urlsplit(self.path).path
+            value = bodies[path]
+            self.send_response(200); self.send_header('Content-Length', str(len(value)))
+            self.send_header('Content-Type', 'video/mp4' if path.endswith('.mp4') else 'application/octet-stream')
+            self.end_headers()
+            if body: self.wfile.write(value)
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+    original_launch = asyncio.create_subprocess_exec
+    endpoint = f'http://127.0.0.1:{server.server_port}'
+    script = 'import sys;sys.path.insert(0,sys.argv[1]);sys.path.insert(0,sys.argv[2]);from tests.browser_twitter_fixture import fixture_worker;raise SystemExit(fixture_worker(sys.argv[3]))'
+    async def launch(*args, **kwargs):
+        if '--twitter-worker' not in args:
+            return await original_launch(*args, **kwargs)
+        return await original_launch(sys.executable, '-c', script, str(ROOT), str(ROOT / 'backend'), endpoint, **kwargs)
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', launch)
+    try:
+        job = new_job(catalog)
+        jobs.update(job['id'], status='running')
+        original_scan = index.scan_source
+        monkeypatch.setattr(index, 'scan_source', lambda *a, **kw: (_ for _ in ()).throw(OSError('Intentional index failure')))
+        with pytest.raises(OSError, match='index failure'):
+            asyncio.run(jobs.execute(job))
+        item = jobs.get(job['id'])
+        assert item['phase'] == 'registering'
+        path = catalog[1] / item['path']; assert path.is_file()
+        original = {p: p.read_bytes() for p in path.parent.iterdir() if p.is_file()}
+        manifest = json.loads(path.read_text(encoding='utf-8'))
+        for name, facts in manifest['files'].items():
+            assert hashlib.sha256((path.parent / name).read_bytes()).hexdigest() == facts['sha256']
+        assert json.loads((path.parent / 'tweet.json').read_text(encoding='utf-8'))['raw_text'] == RAW_TEXT
+        monkeypatch.setattr(index, 'scan_source', original_scan)
+        jobs.update(job['id'], status='failed')
+        jobs.retry(job['id'], uuid4())
+        async def recover_registration():
+            task = asyncio.create_task(jobs.run_queue())
+            try:
+                for _ in range(100):
+                    if jobs.get(job['id'])['status'] == 'complete':
+                        return
+                    await asyncio.sleep(.05)
+                raise AssertionError('Registration retry did not complete')
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        asyncio.run(recover_registration())
+        assert jobs.get(job['id'])['status'] == 'complete'
+        assert original == {p: p.read_bytes() for p in original}
+        assert browse()['items'][0]['raw_text'] == RAW_TEXT
+        assert requests.count('/source.json?id=333') == 1 and '/video.mp4' in requests
+        repeated = new_job(catalog)
+        jobs.update(repeated['id'], status='running')
+        asyncio.run(jobs.execute(repeated))
+        assert len(browse()['items']) == 2
+        assert original == {p: p.read_bytes() for p in original}
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=3)
+
+
+@pytest.mark.parametrize('action', ['cancel', 'disable', 'source'])
+def test_live_worker_stop_preserves_partial_files_and_reaps_child(catalog, monkeypatch, action):
+    launched = []
+    original_launch = asyncio.create_subprocess_exec
+    script = ('import json,sys,time;from pathlib import Path;s=json.loads(sys.stdin.readline());'
+              'p=Path(s["root"])/s["path"];(p.parent/"source.json").write_bytes(b"preserved partial");time.sleep(60)')
+    async def launch(*args, **kwargs):
+        if '--twitter-worker' not in args:
+            return await original_launch(*args, **kwargs)
+        process = await original_launch(sys.executable, '-c', script, **kwargs)
+        launched.append(process)
+        return process
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', launch)
+    job = new_job(catalog)
+    async def check():
+        runner = asyncio.create_task(jobs.run_queue())
+        partial = None
+        try:
+            for _ in range(100):
+                item = jobs.get(job['id'])
+                if item['path']:
+                    partial = catalog[1] / item['path'].replace('manifest.json', 'source.json')
+                    if partial.is_file(): break
+                await asyncio.sleep(.05)
+            assert partial is not None and partial.is_file()
+            if action == 'cancel':
+                jobs.cancel(job['id'])
+            elif action == 'source':
+                with catalog[3]() as db:
+                    sources.update_source(db, catalog[0].source_id, visible=False)
+            else:
+                runner.cancel()
+            for _ in range(100):
+                if launched[0].returncode is not None: break
+                await asyncio.sleep(.05)
+            assert launched[0].returncode is not None
+            assert partial.read_bytes() == b'preserved partial'
+            assert not partial.with_name('manifest.json').exists()
+        finally:
+            runner.cancel()
+            await asyncio.gather(runner, return_exceptions=True)
+    asyncio.run(check())
+    assert jobs.get(job['id'])['status'] == {'cancel':'cancelled','disable':'interrupted','source':'failed'}[action]

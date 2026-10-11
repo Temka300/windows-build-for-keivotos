@@ -126,6 +126,80 @@ const report={checks:[],errors:[],expectedConsole:[],requests:[]};
   assert.equal((await api(mediaUrl.replace('asset=video','asset=source'))).status,422);
   check('Twitter JPEG/MP4 route reuses shared ranges; actual native playback/seek and invalid ranges/assets are verified');
 
+  const fixture=JSON.parse(fs.readFileSync(path.join(config.mediaLocal,'fixture-endpoint.json'),'utf8')).url;
+  async function control(value){return (await context.request.post(fixture+'/control',{data:value})).json();}
+  async function stats(){return (await context.request.get(fixture+'/stats')).json();}
+  async function until(jobId,status){
+   const end=Date.now()+20000;
+   while(Date.now()<end){
+    const value=(await api('/api/twitter/downloads/'+jobId)).data;
+    if(value.status===status)return value;
+    if(value.status==='failed'&&status!=='failed')throw new Error(JSON.stringify(value));
+    await page.waitForTimeout(100);
+   }
+   throw new Error('Twitter job timeout '+jobId+' '+status);
+  }
+  assert.equal((await api('/api/twitter/settings','POST',{source_id:owner.source_id})).status,200);
+  await page.reload();await page.waitForLoadState('networkidle');
+  assert.equal((await api('/api/twitter/settings')).data.saved_source_id,owner.source_id);
+  assert.equal((await api('/api/twitter/downloads','POST',{url:'https://outside.invalid/status/333',source_id:owner.source_id,request_id:crypto.randomUUID()})).status,400);
+  await control({delay:.5,fail:false});
+  const payload={url:'https://x.com/SavedAuthor/status/333',source_id:owner.source_id,request_id:crypto.randomUUID()};
+  const accepted=await api('/api/twitter/downloads','POST',payload);assert.equal(accepted.status,200);
+  const repeated=await api('/api/twitter/downloads','POST',payload);assert.equal(repeated.data.id,accepted.data.id);
+  assert.equal((await api('/api/twitter/downloads','POST',{...payload,request_id:crypto.randomUUID()})).status,400);
+  const completed=await until(accepted.data.id,'complete');assert.equal(completed.progress,100);
+  assert.equal((await stats()).source_requests,1);
+  const capture=(await api(`/api/twitter/capture?source_id=${owner.source_id}&path=${encodeURIComponent(completed.path)}`)).data;
+  assert.equal(capture.raw_text,'  한글 世界\nline two \t\n');
+  const firstDirectory=path.dirname(path.join(config.mediaLocal,completed.path));const firstSaved=hashes(firstDirectory);
+  const manifest=JSON.parse(fs.readFileSync(path.join(firstDirectory,'manifest.json'),'utf8'));
+  assert.equal(manifest.complete,true);
+  for(const [name,value] of Object.entries(manifest.files)){
+   const bytes=fs.readFileSync(path.join(firstDirectory,name));assert.equal(bytes.length,value.size);
+   assert.equal(crypto.createHash('sha256').update(bytes).digest('hex'),value.sha256);
+  }
+  check('Saved destination survives reload; invalid links refuse; repeated UUID and concurrent duplicate admission create one verified real local MP4 capture');
+
+  await control({delay:0});
+  const second=await api('/api/twitter/downloads','POST',{...payload,request_id:crypto.randomUUID()});
+  const secondDone=await until(second.data.id,'complete');assert.notEqual(secondDone.path,completed.path);
+  assert.deepEqual(firstSaved,hashes(firstDirectory));
+  const page1=(await api('/api/twitter/downloads?limit=1')).data;assert.equal(page1.items.length,1);assert.equal(page1.next_offset,1);
+  assert.equal((await api('/api/twitter/downloads?limit=1&offset=1')).data.items.length,1);
+  check('Explicit later capture preserves a second immutable snapshot; durable job listing paginates without overwriting the earlier capture');
+
+  await control({fail:true});
+  const badPayload={...payload,url:'https://x.com/SavedAuthor/status/444',request_id:crypto.randomUUID()};
+  const bad=await api('/api/twitter/downloads','POST',badPayload);
+  const failed=await until(bad.data.id,'failed');assert.match(failed.error,/one direct MP4/);
+  const partial=path.dirname(path.join(config.mediaLocal,failed.path));
+  assert.equal(fs.existsSync(path.join(partial,'manifest.json')),false);
+  const preserved=hashes(partial);assert(Object.keys(preserved).some(p=>p.endsWith('source.json')));
+  await control({fail:false,delay:.5});
+  const retryToken=crypto.randomUUID();
+  assert.equal((await api(`/api/twitter/downloads/${bad.data.id}/retry`,'POST',{request_id:retryToken})).status,200);
+  const duplicateRetry=await api(`/api/twitter/downloads/${bad.data.id}/retry`,'POST',{request_id:retryToken});assert.equal(duplicateRetry.data.id,bad.data.id);
+  const retried=await until(bad.data.id,'complete');assert.equal(retried.attempt,2);assert.notEqual(retried.path,failed.path);
+  assert.deepEqual(preserved,hashes(partial));
+  assert.equal((await api(`/api/twitter/downloads/${bad.data.id}/retry`,'POST',{request_id:retryToken})).data.attempt,2);
+  check('Unsupported source retains its incomplete response; explicit Retry makes another directory under the same job and repeated retry acknowledgement stays idempotent');
+
+  await control({delay:4});
+  const pending=await api('/api/twitter/downloads','POST',{...payload,url:'https://x.com/SavedAuthor/status/555',request_id:crypto.randomUUID()});
+  await until(pending.data.id,'running');
+  const queued=await api('/api/twitter/downloads','POST',{...payload,url:'https://x.com/SavedAuthor/status/666',request_id:crypto.randomUUID()});
+  assert.equal((await api('/api/suite/modules/twitter/disable','POST')).status,200);
+  assert.equal((await api('/api/twitter/downloads')).status,409);
+  const stoppedStats=await stats();
+  assert.equal((await api('/api/suite/modules/twitter/enable','POST')).status,200);
+  assert.equal((await api('/api/twitter/downloads/'+pending.data.id)).data.status,'interrupted');
+  assert.equal((await api('/api/twitter/downloads/'+queued.data.id)).data.status,'interrupted');
+  await page.waitForTimeout(500);assert.equal((await stats()).source_requests,stoppedStats.source_requests);
+  assert.deepEqual(firstSaved,hashes(firstDirectory));
+  check('Disabling reaps the active helper and interrupts queued work; re-enable keeps durable receipts and starts no remote work until Retry');
+  await control({delay:0});
+
   const nested=await api('/api/suite/folders/apply','POST',{folders:[{path:config.media+'/captures',display_name:'Separate archive owner',role:'files',visible:false}]});
   assert.equal(nested.status,200,JSON.stringify(nested));
   assert.deepEqual((await api('/api/twitter/library')).data.items,[]);
@@ -140,7 +214,8 @@ const report={checks:[],errors:[],expectedConsole:[],requests:[]};
   await page.reload();
   await page.waitForLoadState('networkidle');
   assert.equal((await api('/api/suite/modules/twitter/status')).data.state,'running');
-  assert.deepEqual(original,hashes(config.mediaLocal));
+  const after=hashes(config.mediaLocal);
+  for(const [name,digest] of Object.entries(original))assert.equal(after[name],digest);
   assert.deepEqual(report.errors,[]);
   check('Reload/disable/re-enable preserve registrations and every original byte; no unexpected browser errors or external request');
   await page.screenshot({path:path.join(config.output,'twitter-archive-settings.png')});

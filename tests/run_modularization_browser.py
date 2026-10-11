@@ -34,6 +34,10 @@ if len(sys.argv)>3 and sys.argv[3]=='youtube':
     sys.path.insert(0, str(Path.cwd() / 'tests'))
     from browser_youtube_fixture import install
     install(Path(sys.argv[4]))
+if len(sys.argv)>3 and sys.argv[3]=='twitter':
+    sys.path.insert(0, str(Path.cwd() / 'tests'))
+    from browser_twitter_fixture import install
+    install(Path(sys.argv[4]))
 uvicorn.run(server.app, host='127.0.0.1', port=int(sys.argv[2]))
 """
 

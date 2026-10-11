@@ -49,6 +49,9 @@ class ModuleRegistryTests(unittest.TestCase):
         self.assertEqual(twitter.api_prefix, "/api/twitter")
         self.assertEqual(twitter.database, files.database)
         self.assertEqual(twitter.backup_components(), ())
+        self.assertIsNotNone(twitter.startup_hook)
+        self.assertIsNotNone(twitter.background_tasks_hook)
+        self.assertIn('twitter_downloads', twitter.user_schema_provider())
 
     def test_registry_rejects_duplicate_slugs(self) -> None:
         with tempfile.TemporaryDirectory(dir=ROOT / "tests") as temporary:

@@ -1,13 +1,15 @@
 """Optional Twitter archive routes; local media uses guarded shared Files URLs."""
 from typing import Literal
+from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from starlette.responses import FileResponse, Response, StreamingResponse
+from pydantic import BaseModel, Field
 
 import config
 from database import get_user_db
 from files_base import serving, sources
-from modules.twitter import archive
+from modules.twitter import archive, jobs
 
 router = APIRouter()
 
@@ -90,3 +92,68 @@ def media(request: Request, source_id: str = Query(..., max_length=256),
                                      'Content-Length': str(end - start + 1),
                                      'Content-Range': f'bytes {start}-{end}/{file_size}'})
     return FileResponse(resolved, media_type=media_type, headers=headers)
+
+
+def _job_call(action, *args):
+    try:
+        return action(*args)
+    except serving.ServeDenied as error:
+        raise HTTPException(error.status_code, error.detail) from error
+    except (ValueError, OSError) as error:
+        raise HTTPException(400, str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(409, str(error)) from error
+
+
+class TwitterPreferences(BaseModel):
+    source_id: str = Field(max_length=256)
+
+
+class TwitterDownload(BaseModel):
+    url: str = Field(max_length=2048)
+    source_id: str = Field(default='', max_length=256)
+    request_id: UUID
+
+
+class TwitterRetry(BaseModel):
+    request_id: UUID
+
+
+@router.get('/api/twitter/settings')
+def settings():
+    return jobs.preferences()
+
+
+@router.post('/api/twitter/settings')
+def save_settings(payload: TwitterPreferences):
+    return _job_call(jobs.save_preferences, payload.source_id)
+
+
+@router.get('/api/twitter/downloads')
+def downloads(offset: int = Query(0, ge=0), limit: int = Query(120, ge=1, le=240)):
+    return jobs.listing(offset, limit)
+
+
+@router.post('/api/twitter/downloads')
+def download(payload: TwitterDownload):
+    return jobs.public(_job_call(jobs.create, payload.url, payload.source_id, payload.request_id))
+
+
+@router.get('/api/twitter/downloads/{job_id}')
+def download_status(job_id: UUID):
+    item = jobs.get(str(job_id))
+    if not item:
+        raise HTTPException(404, 'Download not found')
+    return jobs.public(item)
+
+
+@router.post('/api/twitter/downloads/{job_id}/cancel')
+def cancel_download(job_id: UUID):
+    download_status(job_id)
+    return jobs.public(_job_call(jobs.cancel, str(job_id)))
+
+
+@router.post('/api/twitter/downloads/{job_id}/retry')
+def retry_download(job_id: UUID, payload: TwitterRetry):
+    download_status(job_id)
+    return jobs.public(_job_call(jobs.retry, str(job_id), payload.request_id))

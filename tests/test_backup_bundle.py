@@ -215,6 +215,28 @@ class MetadataBackupBundleTests(unittest.TestCase):
             self.assertEqual(connection.execute('SELECT value FROM marker').fetchone(), ('user-original',))
         self.assertEqual(self.external_image.read_bytes(), b'original-image-must-stay')
 
+    def test_twitter_preferences_and_receipts_survive_complete_user_backup_restore(self) -> None:
+        from modules.twitter.user_schema import publish
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
+            publish(connection)
+            connection.execute("INSERT INTO twitter_preferences VALUES(1,'preserved-twitter-root')")
+            connection.execute("""INSERT INTO twitter_downloads
+                (id,request_id,url,post_id,source_id,root,status,phase,attempt,capture_id,path,retry_requests)
+                VALUES ('job','receipt','https://x.com/SavedAuthor/status/333','333','preserved-twitter-root',
+                        'original-root','complete','completed',2,'saved-capture','saved-manifest','[\"retry-receipt\"]')""")
+        with patch('suite_modules.enabled_ids', side_effect=AssertionError('Personal backup ignores enablement')):
+            created = backup_bundle.create_backup_bundle()
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
+            connection.execute("UPDATE twitter_preferences SET source_id='later-choice'")
+            connection.execute("UPDATE twitter_downloads SET status='failed',attempt=3")
+        backup_bundle.restore_backup_bundle(created['name'])
+        with closing(sqlite3.connect(self.user_db)) as connection:
+            self.assertEqual(connection.execute('SELECT source_id FROM twitter_preferences').fetchone(), ('preserved-twitter-root',))
+            self.assertEqual(connection.execute('SELECT request_id,status,attempt,path,retry_requests FROM twitter_downloads').fetchone(),
+                             ('receipt','complete',2,'saved-manifest','["retry-receipt"]'))
+            self.assertEqual(connection.execute('SELECT value FROM marker').fetchone(), ('user-original',))
+        self.assertEqual(self.external_image.read_bytes(), b'original-image-must-stay')
+
     def test_youtube_playlists_survive_complete_user_backup_restore(self) -> None:
         from modules.youtube import _publish
         with closing(sqlite3.connect(self.user_db)) as connection, connection:
