@@ -1,5 +1,4 @@
-// Stage 27: real archive HTTP, Settings registration and shared local media.
-// Feed/Download motion is added with the following approved UI stage.
+// Actual archive/capture API plus timed Twitter UI and local video interaction.
 const assert=require('node:assert/strict');
 const fs=require('node:fs');
 const path=require('node:path');
@@ -8,6 +7,7 @@ const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
 const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
 assert.match(config.home,/[/\\]keivotos-modularization-[^/\\]+[/\\]home$/);
 const report={checks:[],errors:[],expectedConsole:[],requests:[]};
+let expectedLostReply=false;
 (async()=>{
  const browser=await chromium.launch({headless:true,channel:process.env.PLAYWRIGHT_CHANNEL});
  const context=await browser.newContext({viewport:{width:1440,height:1000}});
@@ -17,6 +17,9 @@ const report={checks:[],errors:[],expectedConsole:[],requests:[]};
  page.on('console',m=>{
   if(m.type()!=='error')return;
   const url=m.location().url?new URL(m.location().url):null;
+  if(expectedLostReply&&url?.origin===config.url&&url.pathname==='/api/twitter/downloads'&&m.text().includes('ERR_FAILED')){
+   report.expectedConsole.push({url:url.href,message:m.text()});return;
+  }
   // Once the hidden nested owner excludes captures, the Files directory has
   // no cover candidate. Keep that reviewed image miss separate from failures.
   if(url?.origin===config.url&&url.pathname==='/api/files/thumbnail'&&
@@ -200,6 +203,170 @@ const report={checks:[],errors:[],expectedConsole:[],requests:[]};
   check('Disabling reaps the active helper and interrupts queued work; re-enable keeps durable receipts and starts no remote work until Retry');
   await control({delay:0});
 
+  // Force smaller real API pages to exercise continuation without retaining a
+  // second synthetic archive or returning fabricated UI responses.
+  const smallPages=async route=>{const url=new URL(route.request().url());url.searchParams.set('limit','17');await route.fulfill({response:await route.fetch({url:url.href})});};
+  await page.route('**/api/twitter/library?*',smallPages);
+  await page.getByRole('button',{name:'Open Keivotos menu',exact:true}).click();
+  await page.locator('.app-drawer').getByRole('button',{name:'Twitter',exact:true}).click();
+  const archive=page.getByRole('main',{name:'Twitter archive'});
+  const posts=archive.locator('[data-twitter-post]');
+  const search=page.getByRole('textbox',{name:'Search saved posts or paste a Twitter URL'});
+  const reveal=page.locator('.twitter-surface .download-reveal');
+  const download=page.locator('.twitter-surface .download');
+  const sidebar=page.getByRole('navigation',{name:'Twitter sections'});
+  const firstPageCount=(await api('/api/twitter/library?limit=17')).data.items.length;
+  await page.waitForFunction(count=>document.querySelectorAll('[data-twitter-post]').length===count,firstPageCount);
+  assert.equal(await page.title(),'Keivotos - Twitter');
+  assert.equal(await posts.first().locator('.text').textContent(),info.raw_text);
+  assert(await archive.boundingBox().then(box=>box.width<=601));
+  assert.equal(await posts.locator('video[autoplay]').count(),0);
+  assert(await posts.locator('video').evaluateAll(videos=>videos.every(v=>v.preload==='none'&&v.paused&&v.readyState===0)));
+  assert.equal(await page.locator('a[href^="https://pbs.twimg.com"],img[src^="https://"]').count(),0);
+  check('Twitter surface discovers automatically; central feed, captured author/text and guarded local video render without autoplay or remote images');
+
+  const inputBox=await search.boundingBox();
+  assert.equal(await reveal.getAttribute('inert'),'');assert.equal(await download.getAttribute('tabindex'),'-1');
+  for(const invalid of ['http://x.com/SavedAuthor/status/777','https://x.com.evil.invalid/SavedAuthor/status/777','https://user@x.com/SavedAuthor/status/777','https://x.com:444/SavedAuthor/status/777','https://x.com/SavedAuthor/status/0','https://x.com/SavedAuthor/status/777/photo/1']){
+   await search.fill(invalid);await page.waitForTimeout(240);assert.equal(await reveal.getAttribute('inert'),'');
+  }
+  await search.fill('');await page.waitForTimeout(250);
+  await search.fill('https://twitter.com/SavedAuthor/status/777?s=20');
+  await page.waitForTimeout(60);
+  const middle=await reveal.evaluate(node=>({opacity:+getComputedStyle(node).opacity,clip:getComputedStyle(node).clipPath,transform:getComputedStyle(node).transform}));
+  assert(middle.opacity>0&&middle.opacity<1,JSON.stringify(middle));
+  await page.waitForTimeout(210);assert.equal(await reveal.evaluate(node=>+getComputedStyle(node).opacity),1);
+  const urlBox=await search.boundingBox();assert(Math.abs(inputBox.x-urlBox.x)<.1&&Math.abs(inputBox.width-urlBox.width)<.1);
+  await search.fill('not a link');await page.waitForTimeout(50);
+  assert(await reveal.evaluate(node=>+getComputedStyle(node).opacity)<1);
+  await search.fill('https://x.com/i/web/status/777');await page.waitForTimeout(25);await search.fill('');await page.waitForTimeout(25);await search.fill('https://x.com/SavedAuthor/status/777');
+  await page.waitForTimeout(280);assert.equal(await reveal.getAttribute('inert'),null);assert.equal(await download.getAttribute('tabindex'),'0');
+  report.reveal={middle,stable_input:inputBox,visible_input:urlBox};
+  await page.emulateMedia({reducedMotion:'reduce'});
+  assert(await reveal.evaluate(node=>getComputedStyle(node).transitionDuration.split(',').every(value=>parseFloat(value)<=.00001)));
+  await search.fill('');await search.fill('https://x.com/SavedAuthor/status/777');assert.equal(await reveal.evaluate(node=>+getComputedStyle(node).opacity),1);
+  await page.emulateMedia({reducedMotion:'no-preference'});
+  await page.evaluate(()=>document.documentElement.dataset.motion='reduced');
+  assert(await reveal.evaluate(node=>getComputedStyle(node).transitionDuration.split(',').every(value=>parseFloat(value)<=.00001)));
+  await page.evaluate(()=>document.documentElement.dataset.motion='system');
+  await search.fill('');await page.waitForTimeout(260);
+  await search.focus();await search.press('Tab');assert.notEqual(await page.evaluate(()=>document.activeElement?.className),'download');
+  check('Valid link alone reveals Download with measured intermediate motion and fixed input geometry; invalid links, reversal, inert Tab order and both reduced-motion preferences work');
+
+  await search.fill('이름');await page.waitForTimeout(260);await page.waitForFunction(count=>document.querySelectorAll('[data-twitter-post]').length===count,firstPageCount);
+  await archive.getByRole('button',{name:'Load more',exact:true}).click();
+  await page.waitForFunction(count=>document.querySelectorAll('[data-twitter-post]').length===count,firstPageCount+17);
+  const clicked=posts.nth(24).getByRole('button',{name:/^Read saved post/});
+  await clicked.focus();const beforeScroll=await archive.evaluate(node=>node.scrollTop);const clickedKey=await posts.nth(24).getAttribute('data-twitter-post');
+  await clicked.click();await archive.locator('article.detail').waitFor();
+  assert.equal(await archive.locator('article.detail .text').textContent(),info.raw_text);
+  await archive.getByRole('button',{name:'Back to saved view'}).click();
+  assert.equal(await search.inputValue(),'이름');assert.equal(await posts.count(),firstPageCount+17);
+  assert(Math.abs(await archive.evaluate(node=>node.scrollTop)-beforeScroll)<2);
+  assert.equal(await page.evaluate(()=>document.activeElement?.closest('[data-twitter-post]')?.getAttribute('data-twitter-post')),clickedKey);
+  const authorButton=posts.first().getByRole('button',{name:'Posts by Saved author 이름'});
+  await authorButton.click();await archive.locator('.author-heading').waitFor();
+  assert.equal(await archive.locator('.author-heading span').textContent(),'@SavedAuthor');
+  await archive.getByRole('button',{name:'Back to saved view'}).click();
+  await sidebar.getByRole('button',{name:'Authors',exact:true}).click();
+  await page.locator('[data-twitter-author="id:123"]').waitFor();
+  assert.equal(await page.locator('[data-twitter-author]').count(),1);
+  await page.locator('[data-twitter-author="id:123"]').click();await archive.locator('.author-heading').waitFor();
+  await archive.getByRole('button',{name:'Back to saved view'}).click();
+  assert.equal(await page.evaluate(()=>document.activeElement?.getAttribute('data-twitter-author')),'id:123');
+  await sidebar.getByRole('button',{name:'Saved posts',exact:true}).click();
+  await search.fill('absent phrase');await archive.getByText('No saved posts found',{exact:true}).waitFor();
+  assert.equal(await archive.getByRole('button',{name:'Load more',exact:true}).count(),0);
+  await search.fill('');await page.waitForTimeout(260);await page.waitForFunction(count=>document.querySelectorAll('[data-twitter-post]').length===count,firstPageCount);
+  check('Real smaller pages append without duplicate identities; exact detail/author views restore query, loaded rows, scroll and originating focus; filtered empty pages continue to null');
+
+  const playing=posts.first().locator('video');
+  await playing.evaluate(video=>video.play());await page.waitForFunction(()=>document.querySelector('[data-twitter-post] video')?.currentTime>.1);
+  await playing.evaluate(video=>{video.pause();video.currentTime=1.5;});
+  await page.waitForFunction(()=>Math.abs(document.querySelector('[data-twitter-post] video')?.currentTime-1.5)<.1);
+  await playing.evaluate(async video=>{window.__twitterOldVideo=video;await video.play();});
+  await posts.first().getByRole('button',{name:/^Read saved post/}).click();await archive.locator('article.detail').waitFor();
+  assert(await page.evaluate(()=>window.__twitterOldVideo.paused&&!window.__twitterOldVideo.hasAttribute('src')));
+  const detailVideo=archive.locator('article.detail video');
+  await detailVideo.evaluate(video=>video.play());
+  await detailVideo.evaluate(video=>video.requestFullscreen());
+  await page.waitForFunction(()=>document.fullscreenElement?.tagName==='VIDEO');
+  await page.evaluate(()=>document.exitFullscreen());
+  await page.waitForFunction(()=>!document.fullscreenElement);
+  await detailVideo.evaluate(video=>{window.__twitterOldVideo=video;});
+  await page.getByRole('button',{name:'Open Keivotos menu'}).click();await page.locator('.app-drawer').getByRole('button',{name:'Files',exact:true}).click();
+  assert(await page.evaluate(()=>window.__twitterOldVideo.paused&&!window.__twitterOldVideo.hasAttribute('src')));
+  await page.getByRole('button',{name:'Open Keivotos menu'}).click();await page.locator('.app-drawer').getByRole('button',{name:'Twitter',exact:true}).click();await posts.first().waitFor();
+  check('Native inline video plays, seeks and enters/exits fullscreen only on demand; detail navigation and module exit pause and release the exact old media node');
+
+  const posted=[];let releaseAck;const ackGate=new Promise(resolve=>releaseAck=resolve);
+  const lostAck=async route=>{
+   if(route.request().method()!=='POST'){await route.continue();return;}
+   posted.push(route.request().postDataJSON());const response=await route.fetch();assert.equal(response.status(),200);
+   if(posted.length===1){await ackGate;expectedLostReply=true;await route.abort('failed');}else await route.fulfill({response});
+  };
+  await page.route('**/api/twitter/downloads',lostAck);await control({delay:.7,fail:false});
+  await search.fill('https://twitter.com/SavedAuthor/status/731?s=20');await download.click();
+  await page.waitForFunction(()=>document.querySelector('.twitter-surface .download')?.textContent==='Starting…');
+  assert.equal(await search.isDisabled(),true);assert.equal(await page.getByLabel('Save to',{exact:true}).isDisabled(),true);
+  await download.press('Enter');await page.waitForTimeout(200);assert.equal(posted.length,1);
+  releaseAck();await page.getByRole('button',{name:'Retry request',exact:true}).waitFor();
+  await page.reload();await page.getByRole('button',{name:'Retry request',exact:true}).waitFor();
+  await page.getByRole('button',{name:'Retry request',exact:true}).click();
+  await page.waitForFunction(()=>document.querySelector('.twitter-surface input')?.value==='');
+  assert.equal(posted.length,2);assert.deepEqual(posted[1],posted[0]);
+  const recovered=await until(posted[0].request_id,'complete');
+  await page.getByRole('button',{name:'View saved post 731',exact:true}).waitFor();
+  await page.getByRole('button',{name:'View saved post 731',exact:true}).click();await archive.locator('article.detail').waitFor();
+  assert.equal(await archive.locator('article.detail').getAttribute('data-twitter-post'),owner.source_id+':'+recovered.path);
+  await archive.getByRole('button',{name:'Back to saved view'}).click();
+  await search.fill('https://x.com/SavedAuthor/status/731');
+  await search.dispatchEvent('keydown',{key:'Enter',code:'Enter',isComposing:true,keyCode:229});await page.waitForTimeout(100);assert.equal(posted.length,2);
+  await search.press('Enter');await page.waitForFunction(()=>document.querySelector('.twitter-surface input')?.value==='');
+  assert.equal(posted.length,3);assert.notEqual(posted[2].request_id,posted[0].request_id);
+  await until(posted[2].request_id,'complete');
+  await page.unroute('**/api/twitter/downloads',lostAck);
+  check('Pending Download blocks duplicate submit and destination changes; lost committed acknowledgement survives reload and retries the identical UUID; later Enter creates a separate snapshot and composition Enter submits nothing');
+
+  await control({fail:true,delay:0});await search.fill('https://x.com/SavedAuthor/status/732');await download.click();
+  await page.getByRole('button',{name:'Retry post 732',exact:true}).waitFor();
+  assert(await page.locator('[data-twitter-job]').filter({has:page.getByRole('button',{name:'Retry post 732',exact:true})}).textContent().then(text=>text.includes('one direct MP4')));
+  await control({fail:false,delay:.7});await page.getByRole('button',{name:'Retry post 732',exact:true}).click();
+  await page.getByRole('button',{name:'View saved post 732',exact:true}).waitFor();
+  await control({delay:3});await search.fill('https://x.com/SavedAuthor/status/733');await download.click();
+  await page.getByRole('button',{name:'Cancel post 733',exact:true}).waitFor();await page.getByRole('button',{name:'Cancel post 733',exact:true}).click();
+  await page.getByRole('button',{name:'Retry post 733',exact:true}).waitFor();await control({delay:0});
+  check('Actual generated unsupported capture exposes its saved error and Retry; a pending capture cancels through the UI while retaining its receipt and partial files');
+
+  const grip=page.locator('[data-sidebar-owner="twitter"] [data-module-sidebar-grip]');
+  const savedYoutubePosition=await page.evaluate(()=>localStorage.getItem('keivotos:youtube-sidebar-handle-position'));
+  await grip.focus();await grip.press('End');assert.equal(await page.evaluate(()=>JSON.parse(localStorage.getItem('keivotos:twitter-sidebar-handle-position'))),90);
+  await grip.click();await page.waitForTimeout(75);const movingWidth=await page.locator('[data-sidebar-owner="twitter"]').evaluate(node=>node.getBoundingClientRect().width);assert(movingWidth>0&&movingWidth<256);
+  await grip.click();await page.waitForTimeout(320);assert.equal(await grip.getAttribute('aria-expanded'),'true');
+  await grip.click();await page.waitForTimeout(320);assert.equal(await grip.getAttribute('aria-expanded'),'false');
+  await page.reload();await posts.first().waitFor();assert.equal(await grip.getAttribute('aria-expanded'),'false');
+  assert.equal(await page.evaluate(()=>localStorage.getItem('keivotos:youtube-sidebar-handle-position')),savedYoutubePosition);
+  await grip.click();await page.waitForTimeout(320);
+  await page.screenshot({path:path.join(config.output,'twitter-feed.png')});
+  await page.setViewportSize({width:320,height:520});
+  await grip.click();await page.waitForTimeout(320);
+  await search.fill('https://x.com/SavedAuthor/status/734');await page.waitForTimeout(260);
+  assert(await download.isVisible());assert(await download.boundingBox().then(box=>box.x+box.width<=320));
+  assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
+  await page.getByRole('button',{name:'Downloads',exact:true}).click();await page.getByLabel('Save to',{exact:true}).waitFor();
+  assert(await page.getByRole('complementary',{name:'Twitter downloads'}).boundingBox().then(box=>box.x>=0&&box.x+box.width<=320));
+  await page.screenshot({path:path.join(config.output,'twitter-narrow-downloads.png')});
+  await page.getByRole('button',{name:'Close downloads',exact:true}).click();
+  assert.equal(await page.getByRole('button',{name:'Downloads',exact:true}).evaluate(node=>document.activeElement===node),true);
+  await page.getByRole('button',{name:'Downloads',exact:true}).click();
+  await page.getByRole('button',{name:'Close downloads',exact:true}).press('Escape');
+  assert.equal(await page.getByRole('button',{name:'Downloads',exact:true}).getAttribute('aria-expanded'),'false');
+  assert.equal(await page.getByRole('button',{name:'Downloads',exact:true}).evaluate(node=>document.activeElement===node),true);
+  await page.setViewportSize({width:1440,height:1000});await search.fill('');
+  check('Twitter reuses the animated movable sidebar grip with independent saved keys; rapid reversal, reload and 320px feed/search/download panel fit without overflow');
+  await page.unroute('**/api/twitter/library?*',smallPages);
+  await page.getByRole('button',{name:'Open Keivotos menu'}).click();await page.locator('.app-drawer').getByRole('button',{name:'Files',exact:true}).click();
+
   const nested=await api('/api/suite/folders/apply','POST',{folders:[{path:config.media+'/captures',display_name:'Separate archive owner',role:'files',visible:false}]});
   assert.equal(nested.status,200,JSON.stringify(nested));
   assert.deepEqual((await api('/api/twitter/library')).data.items,[]);
@@ -219,6 +386,8 @@ const report={checks:[],errors:[],expectedConsole:[],requests:[]};
   assert.deepEqual(report.errors,[]);
   check('Reload/disable/re-enable preserve registrations and every original byte; no unexpected browser errors or external request');
   await page.screenshot({path:path.join(config.output,'twitter-archive-settings.png')});
+ }catch(error){
+  await page.screenshot({path:path.join(config.output,'failure.png')});fs.writeFileSync(path.join(config.output,'failure.html'),await page.content());throw error;
  }finally{
   fs.writeFileSync(path.join(config.output,'report.json'),JSON.stringify(report,null,2));
   await context.tracing.stop({path:path.join(config.output,'trace.zip')});await browser.close();
