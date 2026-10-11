@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT / 'backend'))
 def test_specs_and_frozen_checks_with_physical_module_absence(tmp_path, installed, target):
     source = tmp_path / 'source'
     source.mkdir()
-    omitted = ('__pycache__',) if installed else ('__pycache__', 'danbooru', 'youtube', 'language', 'ost')
+    omitted = ('__pycache__',) if installed else ('__pycache__', 'danbooru', 'youtube', 'language', 'ost', 'twitter')
     shutil.copytree(ROOT / 'backend', source / 'backend', ignore=shutil.ignore_patterns(*omitted))
     shutil.copytree(ROOT / 'packaging', source / 'packaging')
     shutil.copy2(ROOT / 'app.py', source / 'app.py')
