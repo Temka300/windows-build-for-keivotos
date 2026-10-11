@@ -63,6 +63,8 @@ const report={checks:[],errors:[],requests:[]};
   assert(!paths['/api/images']);assert(!paths['/api/danbooru/credentials']);assert(!paths['/api/language/documents']);assert(paths['/api/files/sources']);
   assert(!paths['/api/ost/folders']);assert(!paths['/api/ost/library']);
   assert(!paths['/api/ost/cover']);
+  assert(!paths['/api/ost/tracks']);
+  assert.equal(await page.getByRole('navigation',{name:'OST sections'}).count(),0);
   assert.equal(await page.getByRole('switch',{name:'OST module',exact:true}).count(),0);
   assert(!report.requests.some(p=>p.startsWith('/api/ost')));
   assert(!Object.keys(paths).some(p=>p.startsWith('/api/youtube')));

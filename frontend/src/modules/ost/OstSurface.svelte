@@ -2,13 +2,17 @@
   import {onMount,onDestroy,tick} from 'svelte';
   import AppDrawer from '../../components/AppDrawer.svelte';
   import ModuleLocationMenu from '../../components/ModuleLocationMenu.svelte';
+  import ModuleSidebarDock from '../../components/ModuleSidebarDock.svelte';
   import {settingsOpen} from '../../lib/suiteStores';
-  import {ostApi,type OstSource,type OstItem} from './api';
+  import {ostApi,type OstSource,type OstItem,type OstTrack} from './api';
   import AudioPlayer from './AudioPlayer.svelte';
+  import OstSidebar from './OstSidebar.svelte';
   type Position={count:number;scroll:number;focus:string;selected:string};
   let drawer=false,loading=false,sourceLoading=true,error='',sourceError='',notice='';
   let sources:OstSource[]=[];
   let source:OstSource|null=null,parent='',items:OstItem[]=[],total=0,selected='';
+  let section:'folders'|'library'='folders',tracks:OstTrack[]=[],trackTotal=0,trackOffset=0,trackLoading=false,trackError='',trackRetryMore=false;
+  let trackRequest:AbortController|null=null;
   let main:HTMLElement;
   let request:AbortController|null=null,sourceRequest:AbortController|null=null;
   let alive=true;
@@ -18,21 +22,24 @@
   const positions=new Map<string,Position>();
   let locationMenu:{x:number;y:number;label:string;sourceId:string;relativePath:string;anchor:HTMLElement;unavailableReason:string}|null=null;
   let locationMenuSerial=0;
-  type Queue={source:OstSource;parent:string;tracks:OstItem[];offset:number;total:number};
+  type Queue={kind:'folders'|'library';source:OstSource;parent:string;tracks:OstItem[];offset:number;total:number;stale?:boolean};
   let queue:Queue|null=null,playingTrack:OstItem|null=null;
   let playerExpanded=false,playbackNavigating=false,playbackNotice='';
   let playbackRequest:AbortController|null=null;
   let playerReturn:Position|undefined,playerAnchor:HTMLElement|null=null;
-  $: playingIndex=queue&&playingTrack?queue.tracks.findIndex(item=>item.path===playingTrack?.path):-1;
-  $: hasPrevious=playingIndex>0;
-  $: hasNext=!!queue&&(playingIndex<queue.tracks.length-1||queue.offset<queue.total);
-  $: folderLabel=queue?`${queue.source.name}${queue.parent?' / '+queue.parent:''}`:'';
+  function identity(item:OstItem){return JSON.stringify([item.source_id,item.path]);}
+  $: playingIndex=queue&&playingTrack?queue.tracks.findIndex(item=>identity(item)===identity(playingTrack!)):-1;
+  $: hasPrevious=playingIndex>0||!!queue?.stale;
+  $: hasNext=!!queue&&(playingIndex<queue.tracks.length-1||queue.offset<queue.total||queue.stale);
+  $: playingSource=sources.find(owner=>owner.source_id===playingTrack?.source_id);
+  $: playingParent=queue?.kind==='library'?playingTrack?.path.split('/').slice(0,-1).join('/'):queue?.parent;
+  $: folderLabel=queue?`${playingSource?.name??queue.source.name}${playingParent?' / '+playingParent:''}`:'';
   $: parts=parent?parent.split('/'):[];
   $: backLabel=parent?(parts.length>1?parts[parts.length-2]:source?.name):'OST';
   function key(owner:OstSource|null,path:string){return owner?`${owner.source_id}:${path}`:'roots';}
   function remember(){
     const active=document.activeElement as HTMLElement|null;
-    positions.set(key(source,parent),{count:items.length,scroll:main?.scrollTop??0,
+    positions.set(section==='library'?'library':key(source,parent),{count:section==='library'?tracks.length:items.length,scroll:main?.scrollTop??0,
       focus:active?.dataset.ostFocus??'',selected});
     if(positions.size>64)positions.delete(positions.keys().next().value!);
   }
@@ -76,6 +83,37 @@
     if(owner)await load(false,position.count,position);
     else{loading=false;await restore(position,undefined,serial);}
   }
+  async function loadTracks(more=false,wanted=0,position?:Position,focusLibrary=true){
+    trackRequest?.abort();const current=new AbortController();trackRequest=current;
+    const serial=navigationSerial,scroll=main?.scrollTop??0;
+    trackLoading=true;trackError='';trackRetryMore=more;
+    try{
+      let next:OstTrack[]=[],offset=more?trackOffset:0,result;
+      do{
+        result=await ostApi.tracks(offset,current.signal);
+        if(!alive||current.signal.aborted||section!=='library')return;
+        offset+=result.items.length;next=[...next,...result.items];
+      }while(!more&&next.length<wanted&&offset<result.total&&result.items.length>0);
+      tracks=[...new Map((more?[...tracks,...next]:next).map(item=>[identity(item),item])).values()];trackTotal=result.total;trackOffset=offset;
+      await tick();if(!alive||current.signal.aborted)return;
+      if(more)main.scrollTop=scroll;
+      else if(position)await restore(position,current.signal,serial,focusLibrary);
+    }catch(caught){if(alive&&!current.signal.aborted)trackError=caught instanceof Error?caught.message:'Could not load the OST library.';}
+    finally{if(alive&&trackRequest===current)trackLoading=false;}
+  }
+  async function selectSection(next:'folders'|'library'){
+    if(next===section&&!playerExpanded)return;
+    if(!playerExpanded)remember();
+    request?.abort();trackRequest?.abort();loading=false;trackLoading=false;
+    locationMenu=null;playerExpanded=false;section=next;
+    const serial=++navigationSerial;
+    const position=positions.get(next==='library'?'library':key(source,parent));
+    await restore(undefined,undefined,serial);
+    if(!alive||serial!==navigationSerial)return;
+    if(next==='library')await loadTracks(false,position?.count??tracks.length,position);
+    else if(source)await load(false,position?.count??items.length,position);
+    else await restore(position,undefined,serial);
+  }
   function back(){void navigate(source&&parent?source:null,parent?parts.slice(0,-1).join('/'):'');}
   async function refreshSources(){
     sourceRequest?.abort();const current=new AbortController();sourceRequest=current;
@@ -83,11 +121,20 @@
     try{
       const result=await ostApi.folders(current.signal);
       if(!alive||current.signal.aborted)return;
+      if(queue?.kind==='library'&&JSON.stringify(sources)!==JSON.stringify(result))queue.stale=true;
       sources=result;
-      if(queue&&!result.some(row=>row.source_id===queue?.source.source_id&&row.available)){
+      if(queue&&playingTrack&&!result.some(row=>row.source_id===playingTrack?.source_id&&row.available)){
         playbackRequest?.abort();queue=null;playingTrack=null;playerExpanded=false;playbackNavigating=false;
       }
-      if(source){
+      if(section==='library'){
+        if(source){
+          const fresh=result.find(row=>row.source_id===source?.source_id);
+          if(fresh)source=fresh;
+          else{source=null;parent='';items=[];total=0;selected='';}
+        }
+        const active=document.activeElement as HTMLElement|null;
+        void loadTracks(false,tracks.length,{count:tracks.length,scroll:main?.scrollTop??0,focus:active?.dataset.ostFocus??'',selected},false);
+      }else if(source){
         const fresh=result.find(row=>row.source_id===source?.source_id);
         if(fresh){
           source=fresh;const active=document.activeElement as HTMLElement|null;
@@ -117,7 +164,7 @@
   function artFailed(id:string){missingArt=new Set([...missingArt,id]);}
   function expandPlayer(event?:MouseEvent){
     if(playerExpanded)return;
-    remember();playerReturn=positions.get(key(source,parent));
+    remember();playerReturn=positions.get(section==='library'?'library':key(source,parent));
     playerAnchor=(event?.currentTarget as HTMLElement|null)??document.activeElement as HTMLElement|null;
     playerExpanded=true;
   }
@@ -130,11 +177,11 @@
   }
   async function extendQueue(target:Queue,signal:AbortSignal){
     while(target.offset<target.total){
-      const result=await ostApi.library(target.source.source_id,target.parent,target.offset,signal);
+      const result=target.kind==='library'?await ostApi.tracks(target.offset,signal):await ostApi.library(target.source.source_id,target.parent,target.offset,signal);
       if(!alive||signal.aborted||queue!==target)return;
       if(!result.items.length){target.offset=result.total;target.total=result.total;break;}
       target.offset+=result.items.length;target.total=result.total;
-      const additions=result.items.filter(item=>!item.is_dir&&item.available&&!target.tracks.some(old=>old.path===item.path));
+      const additions=result.items.filter(item=>!item.is_dir&&item.available&&!target.tracks.some(old=>identity(old)===identity(item)));
       target.tracks=[...target.tracks,...additions];
       queue=target;
       if(additions.length)return;
@@ -146,16 +193,26 @@
     playbackRequest?.abort();const pending=new AbortController();playbackRequest=pending;
     playbackNavigating=true;playbackNotice='';
     try{
-      let index=target.tracks.findIndex(item=>item.path===currentTrack.path);
+      if(target.kind==='library'&&target.stale){
+        let refreshed:OstItem[]=[],offset=0,result;
+        do{
+          result=await ostApi.tracks(offset,pending.signal);
+          if(!alive||pending.signal.aborted||queue!==target||playingTrack!==currentTrack)return false;
+          refreshed=[...refreshed,...result.items.filter(item=>item.available)];offset+=result.items.length;
+        }while(offset<result.total&&result.items.length&&!refreshed.some(item=>identity(item)===identity(currentTrack)));
+        target.tracks=refreshed;target.offset=offset;target.total=result.total;target.stale=false;queue=target;
+      }
+      let index=target.tracks.findIndex(item=>identity(item)===identity(currentTrack));
+      if(index<0)return false;
       if(direction===1&&index===target.tracks.length-1&&target.offset<target.total)await extendQueue(target,pending.signal);
       if(direction===-1&&index===0&&wrap)while(target.offset<target.total){await extendQueue(target,pending.signal);if(pending.signal.aborted||queue!==target)return false;}
       if(!alive||pending.signal.aborted||queue!==target||playingTrack!==currentTrack)return false;
       index+=direction;
       if(index<0||index>=target.tracks.length){if(!wrap)return false;index=(index+target.tracks.length)%target.tracks.length;}
       const next=target.tracks[index];
-      if(!next||next===currentTrack)return false;
+      if(!next||identity(next)===identity(currentTrack))return false;
       playingTrack=next;
-      if(source?.source_id===target.source.source_id&&parent===target.parent)selected=next.path;
+      if(target.kind==='folders'&&source?.source_id===target.source.source_id&&parent===target.parent)selected=next.path;
       return true;
     }catch(caught){
       if(alive&&!pending.signal.aborted&&queue===target)playbackNotice=caught instanceof Error?caught.message:'Could not load another song. Try Next again.';
@@ -167,16 +224,23 @@
     if(item.is_dir)void navigate(source,item.path);
     else{
       playbackRequest?.abort();playbackNavigating=false;playbackNotice='';selected=item.path;
-      queue={source,parent,tracks:items.filter(row=>!row.is_dir&&row.available),offset:items.length,total};
+      queue={kind:'folders',source,parent,tracks:items.filter(row=>!row.is_dir&&row.available),offset:items.length,total};
       playingTrack=item;expandPlayer(event);
     }
+  }
+  function chooseTrack(item:OstTrack,event:MouseEvent){
+    const owner=sources.find(row=>row.source_id===item.source_id&&row.available);
+    if(!item.available||!owner)return;
+    playbackRequest?.abort();playbackNavigating=false;playbackNotice='';
+    queue={kind:'library',source:owner,parent:'',tracks:tracks.filter(row=>row.available),offset:trackOffset,total:trackTotal};
+    playingTrack=item;expandPlayer(event);
   }
   onMount(()=>{
     let previous=false;
     const stop=settingsOpen.subscribe(open=>{if(previous&&!open)void settingsClosed();previous=open;});
     void refreshSources();return stop;
   });
-  onDestroy(()=>{alive=false;request?.abort();sourceRequest?.abort();playbackRequest?.abort();});
+  onDestroy(()=>{alive=false;request?.abort();sourceRequest?.abort();trackRequest?.abort();playbackRequest?.abort();});
 </script>
 
 <svelte:window on:focus={()=>{if(!$settingsOpen)void refreshSources();}} />
@@ -184,7 +248,10 @@
   <header>
     <button class="menu" aria-label="Open Keivotos menu" title="Open Keivotos menu" on:click={()=>drawer=true}>☰</button><h1>OST</h1>
   </header>
-  {#if source}
+  <div class="ost-body">
+  <ModuleSidebarDock owner="ost" label="OST"><OstSidebar {section} on:select={event=>selectSection(event.detail)}/></ModuleSidebarDock>
+  <div class="ost-content">
+  {#if section==='folders'&&source}
       <div class="location" class:player-hidden={playerExpanded}>
         <button class="back" aria-label={`Back to ${backLabel}`} title={`Back to ${backLabel}`} on:click={back}>
           <svg width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="m15 18-6-6 6-6"/></svg>
@@ -195,11 +262,28 @@
         </nav>
       </div>
   {/if}
-  <main bind:this={main} aria-label="OST library" tabindex="-1" aria-busy={loading||sourceLoading} class:player-hidden={playerExpanded}>
+  <main bind:this={main} aria-label="OST library" tabindex="-1" aria-busy={loading||sourceLoading||trackLoading} class:player-hidden={playerExpanded}>
     {#if notice}<p role="status">{notice}</p>{/if}
     {#if sourceError}<p role="alert">{sourceError} <button on:click={refreshSources}>Retry folders</button></p>{/if}
     {#if error}<p role="alert">{error} <button on:click={()=>load(retryMore,items.length)}>Retry</button></p>{/if}
-    {#if !source}
+    {#if section==='library'}
+      {#if trackError}<p role="alert">{trackError} <button on:click={()=>loadTracks(trackRetryMore,tracks.length)}>Retry library</button></p>{/if}
+      {#if trackLoading&&!tracks.length}<p role="status">Loading OST tracks…</p>{/if}
+      <ul aria-label="All OST tracks" class="entries">
+        {#each tracks as item (`${identity(item)}:${item.cover_version}`)}
+          {@const id=artKey(item.source_id,item.path,item.cover_version)}
+          <li><button class="entry" class:selected={playingTrack&&identity(playingTrack)===identity(item)} data-ost-source={item.source_id} data-ost-entry-path={item.path} data-ost-focus={identity(item)}
+            aria-label={`Play track ${item.name}`} aria-disabled={!item.available} aria-pressed={!!playingTrack&&identity(playingTrack)===identity(item)} title={`${item.source_name}\n${item.path}`} on:click={event=>chooseTrack(item,event)}
+            on:contextmenu={event=>openLocation(event,item.name,item.source_id,item.path,item.available)} on:keydown={event=>locationKey(event,item.name,item.source_id,item.path,item.available)}>
+            <span class="art"><span aria-hidden="true">♫</span>{#if item.available&&!missingArt.has(id)}<img alt="" loading="lazy" decoding="async" width="52" height="52" src={ostApi.coverUrl(item.source_id,item.path,item.cover_version)} on:error={()=>artFailed(id)}/>{/if}</span>
+            <span class="details"><span class="name">{item.name}</span><small>{item.source_name}{item.parent?` / ${item.parent}`:''}{!item.available?' · File unavailable':''}</small></span>
+          </button></li>
+        {/each}
+      </ul>
+      {#if !trackLoading&&!trackError&&!tracks.length}<p role="status">No supported OST tracks in assigned folders.</p>{/if}
+      {#if trackOffset<trackTotal}<button class="more" disabled={trackLoading} on:click={()=>loadTracks(true)}>{trackLoading?'Loading…':'Load more'}</button>{/if}
+      <p class="count" aria-live="polite">{tracks.length} / {trackTotal} tracks</p>
+    {:else if !source}
       {#if sourceLoading&&!sources.length}<p role="status">Loading OST folders…</p>{/if}
       {#if sources.length}
         <ul aria-label="OST folders" class="entries">
@@ -240,12 +324,15 @@
   {#if playingTrack}<AudioPlayer track={playingTrack} {folderLabel} expanded={playerExpanded}
     {hasPrevious} {hasNext} canWrap={!!queue?.tracks.length} navigating={playbackNavigating} navigationNotice={playbackNotice}
     onNavigate={navigatePlayback} onExpand={expandPlayer} onBrowse={browsePlayer}/>{/if}
+  </div>
+  </div>
 </div>
 {#if drawer}<AppDrawer on:close={()=>drawer=false} />{/if}
 {#if locationMenu}{#key locationMenuSerial}<ModuleLocationMenu {...locationMenu} on:close={()=>locationMenu=null}/>{/key}{/if}
 
 <style>
   .ost-surface{display:flex;flex:1;min-height:0;min-width:0;flex-direction:column;background:#0f0f14;color:#e0e0e8;font-family:system-ui,sans-serif}
+  .ost-body{display:flex;position:relative;flex:1;min-height:0;min-width:0;overflow:hidden}.ost-content{display:flex;flex:1;flex-direction:column;min-height:0;min-width:0}
   header{display:flex;align-items:center;gap:16px;min-height:60px;padding:8px 16px;border-bottom:1px solid #292936}
   .menu{width:36px;height:36px;flex:none;border-radius:8px;background:#1e1e2e;font-size:16px}
   h1{font-size:18px;font-weight:600}main:focus{outline:none}

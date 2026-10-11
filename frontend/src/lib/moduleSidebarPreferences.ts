@@ -1,7 +1,7 @@
 import {writable} from 'svelte/store';
 import {persistentStorageKey} from './product';
 
-export type ModuleSidebarOwner = 'youtube' | 'language';
+export type ModuleSidebarOwner = 'youtube' | 'language' | 'ost';
 function normalizePosition(value:unknown) {
   return typeof value==='number'&&Number.isFinite(value)?Math.min(90,Math.max(10,value)):50;
 }

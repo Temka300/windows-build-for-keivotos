@@ -69,3 +69,9 @@ def cover(source_id: str = Query(..., max_length=256), path: str = Query('', max
         raise HTTPException(error.status_code, error.detail) from error
     except (OSError, ValueError) as error:
         raise HTTPException(404, 'OST cover is unavailable') from error
+
+
+@router.get('/api/ost/tracks')
+def tracks(offset: int = Query(0, ge=0), limit: int = Query(120, ge=1, le=240)):
+    return discovery.tracks(config.FILES_DB_PATH, registered_sources(),
+                            config.SUITE_HOME, offset, limit)

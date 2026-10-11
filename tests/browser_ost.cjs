@@ -4,17 +4,18 @@ const path=require('node:path');
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
 const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
 assert.match(config.home,/[/\\]keivotos-modularization-[^/\\]+[/\\]home$/);
-const report={checks:[],errors:[],covers:[],audio:[],timings:{}};
+const report={checks:[],errors:[],console:[],covers:[],audio:[],timings:{}};
 (async()=>{
  const browser=await chromium.launch({headless:true,channel:process.env.PLAYWRIGHT_CHANNEL});
  const context=await browser.newContext({viewport:{width:1440,height:1000}});
  await context.tracing.start({screenshots:true,snapshots:true});
  const page=await context.newPage();page.setDefaultTimeout(15000);
  page.on('pageerror',error=>report.errors.push(error.message));
+ page.on('console',message=>{if(message.type()==='error')report.console.push(message.text());});
  let expectedFailures=0,playbackStarted=false;
  page.on('response',response=>{
   if(response.status()<500)return;
-  if(response.status()===503&&new URL(response.url()).pathname==='/api/ost/library'&&expectedFailures>0){expectedFailures--;return;}
+  if(response.status()===503&&['/api/ost/library','/api/ost/tracks'].includes(new URL(response.url()).pathname)&&expectedFailures>0){expectedFailures--;return;}
   report.errors.push(`${response.status()} ${response.url()}`);
  });
  await page.route('**/*',route=>{
@@ -67,11 +68,14 @@ const report={checks:[],errors:[],covers:[],audio:[],timings:{}};
  try{
   await page.goto(config.url);
   assert.equal((await api('/api/ost/cover')).status,409);
+  assert.equal((await context.request.get(config.url+'/api/ost/tracks')).status(),409);
   assert.equal((await api('/api/suite/modules/ost/enable','POST')).status,200);
   const registration=await api('/api/suite/folders/apply','POST',{folders:[{path:config.media,display_name:'Soundtracks',role:'ost'}]});
   assert.equal(registration.status,200,JSON.stringify(registration));
   const owner=registration.data.sources.find(source=>source.role==='ost');
   await page.reload();await chooseModule();
+  assert.equal((await context.request.get(config.url+'/api/ost/tracks?limit=241')).status(),422);
+  assert.equal((await context.request.get(config.url+'/api/ost/tracks?offset=-1')).status(),422);
   assert.equal(await page.getByRole('button',{name:'Manage OST folders',exact:true}).count(),0);
   assert.equal(await page.getByRole('heading',{name:'Soundtrack folders',exact:true}).count(),0);
   assert.equal(await root(owner.source_id).locator('.art').innerText(),'📁');
@@ -149,7 +153,9 @@ const report={checks:[],errors:[],covers:[],audio:[],timings:{}};
   await page.evaluate(()=>delete document.documentElement.dataset.motion);
   const longTrack=page.getByRole('button',{name:/^Play track A long soundtrack title/});
   for(const width of [1440,720,360]){
-   await page.setViewportSize({width,height:1000});await page.waitForTimeout(120);
+   await page.setViewportSize({width,height:1000});await page.waitForTimeout(330);
+   const compactGrip=page.locator('[data-sidebar-owner="ost"] [data-module-sidebar-grip]');
+   if(width<=700&&await compactGrip.getAttribute('aria-expanded')==='true'){await compactGrip.click();await page.waitForTimeout(330);}
    assert.equal(await longTrack.getAttribute('title'),'A long soundtrack title with quiet rain and a distant train that wraps across two rows while its complete name remains readable 曲 2.wav');
    assert.equal(await longTrack.locator('.name').evaluate(element=>getComputedStyle(element).webkitLineClamp),'2');
    assert(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth));
@@ -228,6 +234,79 @@ const report={checks:[],errors:[],covers:[],audio:[],timings:{}};
   check('closing Settings reconciles lost ownership; API failures retry; fast Back cancels delayed discovery without stale rows or focus');
   await page.screenshot({path:path.join(config.output,'ost-root-rows.png')});
 
+  const sections=page.getByRole('navigation',{name:'OST sections'}),dock=page.locator('[data-sidebar-owner="ost"]'),grip=dock.locator('[data-module-sidebar-grip]');
+  if(await grip.getAttribute('aria-expanded')==='false'){await grip.click();await page.waitForTimeout(350);}
+  await page.waitForTimeout(350);assert.equal(await grip.locator('.dots > span').count(),3);
+  await page.evaluate(()=>{localStorage.setItem('keivotos:youtube-sidebar-open','false');localStorage.setItem('keivotos:language-sidebar-handle-position','41');});
+  await grip.click();await page.waitForTimeout(90);const duringClose=await dock.evaluate(node=>node.getBoundingClientRect().width);assert(duringClose>0&&duringClose<256);
+  await grip.click();await page.waitForTimeout(350);assert.equal(await grip.getAttribute('aria-expanded'),'true');
+  const gripBox=await grip.boundingBox(),dockBox=await dock.boundingBox();
+  await page.mouse.move(gripBox.x+20,gripBox.y+32);await page.mouse.down();await page.mouse.move(gripBox.x+20,dockBox.y+dockBox.height*.75,{steps:8});await page.mouse.up();
+  assert.equal(await grip.getAttribute('aria-expanded'),'true');assert(Number(await page.evaluate(()=>localStorage.getItem('keivotos:ost-sidebar-handle-position')))>70);
+  await grip.focus();await page.keyboard.press('Home');await page.keyboard.press('ArrowDown');assert.equal(await page.evaluate(()=>localStorage.getItem('keivotos:ost-sidebar-handle-position')),'15');
+  assert.equal(await page.evaluate(()=>localStorage.getItem('keivotos:youtube-sidebar-open')),'false');assert.equal(await page.evaluate(()=>localStorage.getItem('keivotos:language-sidebar-handle-position')),'41');
+  await sections.getByRole('button',{name:'Folders',exact:true}).focus();await page.mouse.move(1200,100);await page.waitForTimeout(1850);
+  assert(Number(await grip.locator('.module-sidebar-grip-visual').evaluate(node=>getComputedStyle(node).opacity))<.05);
+  await grip.hover();await page.waitForTimeout(200);assert(Number(await grip.locator('.module-sidebar-grip-visual').evaluate(node=>getComputedStyle(node).opacity))>.95);
+  await grip.click();await page.waitForTimeout(350);await page.reload();await root(owner.source_id).waitFor();assert.equal(await grip.getAttribute('aria-expanded'),'false');
+  await grip.click();await page.waitForTimeout(350);await root(owner.source_id).click();
+  await page.setViewportSize({width:360,height:440});await page.waitForTimeout(350);
+  const narrowPanel=await dock.locator('.module-sidebar-panel').boundingBox(),narrowGrip=await grip.boundingBox();assert(Math.abs(narrowGrip.x-narrowPanel.x-narrowPanel.width)<1);assert(narrowGrip.x+narrowGrip.width<=360);
+  await grip.click();await page.waitForTimeout(350);assert((await grip.boundingBox()).x>=0);
+  await grip.click();await page.waitForTimeout(350);assert.equal(await grip.getAttribute('aria-expanded'),'true');
+  await page.emulateMedia({reducedMotion:'reduce'});assert(await dock.evaluate(node=>parseFloat(getComputedStyle(node).transitionDuration)<.001));
+  await page.emulateMedia({reducedMotion:'no-preference'});await page.evaluate(()=>document.documentElement.dataset.motion='reduced');assert(await dock.evaluate(node=>parseFloat(getComputedStyle(node).transitionDuration)<.001));
+  await page.evaluate(()=>delete document.documentElement.dataset.motion);await page.setViewportSize({width:1440,height:1000});await page.waitForTimeout(350);
+  check('OST three-dot sidebar animates/reverses, drags and restores independently; keyboard placement, delayed reveal and hover return remain');
+
+  const allTracks=page.getByRole('list',{name:'All OST tracks'});
+  const trackRow=(id,relative)=>allTracks.locator(`[data-ost-source=${JSON.stringify(id)}][data-ost-entry-path=${JSON.stringify(relative)}]`);
+  await sections.getByRole('button',{name:'Library',exact:true}).click();await allTracks.waitFor();await page.waitForFunction(()=>document.querySelector('.ost-surface main')?.getAttribute('aria-busy')==='false');
+  assert.equal(await allTracks.locator('li').count(),120);assert.equal(await allTracks.locator('[aria-label^="Open folder"]').count(),0);
+  assert.equal(await trackRow(owner.source_id,'Album 2/Deep/曲 2.wav').count(),1);assert.equal(await allTracks.locator(`[data-ost-source=${JSON.stringify(child.source_id)}]`).count(),0);
+  assert.equal(await allTracks.locator('.details small').first().innerText(),'Soundtracks / Album 2');
+  const libraryScroll=page.locator('.ost-surface main');await libraryScroll.evaluate(node=>node.scrollTop=440);
+  await sections.getByRole('button',{name:'Folders',exact:true}).click();await row('Root track.wav').waitFor();
+  await sections.getByRole('button',{name:'Library',exact:true}).click();await allTracks.waitFor();await page.waitForFunction(()=>document.querySelector('.ost-surface main')?.getAttribute('aria-busy')==='false');
+  assert(Math.abs(await libraryScroll.evaluate(node=>node.scrollTop)-440)<3);
+  const boundary=(await api('/api/ost/tracks?offset=119&limit=2')).data.items;
+  await trackRow(boundary[0].source_id,boundary[0].path).click();
+  await page.waitForFunction(item=>{const node=document.querySelector('audio');return node&&!node.paused&&node.readyState>=2&&new URL(node.src).searchParams.get('source_id')===item.source_id&&new URL(node.src).searchParams.get('path')===item.path;},boundary[0]);
+  await page.getByRole('button',{name:'Next song',exact:true}).click();
+  await page.waitForFunction(item=>{const node=document.querySelector('audio');return node&&!node.paused&&node.readyState>=2&&new URL(node.src).searchParams.get('source_id')===item.source_id&&new URL(node.src).searchParams.get('path')===item.path;},boundary[1]);
+  if(await page.getByRole('button',{name:'Pause',exact:true}).count())await page.getByRole('button',{name:'Pause',exact:true}).click();
+  await page.getByRole('button',{name:'Back to tracks',exact:true}).click();assert.equal(await allTracks.locator('li').count(),120);
+  await page.getByRole('button',{name:'Load more',exact:true}).click();await page.getByText('240 / 269 tracks',{exact:true}).waitFor();
+  await page.getByRole('button',{name:'Load more',exact:true}).click();await page.getByText('269 / 269 tracks',{exact:true}).waitFor();
+  const identities=await allTracks.locator('button').evaluateAll(nodes=>nodes.map(node=>JSON.stringify([node.dataset.ostSource,node.dataset.ostEntryPath])));assert.equal(new Set(identities).size,269);
+  await page.screenshot({path:path.join(config.output,'ost-library.png')});
+  check('Library flattens nested visible OST tracks, excludes hidden owned roots, paginates 120/240/269 and restores independent section scroll');
+
+  let failLibrary=true;expectedFailures++;
+  const failTracks=async route=>{if(failLibrary){failLibrary=false;return route.fulfill({status:503,json:{detail:'Generated Library failure'}});}return route.continue();};
+  await sections.getByRole('button',{name:'Folders',exact:true}).click();await row('Root track.wav').waitFor();await page.route('**/api/ost/tracks?**',failTracks);
+  await sections.getByRole('button',{name:'Library',exact:true}).click();await page.getByRole('alert').filter({hasText:'Generated Library failure'}).waitFor();assert.equal(await allTracks.locator('li').count(),269);
+  await page.getByRole('button',{name:'Retry library',exact:true}).click();await page.waitForFunction(()=>document.querySelector('.ost-surface main')?.getAttribute('aria-busy')==='false');await page.unroute('**/api/ost/tracks?**',failTracks);
+  const restoredChild=await api('/api/suite/folders/apply','POST',{folders:[{source_id:child.source_id,display_name:'Soundtracks',role:'ost',visible:true}]});assert.equal(restoredChild.status,200);
+  const mirrored=await api('/api/suite/folders/apply','POST',{folders:[{path:config.media+'/../second-music',display_name:'ZZ Soundtracks',role:'ost'}]});assert.equal(mirrored.status,200,JSON.stringify(mirrored));
+  const mirrorSource=mirrored.data.sources.find(item=>item.display_name==='ZZ Soundtracks');
+  await page.evaluate(()=>window.dispatchEvent(new Event('focus')));await page.waitForFunction(()=>document.querySelector('.ost-surface main')?.getAttribute('aria-busy')==='false');
+  await sections.getByRole('button',{name:'Folders',exact:true}).click();await row('Root track.wav').waitFor();await returnToRoots();await root(child.source_id).waitFor();
+  await sections.getByRole('button',{name:'Library',exact:true}).click();await page.waitForFunction(()=>document.querySelector('.ost-surface main')?.getAttribute('aria-busy')==='false');
+  while(await page.getByRole('button',{name:'Load more',exact:true}).count()){await page.getByRole('button',{name:'Load more',exact:true}).click();await page.waitForFunction(()=>document.querySelector('.ost-surface main')?.getAttribute('aria-busy')==='false');}
+  await trackRow(child.source_id,'Track 2.wav').waitFor();assert.equal(await trackRow(owner.source_id,'Album 10/Track 2.wav').count(),0);
+  assert.equal(await trackRow(owner.source_id,'Album 2/Track 2.wav').count(),1);assert.equal(await trackRow(mirrorSource.source_id,'Album 2/Track 2.wav').count(),1);
+  await trackRow(child.source_id,'Track 2.wav').click();await page.waitForFunction(id=>{const node=document.querySelector('audio');return node&&!node.paused&&node.readyState>=2&&new URL(node.src).searchParams.get('source_id')===id;},child.source_id);
+  await page.getByRole('button',{name:'Previous song',exact:true}).click();await page.waitForFunction(id=>{const node=document.querySelector('audio');return node&&!node.paused&&node.readyState>=2&&new URL(node.src).searchParams.get('source_id')===id;},owner.source_id);
+  await page.getByRole('button',{name:'Next song',exact:true}).click();await page.waitForFunction(id=>{const node=document.querySelector('audio');return node&&!node.paused&&new URL(node.src).searchParams.get('source_id')===id;},child.source_id);
+  await page.getByRole('button',{name:'Back to tracks',exact:true}).click();assert.equal(await trackRow(child.source_id,'Track 2.wav').getAttribute('aria-pressed'),'true');
+  await sections.getByRole('button',{name:'Folders',exact:true}).click();assert.equal(await page.locator('audio').evaluate(node=>node.paused),false);
+  await sections.getByRole('button',{name:'Library',exact:true}).click();assert.equal(await page.locator('audio').evaluate(node=>node.paused),false);
+  await openSettings();assert.equal((await api('/api/suite/folders/apply','POST',{folders:[{source_id:child.source_id,display_name:'Soundtracks',role:'ost',visible:false}]})).status,200);await closeSettings();await page.locator('.audio-player').waitFor({state:'detached'});
+  assert.equal((await api('/api/suite/folders/apply','POST',{folders:[{source_id:mirrorSource.source_id,display_name:'ZZ Soundtracks',role:'ost',visible:false}]})).status,200);
+  await sections.getByRole('button',{name:'Folders',exact:true}).click();await root(owner.source_id).click();await row('Root track.wav').waitFor();
+  check('Library failures retain rows/Retry; cross-source queue and current highlight keep exact identities; section browsing continues audio and source loss releases it');
+
   const audio=page.locator('audio');
   const player=()=>page.getByRole('region',{name:'OST player',exact:true});
   const transport=()=>page.getByRole('region',{name:'OST playback controls',exact:true});
@@ -270,10 +349,12 @@ const report={checks:[],errors:[],covers:[],audio:[],timings:{}};
   check('real WAV playback with Video/YouTube disabled; Space, repeat protection, five-second seeks, native slider keys, mute and independent 0–100 volume');
 
   for(const width of [1440,720,360]){
-   await page.setViewportSize({width,height:1000});await page.waitForTimeout(120);
+   await page.setViewportSize({width,height:1000});await page.waitForTimeout(330);
+   if(width<=700&&await grip.getAttribute('aria-expanded')==='true'){await grip.click();await page.waitForTimeout(330);}
    const playBox=await play().boundingBox(),seekBox=await seek.boundingBox(),volumeBox=await volume.boundingBox();
    const currentBox=await page.getByLabel('Current time',{exact:true}).boundingBox(),durationBox=await page.getByLabel('Track duration',{exact:true}).boundingBox();
-   assert(Math.abs(playBox.x+playBox.width/2-width/2)<2);
+   const playerBox=await page.locator('.audio-player').boundingBox();
+   assert(Math.abs(playBox.x+playBox.width/2-(playerBox.x+playerBox.width/2))<2);
    assert(seekBox.y>playBox.y+playBox.height&&seekBox.y>volumeBox.y+volumeBox.height);
    assert(currentBox.x+currentBox.width<seekBox.x&&durationBox.x>seekBox.x+seekBox.width);
    assert(Math.abs(currentBox.y+currentBox.height/2-seekBox.y-seekBox.height/2)<2);
@@ -281,7 +362,7 @@ const report={checks:[],errors:[],covers:[],audio:[],timings:{}};
    assert(1000-seekBox.y-seekBox.height>=10);
    assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
    const nextBox=await page.getByRole('button',{name:'Next song',exact:true}).boundingBox(),previousBox=await page.getByRole('button',{name:'Previous song',exact:true}).boundingBox(),loopBox=await loop().boundingBox();
-   assert(Math.abs((previousBox.x+nextBox.x+nextBox.width)/2-width/2)<2);
+   assert(Math.abs((previousBox.x+nextBox.x+nextBox.width)/2-(playerBox.x+playerBox.width/2))<2);
    assert(loopBox.x>=nextBox.x+nextBox.width&&loopBox.x+loopBox.width<=width);
    await page.screenshot({path:path.join(config.output,`ost-player-${width}.png`)});
   }
@@ -379,12 +460,37 @@ const report={checks:[],errors:[],covers:[],audio:[],timings:{}};
   const mediaDelay=async route=>{if(new URL(route.request().url()).searchParams.get('path')==='Album 2/00 - Opening.flac'){resolveMedia();await new Promise(resolve=>setTimeout(resolve,450));}return route.continue().catch(()=>{});};
   await page.route('**/api/files/file?**',mediaDelay);
   await row('Album 2/00 - Opening.flac').click();await mediaStarted;
+  assert.equal(await page.getByLabel('Track duration',{exact:true}).innerText(),'—:—');
+  assert.equal(await seek.getAttribute('aria-valuetext'),'Duration unavailable');
   assert.equal(await page.getByRole('button',{name:'Next song',exact:true}).isDisabled(),false);
   await page.getByRole('button',{name:'Next song',exact:true}).click();await waitTrack(longPath);await paused();await page.waitForTimeout(550);
   assert.equal(await page.getByRole('alert').count(),0);
   assert.equal(new URL(await audio.getAttribute('src')).searchParams.get('path'),longPath);
   await page.unroute('**/api/files/file?**',mediaDelay);await browse();await back();
   check('Next stays usable during actual delayed media loading; cancelled old media events and play promises cannot replace or fail the new track');
+
+  await openFolder('Album 2');await startTrack('Album 2/Track 2.wav');await cycleTo('all');
+  const burstAudio=await audio.elementHandle();
+  const delayedBurst=async route=>{await new Promise(resolve=>setTimeout(resolve,300));return route.continue().catch(()=>{});};
+  for(const [label,alternating,delayMedia] of [['alternating',true,false],['same-direction',false,false],['delayed',true,true]]){
+   if(delayMedia)await page.route('**/api/files/file?**',delayedBurst);
+   for(let n=0;n<32;n++){
+    const button=page.getByRole('button',{name:alternating&&n%2?'Previous song':'Next song',exact:true});
+    const box=await button.boundingBox();await page.mouse.click(box.x+box.width/2,box.y+box.height/2);await page.waitForTimeout(12);
+   }
+   await waitTrack('Album 2/Track 2.wav');const first=await audio.evaluate(node=>node.currentTime);await page.waitForTimeout(350);assert((await audio.evaluate(node=>node.currentTime))>first);
+   assert.equal(await audio.evaluate((node,original)=>node===original,burstAudio),true);
+   assert.equal(await page.getByLabel('Track duration',{exact:true}).innerText(),'0:20');
+   assert.equal(await page.getByRole('alert').count(),0);report.timings['burst-'+label]=await audio.evaluate(node=>({time:node.currentTime,duration:node.duration,paused:node.paused}));
+   if(delayMedia)await page.unroute('**/api/files/file?**',delayedBurst);
+  }
+  await audio.evaluate(node=>{node.dispatchEvent(new Event('pause'));node.dispatchEvent(new Event('ended'));});
+  assert.equal(await pause().count(),1);assert.equal(new URL(await audio.getAttribute('src')).searchParams.get('path'),'Album 2/Track 2.wav');
+  await paused();const timerSeekBox=await seek.boundingBox();await page.mouse.click(timerSeekBox.x+timerSeekBox.width*.35,timerSeekBox.y+timerSeekBox.height/2);await page.waitForTimeout(80);
+  const observedSeconds=Math.floor(await audio.evaluate(node=>node.currentTime));assert(observedSeconds>0);assert.equal(await page.getByLabel('Current time',{exact:true}).innerText(),`${Math.floor(observedSeconds/60)}:${String(observedSeconds%60).padStart(2,'0')}`);
+  await page.setViewportSize({width:360,height:440});await page.waitForTimeout(350);assert(await page.getByLabel('Current time',{exact:true}).isVisible());assert(await page.getByLabel('Track duration',{exact:true}).isVisible());
+  await page.screenshot({path:path.join(config.output,'ost-player-timer-compact.png')});await page.setViewportSize({width:1440,height:1000});await cycleTo('off');await browse();await back();
+  check('96 rapid native clicks, delayed media and stale pause/ended events retain one playable audio node; elapsed/duration agree with playback and seek in a short window');
 
   // Verify decoded nonzero PCM through the browser audio graph; hardware output is not asserted.
   await startTrack('Root track.wav');

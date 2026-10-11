@@ -147,3 +147,60 @@ def directory(db, source, all_sources, suite_home, parent, offset, limit):
                                                  bool(row['is_dir']), forbidden, folders)}
                  for row in rows]
     return {'source_id': source.source_id, 'parent': relative, 'items': items, 'total': total}
+
+
+def tracks(db, all_sources, suite_home, offset, limit):
+    """One paginated audio collection; the Files index owns recursive facts."""
+    owners = {source.source_id: source for source in all_sources
+              if source.role == 'ost' and source.visible}
+    if not owners:
+        return {'items': [], 'total': 0}
+    forbidden = {key: forbidden_roots(source, all_sources, suite_home)
+                 for key, source in owners.items()}
+    excluded = {
+        key: [os.path.normcase(Path(os.path.relpath(path, source.path)).as_posix())
+              for path in forbidden[key]
+              if sources.is_strict_descendant_path(path, source.path)]
+        for key, source in owners.items()
+    }
+
+    def owned(source_id, path):
+        if source_id not in excluded:
+            return False
+        normalized = os.path.normcase(path)
+        return not any(normalized == child or normalized.startswith(child + os.path.normcase('/'))
+                       for child in excluded[source_id])
+
+    def compare(left, right):
+        a, b = _natural(left), _natural(right)
+        return (a > b) - (a < b)
+
+    owner_marks = ','.join('?' for _ in owners)
+    audio_marks = ','.join('?' for _ in AUDIO_EXTENSIONS)
+    where = (f'source_id IN ({owner_marks}) AND available=1 AND is_dir=0 '
+             f'AND ext IN ({audio_marks}) AND ost_track_owned(source_id,relative_path)')
+    parameters = [*owners, *AUDIO_EXTENSIONS]
+    with index.open_index(db) as connection:
+        connection.create_collation('ost_natural', compare)
+        connection.create_function('ost_track_owned', 2, owned)
+        connection.create_function('ost_source_name', 1, lambda key: owners[key].display_name)
+        total = connection.execute(f'SELECT count(*) FROM files_index WHERE {where}', parameters).fetchone()[0]
+        rows = connection.execute(
+            f'SELECT source_id,relative_path,parent,name,ext,size,mtime FROM files_index WHERE {where} '
+            'ORDER BY ost_source_name(source_id) COLLATE ost_natural, '
+            'relative_path COLLATE ost_natural,source_id LIMIT ? OFFSET ?',
+            [*parameters, limit, offset]).fetchall()
+        folders = {key: {} for key in owners}
+        items = []
+        for row in rows:
+            key = row['source_id']
+            source = owners[key]
+            path = row['relative_path']
+            items.append({'source_id': key, 'source_name': source.display_name,
+                          'path': path, 'parent': row['parent'], 'name': row['name'],
+                          'ext': row['ext'], 'is_dir': False, 'size': row['size'],
+                          'mtime': row['mtime'],
+                          'available': available(source, path, False, forbidden[key]),
+                          'cover_version': cover_version(connection, source, path, False,
+                                                         forbidden[key], folders[key])})
+    return {'items': items, 'total': total}
