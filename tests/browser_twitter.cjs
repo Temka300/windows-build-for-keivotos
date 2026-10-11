@@ -207,8 +207,19 @@ let expectedLostReply=false;
   // second synthetic archive or returning fabricated UI responses.
   const smallPages=async route=>{const url=new URL(route.request().url());url.searchParams.set('limit','17');await route.fulfill({response:await route.fetch({url:url.href})});};
   await page.route('**/api/twitter/library?*',smallPages);
+  assert.equal((await api('/api/suite/modules/youtube/enable','POST')).status,200);
+  await page.reload();await page.waitForLoadState('networkidle');
+  await page.setViewportSize({width:1920,height:1000});
+  await page.getByRole('button',{name:'Open Keivotos menu',exact:true}).click();
+  await page.locator('.app-drawer').getByRole('button',{name:'YouTube',exact:true}).click();
+  const youtubeSearchBox=await page.locator('.youtube-surface .search-controls').boundingBox();
   await page.getByRole('button',{name:'Open Keivotos menu',exact:true}).click();
   await page.locator('.app-drawer').getByRole('button',{name:'Twitter',exact:true}).click();
+  const twitterSearchBox=await page.locator('.twitter-surface .search-controls').boundingBox();
+  assert.equal(twitterSearchBox.width,youtubeSearchBox.width);
+  assert(Math.abs(twitterSearchBox.x-youtubeSearchBox.x)<16,JSON.stringify({twitterSearchBox,youtubeSearchBox}));
+  report.searchPlacement={twitter:twitterSearchBox,youtube:youtubeSearchBox};
+  await page.setViewportSize({width:1440,height:1000});
   const archive=page.getByRole('main',{name:'Twitter archive'});
   const posts=archive.locator('[data-twitter-post]');
   const search=page.getByRole('textbox',{name:'Search saved posts or paste a Twitter URL'});
@@ -223,7 +234,7 @@ let expectedLostReply=false;
   assert.equal(await posts.locator('video[autoplay]').count(),0);
   assert(await posts.locator('video').evaluateAll(videos=>videos.every(v=>v.preload==='none'&&v.paused&&v.readyState===0)));
   assert.equal(await page.locator('a[href^="https://pbs.twimg.com"],img[src^="https://"]').count(),0);
-  check('Twitter surface discovers automatically; central feed, captured author/text and guarded local video render without autoplay or remote images');
+  check('Twitter surface discovers automatically; search matches YouTube placement/width on a wide window; central feed, exact text and guarded local video render without autoplay or remote images');
 
   const inputBox=await search.boundingBox();
   assert.equal(await reveal.getAttribute('inert'),'');assert.equal(await download.getAttribute('tabindex'),'-1');
