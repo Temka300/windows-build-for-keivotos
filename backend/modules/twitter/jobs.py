@@ -19,6 +19,7 @@ from database import get_user_db
 from files_base import index, serving, sources
 from maintenance import exclusive_tool_operation
 from modules.twitter import archive
+from modules.twitter.helpers import ffmpeg_executable
 
 logger = logging.getLogger('keivotos.twitter')
 _lock = threading.RLock()
@@ -69,7 +70,9 @@ def preferences():
 
 
 def dependencies():
-    missing = [name for name in ('yt_dlp', 'PIL', 'imageio_ffmpeg') if importlib.util.find_spec(name) is None]
+    missing = [name for name in ('yt_dlp', 'PIL') if importlib.util.find_spec(name) is None]
+    if not ffmpeg_executable():
+        missing.append('FFmpeg')
     return {'ready': not missing, 'missing': missing}
 
 

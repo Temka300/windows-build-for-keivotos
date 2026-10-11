@@ -22,7 +22,7 @@ import config
 import database
 from files_base import index, sources, serving
 from modules import twitter
-from modules.twitter import archive, router, jobs, acquisition
+from modules.twitter import archive, router, jobs, acquisition, helpers
 from tests.browser_twitter_fixture import RAW_TEXT, write_capture, source_response
 
 
@@ -363,6 +363,129 @@ def test_status_url_admission_is_closed(url):
 def test_status_url_normalization():
     assert archive.canonical_url('https://www.twitter.com/SavedAuthor/status/123/?s=20#ignored') == ('https://x.com/SavedAuthor/status/123', '123')
     assert archive.canonical_url('https://x.com/i/web/status/123') == ('https://x.com/i/web/status/123', '123')
+
+
+@pytest.mark.parametrize('platform,name', [('win32', 'ffmpeg.exe'), ('linux', 'ffmpeg')])
+def test_frozen_twitter_uses_bundled_ffmpeg_without_python_wrapper(tmp_path, monkeypatch, platform, name):
+    import builtins
+    portable = tmp_path / 'portable'
+    portable.mkdir()
+    executable = portable / 'Keivotos'
+    executable.touch()
+    bundled = portable / name
+    bundled.touch()
+    monkeypatch.setattr(helpers.sys, 'frozen', True, raising=False)
+    monkeypatch.setattr(helpers.sys, 'platform', platform)
+    monkeypatch.setattr(helpers.sys, 'executable', str(executable))
+    monkeypatch.setattr(helpers.shutil, 'which', lambda _: pytest.fail('Frozen lookup used PATH'))
+    original_import = builtins.__import__
+    def without_wrapper(name, *args, **kwargs):
+        if name == 'imageio_ffmpeg':
+            pytest.fail('Portable lookup imported the excluded Python wrapper')
+        return original_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, '__import__', without_wrapper)
+    monkeypatch.setattr(jobs.importlib.util, 'find_spec', lambda package: None if package == 'imageio_ffmpeg' else object())
+    assert helpers.ffmpeg_executable() == str(bundled)
+    assert jobs.dependencies() == {'ready': True, 'missing': []}
+
+
+def test_frozen_twitter_missing_bundle_refuses_ambient_ffmpeg(tmp_path, monkeypatch):
+    monkeypatch.setattr(helpers.sys, 'frozen', True, raising=False)
+    monkeypatch.setattr(helpers.sys, 'executable', str(tmp_path / 'Keivotos'))
+    monkeypatch.setattr(helpers.shutil, 'which', lambda _: pytest.fail('Frozen lookup used PATH'))
+    monkeypatch.setattr(jobs.importlib.util, 'find_spec', lambda _: object())
+    assert helpers.ffmpeg_executable() is None
+    assert jobs.dependencies() == {'ready': False, 'missing': ['FFmpeg']}
+
+
+def test_source_twitter_ffmpeg_uses_path_before_python_wrapper(monkeypatch):
+    import builtins
+    monkeypatch.setattr(helpers.sys, 'frozen', False, raising=False)
+    monkeypatch.setattr(helpers.shutil, 'which', lambda _: '/existing/ffmpeg')
+    original_import = builtins.__import__
+    def without_wrapper(name, *args, **kwargs):
+        if name == 'imageio_ffmpeg':
+            pytest.fail('Source PATH lookup unnecessarily imported the wrapper')
+        return original_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, '__import__', without_wrapper)
+    assert helpers.ffmpeg_executable() == '/existing/ffmpeg'
+
+
+def test_source_twitter_ffmpeg_keeps_installed_wrapper_fallback(monkeypatch):
+    import imageio_ffmpeg
+    monkeypatch.setattr(helpers.sys, 'frozen', False, raising=False)
+    monkeypatch.setattr(helpers.shutil, 'which', lambda _: None)
+    monkeypatch.setattr(imageio_ffmpeg, 'get_ffmpeg_exe', lambda: '/locked/environment/ffmpeg')
+    assert helpers.ffmpeg_executable() == '/locked/environment/ffmpeg'
+
+
+def test_source_twitter_reports_missing_ffmpeg_without_path_or_wrapper(monkeypatch):
+    import builtins
+    monkeypatch.setattr(helpers.sys, 'frozen', False, raising=False)
+    monkeypatch.setattr(helpers.shutil, 'which', lambda _: None)
+    monkeypatch.setattr(jobs.importlib.util, 'find_spec', lambda _: object())
+    original_import = builtins.__import__
+    def without_wrapper(name, *args, **kwargs):
+        if name == 'imageio_ffmpeg':
+            raise ModuleNotFoundError(name)
+        return original_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, '__import__', without_wrapper)
+    assert jobs.dependencies() == {'ready': False, 'missing': ['FFmpeg']}
+
+
+@pytest.mark.parametrize('package', ['yt_dlp', 'PIL'])
+def test_twitter_ffmpeg_does_not_mask_other_missing_dependencies(monkeypatch, package):
+    monkeypatch.setattr(jobs, 'ffmpeg_executable', lambda: '/existing/ffmpeg')
+    monkeypatch.setattr(jobs.importlib.util, 'find_spec', lambda name: None if name == package else object())
+    assert jobs.dependencies() == {'ready': False, 'missing': [package]}
+
+
+@pytest.mark.parametrize('corrupt', [False, True])
+def test_real_frozen_twitter_verification_without_imageio_ffmpeg(catalog, tmp_path, monkeypatch, corrupt):
+    import builtins
+    from io import BytesIO
+    import shutil
+    from PIL import Image
+    import imageio_ffmpeg
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    generated = tmp_path / 'generated.mp4'
+    subprocess.run([ffmpeg, '-v', 'error', '-f', 'lavfi', '-i', 'color=blue:s=48x48:r=4',
+                    '-t', '0.5', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(generated)], check=True, timeout=30)
+    portable = tmp_path / 'portable'
+    portable.mkdir()
+    executable = portable / ('Keivotos.exe' if sys.platform == 'win32' else 'Keivotos')
+    executable.touch()
+    bundled = portable / ('ffmpeg.exe' if sys.platform == 'win32' else 'ffmpeg')
+    shutil.copy2(ffmpeg, bundled)
+    avatar = BytesIO()
+    Image.new('RGB', (24, 24), 'blue').save(avatar, 'JPEG')
+    media = catalog[1]
+    path = write_capture(media, video=b'invalid MP4' if corrupt else generated.read_bytes(), avatar=avatar.getvalue())
+    directory = (media / path).parent
+    before = {file.name: file.read_bytes() for file in directory.iterdir()}
+    spec = {'root': str(media.resolve()), 'path': path, 'forbidden': [],
+            'directory_identity': [directory.stat().st_dev, directory.stat().st_ino]}
+    monkeypatch.setattr(helpers.sys, 'frozen', True, raising=False)
+    monkeypatch.setattr(helpers.sys, 'executable', str(executable))
+    original_import = builtins.__import__
+    original_spec = jobs.importlib.util.find_spec
+    def without_wrapper(name, *args, **kwargs):
+        if name == 'imageio_ffmpeg':
+            raise ModuleNotFoundError(name)
+        return original_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, '__import__', without_wrapper)
+    monkeypatch.setattr(jobs.importlib.util, 'find_spec', lambda name: None if name == 'imageio_ffmpeg' else original_spec(name))
+    assert jobs.dependencies() == {'ready': True, 'missing': []}
+    if corrupt:
+        with pytest.raises(ValueError, match='Saved MP4 verification failed'):
+            acquisition.verify(spec)
+    else:
+        verified = acquisition.verify(spec)
+        assert set(verified) == set(archive.ASSET_LIMITS)
+        for name, facts in verified.items():
+            assert facts['size'] == len(before[name])
+            assert facts['sha256'] == hashlib.sha256(before[name]).hexdigest()
+    assert {file.name: file.read_bytes() for file in directory.iterdir()} == before
 
 
 def test_failed_twitter_startup_leaves_base_running_and_can_retry(catalog, monkeypatch):

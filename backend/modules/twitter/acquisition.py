@@ -18,6 +18,7 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 
 from files_base import serving
 from modules.twitter import archive
+from modules.twitter.helpers import ffmpeg_executable
 
 
 def remote_url(value, host):
@@ -186,13 +187,15 @@ def download_video(spec, url, notify):
 
 def verify(spec):
     from PIL import Image
-    import imageio_ffmpeg
+    ffmpeg = ffmpeg_executable()
+    if not ffmpeg:
+        raise ValueError('FFmpeg is unavailable')
     folder = directory(spec)
     with Image.open(folder / 'avatar.jpg') as image:
         if image.format != 'JPEG' or image.width * image.height > 16_000_000:
             raise ValueError('Only a bounded JPEG avatar is supported')
         image.verify()
-    decoded = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-nostdin', '-v', 'error', '-xerror', '-f', 'mp4', '-i',
+    decoded = subprocess.run([ffmpeg, '-nostdin', '-v', 'error', '-xerror', '-f', 'mp4', '-i',
                               str(folder / 'video.mp4'), '-map', '0:v:0', '-f', 'null', '-'],
                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
     if decoded.returncode or decoded.stderr.strip():
