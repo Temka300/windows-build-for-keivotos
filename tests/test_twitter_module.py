@@ -299,7 +299,7 @@ def test_invalid_tweet_fields_refused_after_correct_hash(catalog, change):
     source, media, _, _ = catalog
     path = write_capture(media)
     target = media / path.replace('manifest.json', 'tweet.json')
-    value = json.loads(target.read_text())
+    value = json.loads(target.read_text(encoding='utf-8'))
     change(value)
     raw = json.dumps(value).encode()
     target.write_bytes(raw)
