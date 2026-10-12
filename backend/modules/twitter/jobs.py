@@ -36,15 +36,6 @@ def public(job):
     return {key: value for key, value in job.items() if key not in ('root', 'retry_requests')}
 
 
-def listing(offset=0, limit=120):
-    with get_user_db() as db:
-        total = db.execute('SELECT COUNT(*) AS count FROM twitter_downloads').fetchone()['count']
-        rows = db.execute('SELECT * FROM twitter_downloads ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?',
-                          (limit, offset)).fetchall()
-    return {'items': [public(dict(row)) for row in rows], 'total': total,
-            'next_offset': offset + len(rows) if offset + len(rows) < total else None}
-
-
 def destination(source_id, expected_root=None):
     with get_user_db() as db:
         registered = sources.list_sources(db)

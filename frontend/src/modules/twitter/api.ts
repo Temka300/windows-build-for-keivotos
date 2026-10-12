@@ -16,7 +16,6 @@ export interface Download {
   phase:string;progress:number;attempt:number;capture_id:string;path:string;error:string;
   created_at:string;updated_at:string;
 }
-export interface JobPage {items:Download[];total:number;next_offset:number|null;}
 export const captureKey=(item:Capture)=>item.source_id+':'+item.path;
 export function postUrl(value:string):string|null {
   const raw=value.trim();
@@ -35,8 +34,6 @@ export const twitterApi={
   library:(offset=0,q='',author='',signal?:AbortSignal)=>get<ArchivePage>('/twitter/library',{offset,limit:120,q,author},signal),
   capture:(source_id:string,path:string,signal?:AbortSignal)=>get<Capture>('/twitter/capture',{source_id,path},signal),
   mediaUrl:(item:Capture,asset:'avatar'|'video')=>'/api/twitter/media?'+new URLSearchParams({source_id:item.source_id,path:item.path,asset}),
-  jobs:(offset=0,signal?:AbortSignal)=>get<JobPage>('/twitter/downloads',{offset,limit:120},signal),
+  job:(id:string,signal?:AbortSignal)=>get<Download>(`/twitter/downloads/${encodeURIComponent(id)}`,undefined,signal),
   download:(url:string,source_id:string,request_id:string)=>post<Download>('/twitter/downloads',{url,source_id,request_id}),
-  cancel:(id:string)=>post<Download>('/twitter/downloads/'+encodeURIComponent(id)+'/cancel'),
-  retry:(id:string,request_id:string)=>post<Download>('/twitter/downloads/'+encodeURIComponent(id)+'/retry',{request_id}),
 };

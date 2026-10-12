@@ -60,7 +60,7 @@ ${mode !== 'absent' ? "export { activeCollectionId, selectedImageId, viewMode } 
     assert.equal(get(registry.startupModule), mode === 'additional' ? 'fixture' : 'last');
     assert.deepEqual(registry.settingsContributions.map(owner => owner.group.id),
       mode === 'absent' ? ['general', 'files', 'youtube'] : mode === 'additional'
-        ? ['general', 'files', 'danbooru', 'fixture', 'youtube'] : ['general', 'files', 'danbooru', 'youtube']);
+        ? ['general', 'files', 'danbooru', 'fixture', 'youtube', 'twitter'] : ['general', 'files', 'danbooru', 'youtube', 'twitter']);
     assert.equal(moduleUi('files').slug, 'files');
     assert.deepEqual(moduleUi('files').drawerActions, []);
     assert.equal(surfaceComponent('files').owner, 'FilesView.svelte');

@@ -545,6 +545,11 @@ def test_user_backup_retains_role_without_originals_or_extra_artifact(catalog, t
         assert connection.execute('SELECT role FROM files_sources WHERE source_id=?', (source.source_id,)).fetchone()[0] == 'twitter'
 
 
+def job_count(catalog):
+    with catalog[3]() as db:
+        return db.execute('SELECT COUNT(*) AS count FROM twitter_downloads').fetchone()['count']
+
+
 def new_job(catalog, token=None):
     source = catalog[0]
     twitter.adopt(source.source_id)
@@ -559,14 +564,14 @@ def test_job_uuid_receipt_duplicate_concurrency_and_durable_queue(catalog):
     with ThreadPoolExecutor(max_workers=4) as executor:
         results = list(executor.map(lambda _: new_job(catalog, token), range(4)))
     assert len({r['id'] for r in results}) == 1
-    assert jobs.listing()['total'] == 1
+    assert job_count(catalog) == 1
     with pytest.raises(ValueError, match='already downloading'):
         new_job(catalog)
     with pytest.raises(ValueError, match='different capture'):
         jobs.create('https://x.com/SavedAuthor/status/444', source.source_id, token)
     jobs.update(str(token), status='complete')
     assert new_job(catalog)['id'] != str(token)
-    assert 'root' not in jobs.listing()['items'][0]
+    assert 'root' not in jobs.public(jobs.get(str(token)))
 
 
 def test_committed_lost_acknowledgement_reuses_original_uuid(catalog, monkeypatch):
@@ -584,7 +589,7 @@ def test_committed_lost_acknowledgement_reuses_original_uuid(catalog, monkeypatc
         jobs.create('https://x.com/SavedAuthor/status/333', source.source_id, token)
     monkeypatch.setattr(jobs, 'get_user_db', connect)
     assert new_job(catalog, token)['id'] == str(token)
-    assert jobs.listing()['total'] == 1
+    assert job_count(catalog) == 1
 
 
 def test_pending_restart_and_retry_receipts_do_not_start_remote_work(catalog):
@@ -650,7 +655,7 @@ def test_preferences_additive_schema_and_maintenance_exclusion(catalog):
     with maintenance.module_transition():
         with pytest.raises(RuntimeError, match='transition'):
             new_job(catalog)
-    assert jobs.listing()['total'] == 0
+    assert job_count(catalog) == 0
 
 
 def test_jobs_use_the_production_dictionary_row_factory(catalog, monkeypatch):
@@ -662,7 +667,7 @@ def test_jobs_use_the_production_dictionary_row_factory(catalog, monkeypatch):
             yield db
     monkeypatch.setattr(jobs, 'get_user_db', production_rows)
     job = new_job(catalog)
-    assert jobs.listing()['total'] == 1
+    assert job_count(catalog) == 1
     assert jobs.get(job['id'])['status'] == 'queued'
 
 

@@ -6,7 +6,7 @@ const crypto=require('node:crypto');
 const {chromium}=require(process.env.PLAYWRIGHT_MODULE||'playwright');
 const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
 assert.match(config.home,/[/\\]keivotos-modularization-[^/\\]+[/\\]home$/);
-const report={checks:[],errors:[],expectedConsole:[],requests:[]};
+const report={checks:[],errors:[],expectedConsole:[],requests:[],historyReads:[]};
 let expectedLostReply=false;
 (async()=>{
  const browser=await chromium.launch({headless:true,channel:process.env.PLAYWRIGHT_CHANNEL});
@@ -23,7 +23,7 @@ let expectedLostReply=false;
   // Once the hidden nested owner excludes captures, the Files directory has
   // no cover candidate. Keep that reviewed image miss separate from failures.
   if(url?.origin===config.url&&url.pathname==='/api/files/thumbnail'&&
-     url.searchParams.get('path')==='captures'&&m.text().includes('404')){
+     ['captures','destination'].includes(url.searchParams.get('path'))&&m.text().includes('404')){
    report.expectedConsole.push({url:url.href,message:m.text()});return;
   }
   report.errors.push(m.text());
@@ -168,9 +168,9 @@ let expectedLostReply=false;
   const second=await api('/api/twitter/downloads','POST',{...payload,request_id:crypto.randomUUID()});
   const secondDone=await until(second.data.id,'complete');assert.notEqual(secondDone.path,completed.path);
   assert.deepEqual(firstSaved,hashes(firstDirectory));
-  const page1=(await api('/api/twitter/downloads?limit=1')).data;assert.equal(page1.items.length,1);assert.equal(page1.next_offset,1);
-  assert.equal((await api('/api/twitter/downloads?limit=1&offset=1')).data.items.length,1);
-  check('Explicit later capture preserves a second immutable snapshot; durable job listing paginates without overwriting the earlier capture');
+  assert.equal((await api('/api/twitter/downloads')).status,404);
+  assert.equal((await api('/api/twitter/downloads/'+completed.id)).data.status,'complete');
+  check('Explicit later capture preserves another immutable snapshot; history-list API is removed while individual durable receipts remain readable');
 
   await control({fail:true});
   const badPayload={...payload,url:'https://x.com/SavedAuthor/status/444',request_id:crypto.randomUUID()};
@@ -193,7 +193,7 @@ let expectedLostReply=false;
   await until(pending.data.id,'running');
   const queued=await api('/api/twitter/downloads','POST',{...payload,url:'https://x.com/SavedAuthor/status/666',request_id:crypto.randomUUID()});
   assert.equal((await api('/api/suite/modules/twitter/disable','POST')).status,200);
-  assert.equal((await api('/api/twitter/downloads')).status,409);
+  assert.equal((await api('/api/twitter/downloads/'+pending.data.id)).status,409);
   const stoppedStats=await stats();
   assert.equal((await api('/api/suite/modules/twitter/enable','POST')).status,200);
   assert.equal((await api('/api/twitter/downloads/'+pending.data.id)).data.status,'interrupted');
@@ -226,6 +226,21 @@ let expectedLostReply=false;
   const reveal=page.locator('.twitter-surface .download-reveal');
   const download=page.locator('.twitter-surface .download');
   const sidebar=page.getByRole('navigation',{name:'Twitter sections'});
+  page.on('request',request=>{if(request.method()==='GET'&&new URL(request.url()).pathname==='/api/twitter/downloads')report.historyReads.push(request.url());});
+  async function openTwitterSettings(){
+   await page.getByRole('button',{name:'Open Keivotos menu',exact:true}).click();
+   await page.locator('.app-drawer').getByRole('button',{name:'Settings',exact:true}).click();
+   const sections=dialog.getByRole('navigation',{name:'Settings sections'});
+   await sections.getByRole('button',{name:'Capture',exact:true}).click();
+   await dialog.getByLabel('Save to',{exact:true}).waitFor();
+   await page.waitForFunction(()=>!document.getElementById('twitter-destination')?.disabled||document.querySelector('#setting-twitter-destination')?.textContent.includes('Confirm the pending'));
+  }
+  async function closeTwitterSettings(){
+   await dialog.getByRole('button',{name:'Close settings',exact:true}).click();
+   await dialog.waitFor({state:'hidden'});
+   const menu=page.getByRole('button',{name:'Close menu',exact:true});
+   if(await menu.count()){await menu.click();await page.locator('.app-drawer-layer').waitFor({state:'hidden'});}
+  }
   const firstPageCount=(await api('/api/twitter/library?limit=17')).data.items.length;
   await page.waitForFunction(count=>document.querySelectorAll('[data-twitter-post]').length===count,firstPageCount);
   assert.equal(await page.title(),'Keivotos - Twitter');
@@ -235,6 +250,26 @@ let expectedLostReply=false;
   assert(await posts.locator('video').evaluateAll(videos=>videos.every(v=>v.preload==='none'&&v.paused&&v.readyState===0)));
   assert.equal(await page.locator('a[href^="https://pbs.twimg.com"],img[src^="https://"]').count(),0);
   check('Twitter surface discovers automatically; search matches YouTube placement/width on a wide window; central feed, exact text and guarded local video render without autoplay or remote images');
+
+  assert.equal(await page.getByRole('complementary',{name:'Twitter downloads'}).count(),0);
+  assert.equal(await page.getByRole('button',{name:'Downloads',exact:true}).count(),0);
+  assert.equal(await page.getByLabel('Save to',{exact:true}).count(),0);
+  fs.mkdirSync(path.join(config.mediaLocal,'destination'),{recursive:true});
+  const otherRegistration=await api('/api/suite/folders/apply','POST',{folders:[{path:config.media+'/destination',display_name:'Other Twitter destination',role:'twitter'}]});
+  assert.equal(otherRegistration.status,200);
+  const otherOwner=otherRegistration.data.sources.find(s=>s.path.replaceAll('\\','/').endsWith('/destination'));assert(otherOwner);
+  await openTwitterSettings();
+  await dialog.getByLabel('Save to',{exact:true}).selectOption(otherOwner.source_id);
+  await page.waitForFunction(()=>!document.getElementById('twitter-destination')?.disabled);
+  assert.equal((await api('/api/twitter/settings')).data.saved_source_id,otherOwner.source_id);
+  await dialog.getByLabel('Save to',{exact:true}).selectOption(owner.source_id);
+  await page.waitForFunction(()=>!document.getElementById('twitter-destination')?.disabled);
+  await closeTwitterSettings();
+  await page.reload();await posts.first().waitFor();
+  await openTwitterSettings();assert.equal(await dialog.getByLabel('Save to',{exact:true}).inputValue(),owner.source_id);
+  await page.screenshot({path:path.join(config.output,'twitter-save-settings.png')});
+  await closeTwitterSettings();
+  check('Downloads column and trigger are absent; Save to belongs to Twitter Settings, changes the real destination and survives reload');
 
   const inputBox=await search.boundingBox();
   assert.equal(await reveal.getAttribute('inert'),'');assert.equal(await download.getAttribute('tabindex'),'-1');
@@ -319,7 +354,9 @@ let expectedLostReply=false;
   await page.route('**/api/twitter/downloads',lostAck);await control({delay:.7,fail:false});
   await search.fill('https://twitter.com/SavedAuthor/status/731?s=20');await download.click();
   await page.waitForFunction(()=>document.querySelector('.twitter-surface .download')?.textContent==='Starting…');
-  assert.equal(await search.isDisabled(),true);assert.equal(await page.getByLabel('Save to',{exact:true}).isDisabled(),true);
+  assert.equal(await search.isDisabled(),true);
+  await openTwitterSettings();assert.equal(await dialog.getByLabel('Save to',{exact:true}).isDisabled(),true);
+  await closeTwitterSettings();
   await download.press('Enter');await page.waitForTimeout(200);assert.equal(posted.length,1);
   releaseAck();await page.getByRole('button',{name:'Retry request',exact:true}).waitFor();
   await page.reload();await page.getByRole('button',{name:'Retry request',exact:true}).waitFor();
@@ -327,8 +364,9 @@ let expectedLostReply=false;
   await page.waitForFunction(()=>document.querySelector('.twitter-surface input')?.value==='');
   assert.equal(posted.length,2);assert.deepEqual(posted[1],posted[0]);
   const recovered=await until(posted[0].request_id,'complete');
-  await page.getByRole('button',{name:'View saved post 731',exact:true}).waitFor();
-  await page.getByRole('button',{name:'View saved post 731',exact:true}).click();await archive.locator('article.detail').waitFor();
+  const recoveredPost=archive.locator('[data-twitter-post]').filter({has:page.locator(`button[aria-label="Read saved post 731"]`)}).first();
+  await recoveredPost.waitFor();
+  await recoveredPost.getByRole('button',{name:'Read saved post 731',exact:true}).click();await archive.locator('article.detail').waitFor();
   assert.equal(await archive.locator('article.detail').getAttribute('data-twitter-post'),owner.source_id+':'+recovered.path);
   await archive.getByRole('button',{name:'Back to saved view'}).click();
   await search.fill('https://x.com/SavedAuthor/status/731');
@@ -340,14 +378,18 @@ let expectedLostReply=false;
   check('Pending Download blocks duplicate submit and destination changes; lost committed acknowledgement survives reload and retries the identical UUID; later Enter creates a separate snapshot and composition Enter submits nothing');
 
   await control({fail:true,delay:0});await search.fill('https://x.com/SavedAuthor/status/732');await download.click();
-  await page.getByRole('button',{name:'Retry post 732',exact:true}).waitFor();
-  assert(await page.locator('[data-twitter-job]').filter({has:page.getByRole('button',{name:'Retry post 732',exact:true})}).textContent().then(text=>text.includes('one direct MP4')));
-  await control({fail:false,delay:.7});await page.getByRole('button',{name:'Retry post 732',exact:true}).click();
-  await page.getByRole('button',{name:'View saved post 732',exact:true}).waitFor();
+  await page.getByText(/Could not save post 732.*one direct MP4/).waitFor();
+  assert.equal(await page.locator('[data-twitter-job]').count(),0);
+  await control({fail:false,delay:.7});await search.fill('https://x.com/SavedAuthor/status/732');await download.click();
+  await page.getByText('Post saved: 732.',{exact:true}).waitFor();
   await control({delay:3});await search.fill('https://x.com/SavedAuthor/status/733');await download.click();
-  await page.getByRole('button',{name:'Cancel post 733',exact:true}).waitFor();await page.getByRole('button',{name:'Cancel post 733',exact:true}).click();
-  await page.getByRole('button',{name:'Retry post 733',exact:true}).waitFor();await control({delay:0});
-  check('Actual generated unsupported capture exposes its saved error and Retry; a pending capture cancels through the UI while retaining its receipt and partial files');
+  await page.getByText('Saving post 733…',{exact:true}).waitFor();
+  await page.reload();await posts.first().waitFor();
+  await page.getByText('Saving post 733…',{exact:true}).waitFor();
+  await page.getByText('Post saved: 733.',{exact:true}).waitFor();
+  assert.equal(await page.evaluate(()=>sessionStorage.getItem('keivotos:twitter-active-downloads')),null);
+  await control({delay:0});
+  check('Individual status polling delivers failure/progress/success through notifications; another Download retries explicitly, and active tracking survives reload then stops after completion');
 
   const grip=page.locator('[data-sidebar-owner="twitter"] [data-module-sidebar-grip]');
   const savedYoutubePosition=await page.evaluate(()=>localStorage.getItem('keivotos:youtube-sidebar-handle-position'));
@@ -364,17 +406,14 @@ let expectedLostReply=false;
   await search.fill('https://x.com/SavedAuthor/status/734');await page.waitForTimeout(260);
   assert(await download.isVisible());assert(await download.boundingBox().then(box=>box.x+box.width<=320));
   assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
-  await page.getByRole('button',{name:'Downloads',exact:true}).click();await page.getByLabel('Save to',{exact:true}).waitFor();
-  assert(await page.getByRole('complementary',{name:'Twitter downloads'}).boundingBox().then(box=>box.x>=0&&box.x+box.width<=320));
-  await page.screenshot({path:path.join(config.output,'twitter-narrow-downloads.png')});
-  await page.getByRole('button',{name:'Close downloads',exact:true}).click();
-  assert.equal(await page.getByRole('button',{name:'Downloads',exact:true}).evaluate(node=>document.activeElement===node),true);
-  await page.getByRole('button',{name:'Downloads',exact:true}).click();
-  await page.getByRole('button',{name:'Close downloads',exact:true}).press('Escape');
-  assert.equal(await page.getByRole('button',{name:'Downloads',exact:true}).getAttribute('aria-expanded'),'false');
-  assert.equal(await page.getByRole('button',{name:'Downloads',exact:true}).evaluate(node=>document.activeElement===node),true);
+  assert.equal(await page.getByRole('complementary',{name:'Twitter downloads'}).count(),0);
+  await page.screenshot({path:path.join(config.output,'twitter-narrow-feed.png')});
+  await openTwitterSettings();
+  assert(await dialog.getByLabel('Save to',{exact:true}).boundingBox().then(box=>box.x>=0&&box.x+box.width<=320));
+  await page.screenshot({path:path.join(config.output,'twitter-narrow-settings.png')});
+  await closeTwitterSettings();
   await page.setViewportSize({width:1440,height:1000});await search.fill('');
-  check('Twitter reuses the animated movable sidebar grip with independent saved keys; rapid reversal, reload and 320px feed/search/download panel fit without overflow');
+  check('Animated movable sidebar preserves independent keys and rapid reversals; 320px feed/search and Twitter destination settings fit without a Downloads panel');
   await page.unroute('**/api/twitter/library?*',smallPages);
   await page.getByRole('button',{name:'Open Keivotos menu'}).click();await page.locator('.app-drawer').getByRole('button',{name:'Files',exact:true}).click();
 
@@ -395,6 +434,7 @@ let expectedLostReply=false;
   const after=hashes(config.mediaLocal);
   for(const [name,digest] of Object.entries(original))assert.equal(after[name],digest);
   assert.deepEqual(report.errors,[]);
+  assert.deepEqual(report.historyReads,[]);
   check('Reload/disable/re-enable preserve registrations and every original byte; no unexpected browser errors or external request');
   await page.screenshot({path:path.join(config.output,'twitter-archive-settings.png')});
  }catch(error){

@@ -129,11 +129,6 @@ def save_settings(payload: TwitterPreferences):
     return _job_call(jobs.save_preferences, payload.source_id)
 
 
-@router.get('/api/twitter/downloads')
-def downloads(offset: int = Query(0, ge=0), limit: int = Query(120, ge=1, le=240)):
-    return jobs.listing(offset, limit)
-
-
 @router.post('/api/twitter/downloads')
 def download(payload: TwitterDownload):
     return jobs.public(_job_call(jobs.create, payload.url, payload.source_id, payload.request_id))
