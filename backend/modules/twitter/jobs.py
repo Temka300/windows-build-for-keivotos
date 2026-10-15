@@ -221,16 +221,20 @@ def publish(spec, files):
         _, root, forbidden = destination(spec['source_id'], spec['root'])
         spec = {**spec, 'forbidden': [str(p) for p in forbidden]}
         folder = directory(spec)
-        if not isinstance(files, dict) or set(files) != set(archive.ASSET_LIMITS):
-            raise ValueError('Worker did not verify all capture assets')
-        for name, maximum in archive.ASSET_LIMITS.items():
+        limits = archive.asset_limits(files)
+        for name, maximum in limits.items():
             value = files[name]
             target = serving.resolve_served_file(root, folder.relative_to(root).as_posix() + '/' + name, forbidden)
             if (type(value.get('size')) is not int or not 0 < value['size'] <= maximum or
                     not isinstance(value.get('sha256'), str) or not archive.HASH.fullmatch(value['sha256']) or
                     list(archive._identity(target.stat())) != value.get('identity')):
                 raise ValueError('Capture asset changed after worker verification')
-        manifest = {'schema_version': 1, 'complete': True, 'post_id': spec['post_id'],
+        with (folder / 'tweet.json').open('rb') as handle:
+            raw = handle.read(archive.TWEET_LIMIT + 1)
+        tweet = json.loads(raw, object_pairs_hook=archive._unique_object)
+        if len(raw) > archive.TWEET_LIMIT or archive.tweet_asset_limits(tweet) != limits:
+            raise ValueError('Worker photo assets do not match the saved metadata')
+        manifest = {'schema_version': tweet['schema_version'], 'complete': True, 'post_id': spec['post_id'],
                     'capture_id': spec['capture_id'], 'captured_at': spec['captured_at'],
                     'completed_at': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
                     'source_url': spec['url'],
@@ -282,7 +286,7 @@ async def execute(job):
                 failure = str(event.get('error', 'Capture failed'))[:1000]
             elif event.get('event') == 'progress':
                 progress = event.get('progress')
-                if event.get('phase') not in ('metadata', 'avatar', 'video', 'verifying') or type(progress) not in (int, float) or not math.isfinite(progress):
+                if event.get('phase') not in ('metadata', 'avatar', 'video', 'photos', 'verifying') or type(progress) not in (int, float) or not math.isfinite(progress):
                     raise ValueError('Invalid worker progress')
                 try:
                     with _lock, exclusive_tool_operation('recording Twitter progress', wait=False):

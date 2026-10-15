@@ -26,6 +26,277 @@ from modules.twitter import archive, router, jobs, acquisition, helpers
 from tests.browser_twitter_fixture import RAW_TEXT, write_capture, source_response
 
 
+def photo_bytes(extension='jpg', color='red'):
+    from io import BytesIO
+    from PIL import Image
+    output=BytesIO()
+    Image.new('RGB',(73,91),color).save(output,{'jpg':'JPEG','png':'PNG','webp':'WEBP'}[extension])
+    return output.getvalue()
+
+
+@pytest.mark.parametrize('extension', ['jpg', 'png', 'webp'])
+@pytest.mark.parametrize('photo_post', [False, True])
+def test_current_avatar_formats_preserve_bytes_and_serve_matching_mime(catalog, monkeypatch, extension, photo_post):
+    source, media, _, _ = catalog
+    body = photo_bytes(extension)
+    name = 'avatar.' + extension
+    photos = {'photo-1.jpg': photo_bytes()} if photo_post else None
+    path = write_capture(media, avatar=body, photos=photos, avatar_file=name, current_format=True)
+    twitter.adopt(source.source_id); scan(catalog)
+    folder = (media / path).parent
+    spec = {'root': str(media.resolve()), 'path': path, 'forbidden': [],
+            'directory_identity': [folder.stat().st_dev, folder.stat().st_ino]}
+    if photo_post:
+        monkeypatch.setattr(acquisition, 'ffmpeg_executable', lambda: (_ for _ in ()).throw(AssertionError('Photos must not invoke FFmpeg')))
+        verified = acquisition.verify(spec)
+        assert verified[name]['sha256'] == hashlib.sha256(body).hexdigest()
+    item = browse()['items'][0]
+    assert item['avatar_path'].endswith('/' + name) and item['available']
+    response = router.media(Request({'type': 'http', 'headers': []}), source.source_id, path, 'avatar')
+    assert response.media_type == {'jpg':'image/jpeg', 'png':'image/png', 'webp':'image/webp'}[extension]
+    assert Path(response.path).read_bytes() == body
+    assert acquisition.avatar_name(body) == name
+    assert (folder / name).read_bytes() == body
+    before = {file: file.read_bytes() for file in folder.iterdir()}
+    (folder / name).rename(folder / ('preserved-' + name))
+    missing = browse()['items'][0]
+    assert name in missing['unavailable_assets']
+    with pytest.raises(HTTPException) as error:
+        router.media(Request({'type': 'http', 'headers': []}), source.source_id, path, 'avatar')
+    assert error.value.status_code == 404
+    assert all(file.read_bytes() == raw for file, raw in before.items() if file.name != name)
+
+
+@pytest.mark.parametrize('avatar', ['../outside.png', ['avatar.png'], 'avatar.gif', 'avatar.svg'])
+def test_current_avatar_declarations_refuse_unsafe_names(avatar):
+    with pytest.raises(ValueError):
+        archive.tweet_asset_limits({'schema_version':3, 'avatar':avatar, 'media':[{'type':'video','name':'video.mp4'}]})
+
+
+def test_current_avatar_verification_rejects_mislabeled_original_without_rewriting(catalog):
+    _, media, _, _ = catalog
+    body = photo_bytes('png')
+    path = write_capture(media, avatar=body, photos={'photo-1.jpg':photo_bytes()}, current_format=True)
+    folder = (media / path).parent
+    spec = {'root':str(media.resolve()), 'path':path, 'forbidden':[],
+            'directory_identity':[folder.stat().st_dev, folder.stat().st_ino]}
+    with pytest.raises(ValueError, match='bounded static'):
+        acquisition.verify(spec)
+    assert (folder / 'avatar.jpg').read_bytes() == body
+
+
+@pytest.mark.parametrize('body', [b'not an image', photo_bytes('png')[:35]])
+def test_avatar_rejects_corrupt_data(body):
+    with pytest.raises((ValueError, OSError)):
+        acquisition.avatar_name(body)
+
+
+def test_avatar_rejects_animation_and_byte_limit(monkeypatch):
+    from io import BytesIO
+    from PIL import Image
+    output = BytesIO()
+    Image.new('RGB',(20,20),'red').save(output,'PNG',save_all=True,
+        append_images=[Image.new('RGB',(20,20),'blue')],duration=100,loop=0)
+    with pytest.raises(ValueError, match='static'):
+        acquisition.avatar_name(output.getvalue())
+    body = photo_bytes('png')
+    monkeypatch.setitem(archive.ASSET_LIMITS, 'avatar.jpg', len(body)-1)
+    with pytest.raises(ValueError, match='limit'):
+        acquisition.avatar_name(body)
+
+
+def test_avatar_pixel_limit_is_checked_before_decode():
+    import struct, zlib
+    body = photo_bytes('png')
+    header = body[:16] + struct.pack('>II',5001,5000) + body[24:29]
+    body = header + struct.pack('>I', zlib.crc32(header[12:29])) + body[33:]
+    with pytest.raises(ValueError, match='bounded static'):
+        acquisition.avatar_name(body)
+
+
+@pytest.mark.parametrize('empty_list', [False, True])
+def test_text_only_source_preserves_exact_text_without_media(empty_list):
+    source=source_response('999')
+    if empty_list:source['mediaDetails']=[]
+    spec={'post_id':'999','capture_id':'fixture','url':'https://x.com/SavedAuthor/status/999','captured_at':'2026-10-15T12:00:00Z'}
+    tweet, _, downloads=acquisition.record(spec,source)
+    assert tweet['raw_text']==source['text'] and tweet['media']==[] and downloads==[]
+
+
+@pytest.mark.parametrize('media', [None, {}, '', [None], [{'type':'unsupported'}], [{'type':'video'}]])
+def test_text_only_admission_does_not_mask_malformed_media(media):
+    source=source_response('999');source['mediaDetails']=media
+    with pytest.raises(ValueError):
+        acquisition.record({'post_id':'999'},source)
+
+
+@pytest.mark.parametrize('text', ['', ' \t\n', None])
+def test_text_only_source_requires_actual_text(text):
+    source=source_response('999');source['text']=text
+    with pytest.raises(ValueError):
+        acquisition.record({'post_id':'999'},source)
+
+
+def test_text_only_capture_never_downloads_or_verifies_media(catalog,monkeypatch):
+    _, root, _, _=catalog
+    capture_id='20261015T130000000000Z-12345678'
+    folder=root/'captures'/'999'/capture_id;folder.mkdir(parents=True)
+    source=source_response('999');body=photo_bytes('png');requests=[]
+    def remote(url,host,limit):
+        requests.append(host)
+        return json.dumps(source).encode() if host=='cdn.syndication.twimg.com' else body
+    monkeypatch.setattr(acquisition,'read_remote',remote)
+    monkeypatch.setattr(acquisition,'download_video',lambda *args:(_ for _ in ()).throw(AssertionError('Text must not download media')))
+    monkeypatch.setattr(acquisition,'ffmpeg_executable',lambda:(_ for _ in ()).throw(AssertionError('Text must not invoke FFmpeg')))
+    spec={'root':str(root.resolve()),'path':folder.relative_to(root).as_posix()+'/manifest.json','forbidden':[],
+          'directory_identity':[folder.stat().st_dev,folder.stat().st_ino],
+          'url':'https://x.com/SavedAuthor/status/999','post_id':'999','capture_id':capture_id,
+          'captured_at':'2026-10-15T13:00:00Z'}
+    files=acquisition.capture(spec,lambda *args:None)
+    assert set(files)=={'source.json','tweet.json','avatar.png'}
+    assert requests==['cdn.syndication.twimg.com','pbs.twimg.com']
+    assert json.loads((folder/'tweet.json').read_text(encoding='utf-8'))['raw_text']==source['text']
+
+
+def test_text_only_archive_lists_searches_and_preserves_legacy_readers(catalog):
+    source,media,_,_=catalog
+    path=write_capture(media,text='Exact 한글\ntext  ',photos={},avatar=photo_bytes(),current_format=True)
+    write_capture(media,1,photos={'photo-1.jpg':photo_bytes()},avatar=photo_bytes())
+    write_capture(media,2,avatar=photo_bytes())
+    twitter.adopt(source.source_id);scan(catalog)
+    items=browse()['items'];assert len(items)==3
+    text=next(item for item in items if item['path']==path)
+    assert text['video_path'] is None and text['photos']==[] and text['available']
+    assert text['raw_text']=='Exact 한글\ntext  '
+    assert browse(query='Exact')['items']==[text]
+    assert router.capture(source.source_id,path)==text
+    with pytest.raises(HTTPException) as error:
+        router.media(Request({'type':'http','headers':[]}),source.source_id,path,'video')
+    assert error.value.status_code==404
+    for version in (1,2):
+        with pytest.raises(ValueError):
+            archive.asset_limits(dict.fromkeys(('source.json','tweet.json','avatar.jpg')),version)
+
+
+@pytest.mark.parametrize('text', ['', ' \n', None])
+def test_text_only_metadata_refuses_blank_or_absent_text(text):
+    with pytest.raises(ValueError):
+        archive.tweet_asset_limits({'schema_version':3,'avatar':'avatar.jpg','media':[],'raw_text':text})
+
+
+@pytest.mark.parametrize('count',[1,2,3,4])
+def test_photo_capture_verifies_original_bytes_order_and_formats(catalog,monkeypatch,count):
+    source,media,_,_=catalog
+    formats=('jpg','png','webp','jpg')
+    photos={f'photo-{number}.{formats[number-1]}':photo_bytes(formats[number-1]) for number in range(1,count+1)}
+    path=write_capture(media,photos=photos,avatar=photo_bytes())
+    twitter.adopt(source.source_id);scan(catalog)
+    folder=(media/path).parent
+    spec={'root':str(media.resolve()),'path':path,'forbidden':[],
+          'directory_identity':[folder.stat().st_dev,folder.stat().st_ino]}
+    monkeypatch.setattr(acquisition,'ffmpeg_executable',lambda: (_ for _ in ()).throw(AssertionError('Photos must not invoke FFmpeg')))
+    verified=acquisition.verify(spec)
+    item=browse()['items'][0]
+    assert item['video_path'] is None
+    assert [value['name'] for value in item['photos']]==list(photos)
+    for number,(name,body) in enumerate(photos.items(),1):
+        assert (folder/name).read_bytes()==body
+        assert verified[name]['sha256']==hashlib.sha256(body).hexdigest()
+        response=router.media(Request({'type':'http','headers':[]}),source.source_id,path,'photo',number)
+        assert Path(response.path).read_bytes()==body
+    with pytest.raises(HTTPException) as error:
+        router.media(Request({'type':'http','headers':[]}),source.source_id,path,'video')
+    assert error.value.status_code==404
+    if count<4:
+        with pytest.raises(HTTPException) as error:
+            router.media(Request({'type':'http','headers':[]}),source.source_id,path,'photo',count+1)
+        assert error.value.status_code==404
+
+
+@pytest.mark.parametrize('change',[
+    lambda tweet:tweet['media'].reverse(),
+    lambda tweet:tweet['media'].append(tweet['media'][0]),
+    lambda tweet:tweet['media'][0].update(name='../outside.jpg'),
+    lambda tweet:tweet['media'][0].update(name=['photo-1.jpg']),
+    lambda tweet:tweet['media'][0].update(type='video'),
+])
+def test_photo_manifest_rejects_inconsistent_media(catalog,change):
+    source,media,_,_=catalog
+    path=write_capture(media,photos={'photo-1.jpg':photo_bytes(),'photo-2.png':photo_bytes('png')},avatar=photo_bytes())
+    twitter.adopt(source.source_id);scan(catalog)
+    target=media/path.replace('manifest.json','tweet.json')
+    rewrite(target,change)
+    rewrite(media/path,lambda manifest:manifest['files']['tweet.json'].update(size=target.stat().st_size,sha256=hashlib.sha256(target.read_bytes()).hexdigest()))
+    assert browse()['items']==[]
+
+
+@pytest.mark.parametrize('body',[b'not an image',photo_bytes('png'),photo_bytes()[:75]])
+def test_photo_decode_failure_keeps_original_bytes_unpublished(catalog,body):
+    _,media,_,_=catalog
+    path=write_capture(media,photos={'photo-1.jpg':body},avatar=photo_bytes())
+    folder=(media/path).parent
+    spec={'root':str(media.resolve()),'path':path,'forbidden':[],
+          'directory_identity':[folder.stat().st_dev,folder.stat().st_ino]}
+    before={file:file.read_bytes() for file in folder.iterdir()}
+    with pytest.raises((ValueError,OSError)):
+        acquisition.verify(spec)
+    assert all(file.read_bytes()==raw for file,raw in before.items())
+
+
+def test_photo_source_original_url_and_unsupported_hosts():
+    value=source_response('888')
+    spec={'post_id':'888','capture_id':'fixture','url':'https://x.com/SavedAuthor/status/888','captured_at':'2026-10-11T12:00:00Z'}
+    tweet,_,urls=acquisition.record(spec,value)
+    assert tweet['schema_version']==3
+    assert len(urls)==4 and all(url.endswith('?name=orig') for _,url in urls)
+    assert [name for name,_ in urls]==[f'photo-{number}.jpg' for number in range(1,5)]
+    for url in ('https://evil.invalid/a.jpg','https://pbs.twimg.com/media/a.svg','https://pbs.twimg.com/media/a.jpg?name=small'):
+        value['mediaDetails'][0]['media_url_https']=url
+        with pytest.raises(ValueError):acquisition.record(spec,value)
+
+
+@pytest.mark.parametrize('photos',[['photo-2.jpg'],['photo-1.jpg','photo-1.png'],['photo-1.jpg','video.mp4']])
+def test_photo_assets_refuse_gaps_duplicate_slots_and_mixed_video(photos):
+    assets={name:None for name in ('source.json','tweet.json','avatar.jpg',*photos)}
+    with pytest.raises(ValueError):archive.asset_limits(assets,2)
+
+
+@pytest.mark.parametrize('bound',['pixels','bytes'])
+def test_photo_limits_refuse_before_decode_and_preserve_bytes(catalog,monkeypatch,bound):
+    import struct,zlib
+    _,media,_,_=catalog
+    body=photo_bytes('png')
+    if bound=='pixels':
+        header=body[:16]+struct.pack('>II',5001,5000)+body[24:29]
+        body=header+struct.pack('>I',zlib.crc32(header[12:29]))+body[33:]
+    else:
+        monkeypatch.setitem(archive.PHOTO_LIMITS,'photo-1.png',len(body)-1)
+    path=write_capture(media,photos={'photo-1.png':body},avatar=photo_bytes())
+    folder=(media/path).parent
+    spec={'root':str(media.resolve()),'path':path,'forbidden':[],
+          'directory_identity':[folder.stat().st_dev,folder.stat().st_ino]}
+    with pytest.raises(ValueError,match='bounded|oversized'):acquisition.verify(spec)
+    assert (folder/'photo-1.png').read_bytes()==body
+
+
+def test_missing_photo_and_hidden_owner_preserve_the_snapshot(catalog):
+    source,media,_,connect=catalog
+    path=write_capture(media,photos={'photo-1.jpg':photo_bytes()},avatar=photo_bytes())
+    twitter.adopt(source.source_id);scan(catalog)
+    photo=media/path.replace('manifest.json','photo-1.jpg')
+    photo.rename(photo.with_name('preserved-photo.jpg'))
+    item=browse()['items'][0]
+    assert item['unavailable_assets']==['photo-1.jpg'] and not item['available']
+    with pytest.raises(HTTPException) as error:
+        router.media(Request({'type':'http','headers':[]}),source.source_id,path,'photo',1)
+    assert error.value.status_code==404
+    with connect() as db:
+        db.execute('UPDATE files_sources SET visible=0 WHERE source_id=?',(source.source_id,));db.commit()
+    with pytest.raises(HTTPException) as error:
+        router.media(Request({'type':'http','headers':[]}),source.source_id,path,'photo',1)
+    assert error.value.status_code==404
+
+
 @pytest.fixture
 def catalog(tmp_path, monkeypatch):
     home = tmp_path / 'home'
@@ -529,6 +800,8 @@ def test_user_backup_retains_role_without_originals_or_extra_artifact(catalog, t
     import backup_bundle
     source, media, _, _ = catalog
     write_capture(media)
+    write_capture(media,1,photos={'photo-1.jpg':photo_bytes()},avatar=photo_bytes())
+    original={file:hashlib.sha256(file.read_bytes()).hexdigest() for file in media.rglob('*') if file.is_file()}
     twitter.adopt(source.source_id)
     components = dict(backup_bundle.COMPONENTS)
     components['user_database'] = ('databases/user.sqlite', config.USER_DB_PATH)
@@ -543,6 +816,7 @@ def test_user_backup_retains_role_without_originals_or_extra_artifact(catalog, t
         snapshot.write_bytes(bundle.read('databases/user.sqlite'))
     with sqlite3.connect(snapshot) as connection:
         assert connection.execute('SELECT role FROM files_sources WHERE source_id=?', (source.source_id,)).fetchone()[0] == 'twitter'
+    assert all(hashlib.sha256(file.read_bytes()).hexdigest()==digest for file,digest in original.items())
 
 
 def job_count(catalog):
@@ -714,7 +988,9 @@ def test_normalization_preserves_exact_text_and_optional_author_id():
     assert tweet['raw_text'] == RAW_TEXT and tweet['author']['id'] is None and tweet['posted_at'] is None
 
 
-def test_real_helper_download_verify_publish_and_local_registration_retry(catalog, monkeypatch, tmp_path):
+@pytest.mark.parametrize('post_kind', ['video', 'photo', 'text'])
+@pytest.mark.parametrize('avatar_extension', ['jpg', 'png', 'webp'])
+def test_real_helper_download_verify_publish_and_local_registration_retry(catalog, monkeypatch, tmp_path, post_kind, avatar_extension):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     import threading
     from io import BytesIO
@@ -723,9 +999,17 @@ def test_real_helper_download_verify_publish_and_local_registration_retry(catalo
     generated = tmp_path / 'video.mp4'
     subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), '-v', 'error', '-f', 'lavfi', '-i', 'color=blue:s=48x48:r=4',
                     '-t', '0.5', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', str(generated)], check=True, timeout=30)
-    avatar = BytesIO(); Image.new('RGB', (24, 24), 'blue').save(avatar, 'JPEG')
+    avatar = BytesIO(); Image.new('RGB', (24, 24), 'blue').save(avatar, {'jpg':'JPEG','png':'PNG','webp':'WEBP'}[avatar_extension])
     bodies = {'/source.json': json.dumps(source_response(), ensure_ascii=False).encode('utf-8'),
               '/avatar.jpg': avatar.getvalue(), '/video.mp4': generated.read_bytes()}
+    if post_kind == 'photo':
+        value=source_response('888');value['id_str']='333'
+        bodies['/source.json']=json.dumps(value,ensure_ascii=False).encode('utf-8')
+        bodies.update({f'/photo-{number}.jpg':photo_bytes() for number in range(1,5)})
+    elif post_kind == 'text':
+        value=source_response('999');value['id_str']='333'
+        bodies['/source.json']=json.dumps(value,ensure_ascii=False).encode('utf-8')
+    expected_text=json.loads(bodies['/source.json'])['text']
     requests = []
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args): pass
@@ -764,7 +1048,7 @@ def test_real_helper_download_verify_publish_and_local_registration_retry(catalo
         manifest = json.loads(path.read_text(encoding='utf-8'))
         for name, facts in manifest['files'].items():
             assert hashlib.sha256((path.parent / name).read_bytes()).hexdigest() == facts['sha256']
-        assert json.loads((path.parent / 'tweet.json').read_text(encoding='utf-8'))['raw_text'] == RAW_TEXT
+        assert json.loads((path.parent / 'tweet.json').read_text(encoding='utf-8'))['raw_text'] == expected_text
         monkeypatch.setattr(index, 'scan_source', original_scan)
         jobs.update(job['id'], status='failed')
         jobs.retry(job['id'], uuid4())
@@ -782,8 +1066,19 @@ def test_real_helper_download_verify_publish_and_local_registration_retry(catalo
         asyncio.run(recover_registration())
         assert jobs.get(job['id'])['status'] == 'complete'
         assert original == {p: p.read_bytes() for p in original}
-        assert browse()['items'][0]['raw_text'] == RAW_TEXT
-        assert requests.count('/source.json?id=333') == 1 and '/video.mp4' in requests
+        assert browse()['items'][0]['raw_text'] == expected_text
+        assert browse()['items'][0]['avatar_path'].endswith('/avatar.'+avatar_extension)
+        assert requests.count('/source.json?id=333') == 1
+        if post_kind == 'photo':
+            assert '/video.mp4' not in requests
+            assert all(f'/photo-{number}.jpg' in requests for number in range(1,5))
+            assert len(browse()['items'][0]['photos'])==4
+        elif post_kind == 'video':
+            assert '/video.mp4' in requests
+        else:
+            assert '/video.mp4' not in requests and not any('/photo-' in path for path in requests)
+            item=browse()['items'][0]
+            assert item['video_path'] is None and item['photos']==[] and item['available']
         repeated = new_job(catalog)
         jobs.update(repeated['id'], status='running')
         asyncio.run(jobs.execute(repeated))
@@ -826,7 +1121,9 @@ def test_live_worker_stop_preserves_partial_files_and_reaps_child(catalog, monke
             else:
                 runner.cancel()
             for _ in range(100):
-                if launched[0].returncode is not None: break
+                # Process exit precedes the supervisor's durable acknowledgement.
+                # Cancelling it in that gap tests shutdown instead of source loss.
+                if launched[0].returncode is not None and (action != 'source' or jobs.get(job['id'])['status'] == 'failed'): break
                 await asyncio.sleep(.05)
             assert launched[0].returncode is not None
             assert partial.read_bytes() == b'preserved partial'

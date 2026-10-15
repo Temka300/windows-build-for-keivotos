@@ -58,9 +58,19 @@ def capture(source_id: str = Query(..., max_length=256), path: str = Query(..., 
 
 @router.get('/api/twitter/media')
 def media(request: Request, source_id: str = Query(..., max_length=256),
-          path: str = Query(..., max_length=4096), asset: Literal['avatar', 'video'] = Query(...)):
+          path: str = Query(..., max_length=4096), asset: Literal['avatar', 'video', 'photo'] = Query(...),
+          photo: int = Query(1, ge=1, le=4)):
     item = capture(source_id, path)
-    name = 'avatar.jpg' if asset == 'avatar' else 'video.mp4'
+    if asset == 'photo':
+        selected = next((value for value in item['photos'] if value['index'] == photo), None)
+        if selected is None:
+            raise HTTPException(404, 'Twitter photo is unavailable')
+        name, media_path = selected['name'], selected['path']
+    else:
+        name = item['avatar_path'].rsplit('/', 1)[-1] if asset == 'avatar' else 'video.mp4'
+        media_path = item[f'{asset}_path']
+        if not media_path:
+            raise HTTPException(404, 'Twitter media is unavailable')
     if name in item['unavailable_assets']:
         raise HTTPException(404, 'Twitter media is unavailable')
     # Reconcile the owner again after reading metadata; streaming never delegates
@@ -68,7 +78,7 @@ def media(request: Request, source_id: str = Query(..., max_length=256),
     registered = registered_sources()
     source = require_source(registered, source_id)
     try:
-        resolved = serving.resolve_served_file(source.path, item[f'{asset}_path'],
+        resolved = serving.resolve_served_file(source.path, media_path,
                                                archive.forbidden_roots(source, registered, config.SUITE_HOME))
         file_size = resolved.stat().st_size
         if file_size != item['files'][name]['size']:

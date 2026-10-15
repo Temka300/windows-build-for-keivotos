@@ -19,6 +19,9 @@ TWEET_LIMIT = 1024 * 1024
 PAGE_BYTE_LIMIT = 4 * 1024 * 1024
 ASSET_LIMITS = {'source.json': 4 * 1024 * 1024, 'tweet.json': TWEET_LIMIT,
                 'avatar.jpg': 10 * 1024 * 1024, 'video.mp4': 4 * 1024 ** 3}
+PHOTO_LIMITS = {f'photo-{number}.{extension}': 32 * 1024 * 1024
+                for number in range(1, 5) for extension in ('jpg', 'png', 'webp')}
+AVATAR_LIMITS = {f'avatar.{extension}': ASSET_LIMITS['avatar.jpg'] for extension in ('jpg', 'png', 'webp')}
 POST_ID = r'[1-9][0-9]{0,21}'
 HANDLE = r'[A-Za-z0-9_]{1,64}'
 CAPTURE_ID = r'[0-9]{8}T[0-9]{12}Z-[a-f0-9]{8}'
@@ -33,6 +36,90 @@ class InvalidCapture(ValueError):
 
 class PageFull(Exception):
     """The next record belongs to the next bounded page."""
+
+
+def _current_asset_limits(files):
+    avatars = set(files) & set(AVATAR_LIMITS)
+    if len(avatars) != 1:
+        raise InvalidCapture('Capture must declare exactly one supported avatar')
+    avatar = next(iter(avatars))
+    base = {'source.json': ASSET_LIMITS['source.json'], 'tweet.json': TWEET_LIMIT,
+            avatar: AVATAR_LIMITS[avatar]}
+    media = set(files) - set(base)
+    if not set(base) <= set(files):
+        raise InvalidCapture('Capture metadata assets are missing')
+    if not media:
+        return base
+    if media == {'video.mp4'}:
+        return {**base, 'video.mp4': ASSET_LIMITS['video.mp4']}
+    if not 1 <= len(media) <= 4 or not media <= set(PHOTO_LIMITS):
+        raise InvalidCapture('Capture media assets are invalid')
+    ordered = sorted(media)
+    if [int(name.split('-')[1].split('.')[0]) for name in ordered] != list(range(1, len(media) + 1)):
+        raise InvalidCapture('Capture photos are not in their original order')
+    return {**base, **{name: PHOTO_LIMITS[name] for name in ordered}}
+
+
+def asset_limits(files, version=None):
+    """Admit legacy video or one to four consecutively numbered photo assets."""
+    if not isinstance(files, dict):
+        raise InvalidCapture('Capture assets are invalid')
+    if version == 3 or version is None and (set(files) & (set(AVATAR_LIMITS) - {'avatar.jpg'}) or
+                                           set(files) == {'source.json', 'tweet.json', 'avatar.jpg'}):
+        return _current_asset_limits(files)
+    if set(files) == set(ASSET_LIMITS) and version in (None, 1):
+        return ASSET_LIMITS.copy()
+    base = {name: maximum for name, maximum in ASSET_LIMITS.items() if name != 'video.mp4'}
+    photos = set(files) - set(base)
+    if version not in (None, 2) or not set(base) <= set(files) or not 1 <= len(photos) <= 4 or not photos <= set(PHOTO_LIMITS):
+        raise InvalidCapture('Capture assets are invalid')
+    ordered = sorted(photos)
+    if [int(name.split('-')[1].split('.')[0]) for name in ordered] != list(range(1, len(photos) + 1)):
+        raise InvalidCapture('Capture photos are not in their original order')
+    return {**base, **{name: PHOTO_LIMITS[name] for name in ordered}}
+
+
+def tweet_asset_limits(tweet):
+    if not isinstance(tweet, dict) or type(tweet.get('schema_version')) is not int:
+        raise InvalidCapture('Tweet metadata has invalid format')
+    if tweet['schema_version'] == 1:
+        return ASSET_LIMITS.copy()
+    if tweet['schema_version'] == 3:
+        avatar = tweet.get('avatar')
+        media = tweet.get('media')
+        if not isinstance(avatar, str) or avatar not in AVATAR_LIMITS or not isinstance(media, list) or not 0 <= len(media) <= 4:
+            raise InvalidCapture('Tweet metadata has invalid avatar or media')
+        if not media and (not isinstance(tweet.get('raw_text'), str) or not tweet['raw_text'].strip()):
+            raise InvalidCapture('Text-only capture has no post text')
+        names = []
+        for item in media:
+            if not isinstance(item, dict) or not isinstance(item.get('name'), str):
+                raise InvalidCapture('Tweet metadata has invalid media')
+            name = item['name']
+            if not (item.get('type') == 'video' and name == 'video.mp4' or
+                    item.get('type') == 'photo' and name in PHOTO_LIMITS):
+                raise InvalidCapture('Tweet metadata has unsupported media')
+            names.append(name)
+        files = dict.fromkeys(['source.json', 'tweet.json', avatar, *names])
+        limits = asset_limits(files, 3)
+        if names != [name for name in limits if name == 'video.mp4' or name in PHOTO_LIMITS]:
+            raise InvalidCapture('Tweet metadata has inconsistent media order')
+        return limits
+    media = tweet.get('media')
+    if tweet['schema_version'] != 2 or not isinstance(media, list) or not 1 <= len(media) <= 4:
+        raise InvalidCapture('Tweet metadata has invalid photos')
+    names = []
+    for item in media:
+        if (not isinstance(item, dict) or item.get('type') != 'photo' or
+                not isinstance(item.get('name'), str) or item['name'] not in PHOTO_LIMITS):
+            raise InvalidCapture('Tweet metadata has invalid photos')
+        names.append(item['name'])
+    files = {name: None for name in ASSET_LIMITS if name != 'video.mp4'}
+    files.update({name: None for name in names})
+    limits = asset_limits(files, 2)
+    if names != [name for name in limits if name in PHOTO_LIMITS]:
+        raise InvalidCapture('Tweet metadata has inconsistent photo order')
+    return limits
 
 
 class ReadBudget:
@@ -150,7 +237,7 @@ def capture(source, registered, suite_home, path, budget=None):
     forbidden = forbidden_roots(source, registered, suite_home)
     budget = budget or ReadBudget()
     manifest, _ = _read_json(source, path, forbidden, MANIFEST_LIMIT, budget)
-    if (type(manifest.get('schema_version')) is not int or manifest['schema_version'] != 1 or
+    if (type(manifest.get('schema_version')) is not int or manifest['schema_version'] not in (1, 2, 3) or
             manifest.get('complete') is not True or manifest.get('post_id') != post_id or
             manifest.get('capture_id') != capture_id):
         raise InvalidCapture('Capture is incomplete or has inconsistent identity')
@@ -164,9 +251,8 @@ def capture(source, registered, suite_home, path, budget=None):
     if url_id != post_id:
         raise InvalidCapture('Source URL does not match the post')
     assets = manifest.get('files')
-    if not isinstance(assets, dict) or set(assets) != set(ASSET_LIMITS):
-        raise InvalidCapture('Capture assets are invalid')
-    for name, maximum in ASSET_LIMITS.items():
+    limits = asset_limits(assets, manifest['schema_version'])
+    for name, maximum in limits.items():
         asset = assets[name]
         if (not isinstance(asset, dict) or type(asset.get('size')) is not int or
                 not 0 < asset['size'] <= maximum or not isinstance(asset.get('sha256'), str) or
@@ -176,11 +262,13 @@ def capture(source, registered, suite_home, path, budget=None):
     tweet, raw = _read_json(source, f'{parent}/tweet.json', forbidden, TWEET_LIMIT, budget)
     if len(raw) != assets['tweet.json']['size'] or hashlib.sha256(raw).hexdigest() != assets['tweet.json']['sha256']:
         raise InvalidCapture('Tweet metadata does not match its manifest')
-    if (type(tweet.get('schema_version')) is not int or tweet['schema_version'] != 1 or
+    if (type(tweet.get('schema_version')) is not int or tweet['schema_version'] != manifest['schema_version'] or
             tweet.get('tweet_id') != post_id or tweet.get('capture_id') != capture_id or
             tweet.get('captured_at') != manifest['captured_at'] or
             canonical_url(tweet.get('source_url')) != (source_url, post_id)):
         raise InvalidCapture('Tweet metadata has inconsistent identity')
+    if tweet_asset_limits(tweet) != limits:
+        raise InvalidCapture('Tweet media does not match its manifest')
     author = tweet.get('author')
     if not isinstance(author, dict):
         raise InvalidCapture('Invalid captured author')
@@ -209,7 +297,10 @@ def capture(source, registered, suite_home, path, budget=None):
             'posted_at': posted_at, 'raw_text': text,
             'author': {'id': author_id, 'name': author_name, 'handle': handle},
             'author_key': f'id:{author_id}' if author_id else f'handle:{handle.casefold()}',
-            'avatar_path': f'{parent}/avatar.jpg', 'video_path': f'{parent}/video.mp4',
+            'avatar_path': f'{parent}/{next(name for name in limits if name in AVATAR_LIMITS)}',
+            'video_path': f'{parent}/video.mp4' if 'video.mp4' in assets else None,
+            'photos': [{'index': number, 'path': f'{parent}/{name}', 'name': name}
+                       for number, name in enumerate((name for name in limits if name in PHOTO_LIMITS), 1)],
             'files': {name: {'size': asset['size'], 'sha256': asset['sha256']} for name, asset in assets.items()},
             'available': not unavailable, 'unavailable_assets': unavailable}
 

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import {twitterApi,type Capture} from './api';
+  import {twitterApi,avatarUnavailable,type Capture} from './api';
   export let items:Capture[]=[];
   export let onOpen:(item:Capture,event:MouseEvent)=>void;
   $: authors=[...new Map([...items].reverse().map(item=>[item.author_key,item])).values()].sort((a,b)=>b.capture_id.localeCompare(a.capture_id));
@@ -7,7 +7,7 @@
 <div class="authors" aria-label="Saved authors">
   {#each authors as item (item.author_key)}
     <button class="author" data-twitter-author={item.author_key} on:click={event=>onOpen(item,event)}>
-      <span class="avatar">{item.author.name.slice(0,1)}{#if !item.unavailable_assets.includes('avatar.jpg')}<img alt="" loading="lazy" src={twitterApi.mediaUrl(item,'avatar')}/>{/if}</span>
+      <span class="avatar">{item.author.name.slice(0,1)}{#if !avatarUnavailable(item)}<img alt="" loading="lazy" src={twitterApi.mediaUrl(item,'avatar')}/>{/if}</span>
       <span class="name"><strong>{item.author.name}</strong><span>@{item.author.handle}</span></span>
       <span aria-hidden="true">›</span>
     </button>

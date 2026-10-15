@@ -4,7 +4,7 @@ export interface Capture {
   source_id:string;source_name:string;path:string;post_id:string;capture_id:string;
   source_url:string;captured_at:string;completed_at:string;posted_at:string|null;raw_text:string;
   author:{id:string|null;name:string;handle:string};author_key:string;
-  avatar_path:string;video_path:string;available:boolean;unavailable_assets:string[];
+  avatar_path:string;video_path:string|null;photos:{index:number;path:string;name:string}[];available:boolean;unavailable_assets:string[];
   files:Record<string,{size:number;sha256:string}>;
 }
 export interface ArchivePage {items:Capture[];total:number;next_offset:number|null;invalid:number;}
@@ -17,6 +17,7 @@ export interface Download {
   created_at:string;updated_at:string;
 }
 export const captureKey=(item:Capture)=>item.source_id+':'+item.path;
+export const avatarUnavailable=(item:Capture)=>item.unavailable_assets.includes(item.avatar_path.slice(item.avatar_path.lastIndexOf('/')+1));
 export function postUrl(value:string):string|null {
   const raw=value.trim();
   if(!raw||raw.length>2048||/[\x00-\x20\\]/.test(raw))return null;
@@ -33,7 +34,7 @@ export const twitterApi={
   saveSettings:(source_id:string)=>post<Preferences>('/twitter/settings',{source_id}),
   library:(offset=0,q='',author='',signal?:AbortSignal)=>get<ArchivePage>('/twitter/library',{offset,limit:120,q,author},signal),
   capture:(source_id:string,path:string,signal?:AbortSignal)=>get<Capture>('/twitter/capture',{source_id,path},signal),
-  mediaUrl:(item:Capture,asset:'avatar'|'video')=>'/api/twitter/media?'+new URLSearchParams({source_id:item.source_id,path:item.path,asset}),
+  mediaUrl:(item:Capture,asset:'avatar'|'video'|'photo',photo=1)=>'/api/twitter/media?'+new URLSearchParams({source_id:item.source_id,path:item.path,asset,...(asset==='photo'?{photo:String(photo)}:{})}),
   job:(id:string,signal?:AbortSignal)=>get<Download>(`/twitter/downloads/${encodeURIComponent(id)}`,undefined,signal),
   download:(url:string,source_id:string,request_id:string)=>post<Download>('/twitter/downloads',{url,source_id,request_id}),
 };

@@ -12,7 +12,8 @@ RAW_TEXT = '  한글 世界\nline two \t\n'
 
 
 def write_capture(root: Path, number=0, *, post_id=None, text=RAW_TEXT,
-                  author_id='123', handle='SavedAuthor', video=b'generated-video', avatar=b'generated-avatar'):
+                  author_id='123', handle='SavedAuthor', video=b'generated-video', avatar=b'generated-avatar', photos=None,
+                  avatar_file='avatar.jpg', current_format=False):
     captured = datetime(2026, 10, 11, 12, tzinfo=timezone.utc) + timedelta(seconds=number)
     stamp = captured.isoformat().replace('+00:00', 'Z')
     capture_id = captured.strftime('%Y%m%dT%H%M%S%fZ') + f'-{number:08x}'
@@ -26,13 +27,23 @@ def write_capture(root: Path, number=0, *, post_id=None, text=RAW_TEXT,
              'raw_text': text, 'author': {'id': author_id, 'name': 'Saved author 이름', 'handle': handle}}
     records = {'source.json': b'{"fixture":"original raw response"}\n',
                'tweet.json': (json.dumps(tweet, ensure_ascii=False) + '\n').encode('utf-8'),
-               'avatar.jpg': avatar, 'video.mp4': video}
+               avatar_file: avatar, 'video.mp4': video}
+    if photos is not None:
+        tweet.update(schema_version=2, media=[{'type': 'photo', 'name': name} for name in photos])
+        records.pop('video.mp4')
+        records.update(photos)
+        records['tweet.json']=(json.dumps(tweet, ensure_ascii=False)+'\n').encode('utf-8')
+    if current_format:
+        tweet.update(schema_version=3, avatar=avatar_file,
+                     media=tweet.get('media', [{'type':'video','name':'video.mp4'}]))
+        records['tweet.json']=(json.dumps(tweet, ensure_ascii=False)+'\n').encode('utf-8')
     for name, data in records.items():
         (directory / name).write_bytes(data)
     manifest = {'schema_version': 1, 'post_id': post_id, 'capture_id': capture_id,
                 'source_url': url, 'captured_at': stamp, 'completed_at': stamp, 'complete': True,
                 'files': {name: {'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
                           for name, data in records.items()}}
+    manifest['schema_version']=tweet['schema_version']
     (directory / 'manifest.json').write_text(json.dumps(manifest) + '\n', encoding='utf-8')
     return f'{relative}/manifest.json'
 
@@ -58,11 +69,17 @@ def seed_twitter(media: Path):
 
 
 def source_response(post_id='333'):
-    return {'id_str': post_id, 'text': RAW_TEXT, 'created_at': '2026-10-10T12:00:00Z',
+    value = {'id_str': post_id, 'text': RAW_TEXT, 'created_at': '2026-10-10T12:00:00Z',
             'user': {'id_str': '123', 'name': 'Saved author 이름', 'screen_name': 'SavedAuthor',
                      'profile_image_url_https': 'https://pbs.twimg.com/generated.jpg'},
             'mediaDetails': [{'type': 'video', 'video_info': {'variants': [
                 {'content_type': 'video/mp4', 'bitrate': 128000, 'url': 'https://video.twimg.com/generated.mp4'}]}}]}
+    if post_id=='888':
+        value['mediaDetails']=[{'type':'photo','media_url_https':f'https://pbs.twimg.com/media/generated-{number}.jpg'} for number in range(1,5)]
+    if post_id=='999':
+        value.pop('mediaDetails')
+        value['text']='Text-only fixture 한글\nline two  '
+    return value
 
 
 def fixture_worker(endpoint):
@@ -82,7 +99,9 @@ def fixture_worker(endpoint):
     def read(url, host, limit):
         acquisition.remote_url(url, host)
         post_id = parse_qs(urlsplit(url).query).get('id', ['333'])[0]
-        path = '/source.json?id=' + post_id if host == 'cdn.syndication.twimg.com' else '/avatar.jpg'
+        if host == 'cdn.syndication.twimg.com': path='/source.json?id='+post_id
+        elif urlsplit(url).path.startswith('/media/generated-'): path='/photo-'+urlsplit(url).path.split('generated-')[1]
+        else: path='/avatar.jpg'
         with urlopen(endpoint + path, timeout=10) as response:
             data = response.read(limit + 1)
         if not data or len(data) > limit:
@@ -119,13 +138,17 @@ def install(media):
     from modules.twitter import jobs
     first = sorted((media / 'captures').glob('*/*/avatar.jpg'))[0]
     avatar, video = first.read_bytes(), (media / 'generated.mp4').read_bytes()
-    state = {'fail': False, 'delay': 0, 'source_requests': 0, 'video_requests': 0}
+    photos={}
+    for number,color in enumerate(('red','blue','green','yellow'),1):
+        picture=BytesIO();Image.new('RGB',(80+number*8,96),color).save(picture,'JPEG')
+        photos[f'/photo-{number}.jpg']=picture.getvalue()
+    state = {'fail': False, 'delay': 0, 'source_requests': 0, 'video_requests': 0, 'avatar_format': 'jpg'}
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args): pass
         def do_POST(self):
             assert self.path == '/control'
             value = json.loads(self.rfile.read(int(self.headers.get('Content-Length', '0'))))
-            state.update({key: value[key] for key in ('fail', 'delay') if key in value})
+            state.update({key: value[key] for key in ('fail', 'delay', 'avatar_format') if key in value})
             self.respond(json.dumps(state).encode(), 'application/json')
         def do_HEAD(self): self.get(False)
         def do_GET(self): self.get(True)
@@ -138,9 +161,15 @@ def install(media):
                 time.sleep(min(5, max(0, state['delay'])))
                 post_id = parse_qs(url.query).get('id', ['333'])[0]
                 value = source_response(post_id)
-                if state['fail']: value['mediaDetails'] = []
+                if state['fail']: value['mediaDetails'] = [{'type':'unsupported'}]
                 self.respond(json.dumps(value, ensure_ascii=False).encode('utf-8'), 'application/json', body)
-            elif url.path == '/avatar.jpg': self.respond(avatar, 'image/jpeg', body)
+            elif url.path == '/avatar.jpg':
+                if state['avatar_format'] == 'png':
+                    image=BytesIO();Image.new('RGB',(48,48),'purple').save(image,'PNG')
+                    self.respond(image.getvalue(),'image/png',body)
+                else:
+                    self.respond(avatar, 'image/jpeg', body)
+            elif url.path in photos: self.respond(photos[url.path], 'image/jpeg', body)
             elif url.path == '/video.mp4':
                 state['video_requests'] += 1
                 self.respond(video, 'video/mp4', body)
