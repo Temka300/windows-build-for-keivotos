@@ -45,7 +45,18 @@ def verify_artifact(directory: Path, commit: str, target: str) -> list[Path]:
     version = manifest.get("version", "")
     if not re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}[A-Za-z0-9._-]*", version):
         raise RuntimeError("Invalid version in artifact manifest")
-    archive = directory / f"Keivotos-V{version}-{target}-x64.zip"
+    formats = manifest.get('archive_formats', ['zip'])
+    if formats not in (["zip"], ["tar.gz", "zip"]) or target != 'linux' and formats != ['zip']:
+        raise RuntimeError('Unsupported archive formats in artifact manifest')
+    result = []
+    for extension in formats:
+        archive = directory / f"Keivotos-V{version}-{target}-x64.{extension}"
+        result.extend(verify_checksum(archive))
+    return result
+
+
+def verify_checksum(archive: Path) -> list[Path]:
+    directory = archive.parent
     checksum = directory / (archive.name + ".sha256")
     fields = checksum.read_text(encoding="utf-8-sig").strip().split(maxsplit=1)
     if len(fields) != 2 or fields[1] != archive.name or not re.fullmatch(r"[0-9a-fA-F]{64}", fields[0]):

@@ -69,7 +69,7 @@ jobs:
         run: ./scripts/release/build_windows.ps1 -Target windows
       - name: Record artifact provenance
         run: |
-          uv run --locked python -c 'import json,os; from pathlib import Path; from backend.product import VERSION; Path("artifacts/build-manifest.json").write_text(json.dumps(dict(commit=os.environ["BUILD_COMMIT"],target=os.environ["BUILD_TARGET"],version=VERSION)))'
+          uv run --locked python -c 'import json,os; from pathlib import Path; from backend.product import VERSION; target=os.environ["BUILD_TARGET"]; Path("artifacts/build-manifest.json").write_text(json.dumps(dict(commit=os.environ["BUILD_COMMIT"],target=target,version=VERSION,archive_formats=["tar.gz","zip"] if target=="linux" else ["zip"])))'
       - name: Upload verified portable files
         uses: actions/upload-artifact@v4
         with:
@@ -77,6 +77,8 @@ jobs:
           path: |
             artifacts/*.zip
             artifacts/*.zip.sha256
+            artifacts/*.tar.gz
+            artifacts/*.tar.gz.sha256
             artifacts/build-manifest.json
           if-no-files-found: error
           compression-level: 0

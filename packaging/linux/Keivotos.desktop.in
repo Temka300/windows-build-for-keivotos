@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=@NAME@
+Comment=Browse your local media library
+Exec=@LAUNCHER@
+Icon=@ICON@
+Terminal=true
+Categories=AudioVideo;Graphics;
+StartupNotify=false

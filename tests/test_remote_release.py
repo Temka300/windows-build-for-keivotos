@@ -42,6 +42,32 @@ def test_manifest_path_escape_rejected(tmp_path):
         remote.verify_artifact(tmp_path, SHA, "linux")
 
 
+def test_declared_linux_tar_and_zip_are_both_verified(tmp_path):
+    artifact(tmp_path)
+    tar = tmp_path / 'Keivotos-V1.2.3-linux-x64.tar.gz'
+    tar.write_bytes(b'generated tar fixture')
+    checksum = tar.with_name(tar.name + '.sha256')
+    checksum.write_text(hashlib.sha256(tar.read_bytes()).hexdigest() + '  ' + tar.name + '\n')
+    manifest = tmp_path / 'build-manifest.json'
+    value = json.loads(manifest.read_text())
+    value['archive_formats'] = ['tar.gz', 'zip']
+    manifest.write_text(json.dumps(value))
+    assert len(remote.verify_artifact(tmp_path, SHA, 'linux')) == 4
+    tar.write_bytes(b'changed')
+    with pytest.raises(RuntimeError, match='Checksum mismatch'):
+        remote.verify_artifact(tmp_path, SHA, 'linux')
+
+
+@pytest.mark.parametrize('formats', [['../bad'], ['tar.gz'], ['zip', 'zip'], None, 'zip'])
+def test_invalid_declared_archive_formats_refuse(tmp_path, formats):
+    artifact(tmp_path)
+    manifest = tmp_path / 'build-manifest.json'
+    value = json.loads(manifest.read_text()); value['archive_formats'] = formats
+    manifest.write_text(json.dumps(value))
+    with pytest.raises(RuntimeError, match='Unsupported archive formats'):
+        remote.verify_artifact(tmp_path, SHA, 'linux')
+
+
 def test_find_run_matches_request_not_latest():
     with patch.object(remote, "gh_json", return_value=[dict(databaseId=99, displayTitle="other"), dict(databaseId=12, displayTitle="mine")]):
         assert remote.find_run("owner/repo", "mine") == 12

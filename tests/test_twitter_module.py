@@ -988,6 +988,130 @@ def test_normalization_preserves_exact_text_and_optional_author_id():
     assert tweet['raw_text'] == RAW_TEXT and tweet['author']['id'] is None and tweet['posted_at'] is None
 
 
+@pytest.mark.parametrize('source', [
+    {'__typename': 'TweetTombstone', 'tombstone': {}}, {},
+    {'__typename': 'TweetUnavailable', 'reason': 'Protected'},
+    {'__typename': 'TweetUnavailable', 'reason': 'NsfwLoggedOut'},
+    {'tombstone': {'text': {'text': 'Unavailable'}}},
+])
+def test_anonymous_unavailability_has_stable_diagnosis(source):
+    with pytest.raises(acquisition.AnonymousCaptureUnavailable) as error:
+        acquisition.record({'post_id': '333'}, source)
+    assert error.value.code == 'twitter_anonymous_unavailable'
+    assert str(error.value) == '[twitter_anonymous_unavailable] This post is unavailable through anonymous capture'
+
+
+@pytest.mark.parametrize('source', [None, [], 'not a post', 0, {'unexpected': 'shape'},
+    {'__typename': 'UnknownResponse'}, {'user': {}}])
+def test_malformed_source_is_not_reported_as_unavailable_or_wrong_post(source):
+    with pytest.raises(ValueError) as error:
+        acquisition.record({'post_id': '333'}, source)
+    assert not isinstance(error.value, acquisition.AnonymousCaptureUnavailable)
+    assert 'does not match' not in str(error.value)
+
+
+@pytest.mark.parametrize('source', [
+    {'id_str': '444'}, {'id_str': 333},
+    {'id_str': '444', '__typename': 'TweetTombstone', 'tombstone': {}},
+    {'id_str': '444', '__typename': 'TweetUnavailable'},
+])
+def test_explicit_wrong_post_id_remains_a_hard_refusal(source):
+    with pytest.raises(ValueError, match='Source response does not match the requested post') as error:
+        acquisition.record({'post_id': '333'}, source)
+    assert not isinstance(error.value, acquisition.AnonymousCaptureUnavailable)
+
+
+@pytest.mark.parametrize('raw', [
+    b'{"__typename":"TweetTombstone","tombstone":{}}\n', b'{}',
+    b'{"__typename":"TweetUnavailable"}', b'{"id_str":"444"}',
+    b'null', b'[]', b'{broken', b'{"id_str":"333","id_str":"444"}',
+])
+def test_refused_metadata_preserves_exact_response_and_existing_partials(catalog, monkeypatch, raw):
+    job = new_job(catalog)
+    jobs.update(job['id'], status='running')
+    spec = jobs.prepare(job)
+    folder = acquisition.directory(spec)
+    partial = folder / 'video.mp4.part'
+    partial.write_bytes(b'preserved earlier partial')
+    requests = []
+    def metadata(url, host, limit):
+        requests.append(host)
+        assert host == 'cdn.syndication.twimg.com'
+        return raw
+    monkeypatch.setattr(acquisition, 'read_remote', metadata)
+    monkeypatch.setattr(acquisition, 'download_video', lambda *a: pytest.fail('Refusal downloaded video'))
+    with pytest.raises(ValueError):
+        acquisition.capture(spec, lambda *args: None)
+    assert (folder / 'source.json').read_bytes() == raw
+    assert partial.read_bytes() == b'preserved earlier partial'
+    assert set(path.name for path in folder.iterdir()) == {'source.json', 'video.mp4.part'}
+    assert requests == ['cdn.syndication.twimg.com']
+    assert browse()['items'] == []
+
+
+def test_metadata_rate_limit_is_not_an_unavailability_or_mismatch(monkeypatch):
+    from urllib.error import HTTPError
+    class Opener:
+        def open(self, request, timeout):
+            raise HTTPError(request.full_url, 429, 'Too Many Requests', {}, None)
+    monkeypatch.setattr(acquisition, 'build_opener', lambda *args: Opener())
+    with pytest.raises(HTTPError) as error:
+        acquisition.read_remote('https://cdn.syndication.twimg.com/tweet-result?id=333',
+                                'cdn.syndication.twimg.com', archive.ASSET_LIMITS['source.json'])
+    assert error.value.code == 429
+
+
+def test_real_worker_unavailability_survives_queue_and_retry_without_publishing(catalog, monkeypatch):
+    raw = b'{"__typename":"TweetTombstone","tombstone":{}}\n'
+    script = '''import sys
+sys.path.insert(0, sys.argv[1])
+from modules.twitter import acquisition, worker
+raw = bytes.fromhex(sys.argv[2])
+def read(url, host, limit):
+    assert host == 'cdn.syndication.twimg.com', 'Refusal attempted an asset request'
+    return raw
+acquisition.read_remote = read
+raise SystemExit(worker.main([]))
+'''
+    original_launch = asyncio.create_subprocess_exec
+    async def launch(*args, **kwargs):
+        if '--twitter-worker' in args:
+            return await original_launch(sys.executable, '-c', script, str(ROOT / 'backend'), raw.hex(), **kwargs)
+        return await original_launch(*args, **kwargs)
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', launch)
+    job = new_job(catalog)
+    paths = []
+    async def check():
+        runner = asyncio.create_task(jobs.run_queue())
+        try:
+            for attempt in (1, 2):
+                for _ in range(100):
+                    item = jobs.get(job['id'])
+                    if item['status'] == 'failed' and item['attempt'] == attempt:
+                        break
+                    await asyncio.sleep(.05)
+                assert item['status'] == 'failed' and item['attempt'] == attempt
+                assert 'twitter_anonymous_unavailable' in item['error']
+                assert 'This post is unavailable through anonymous capture' in item['error']
+                assert 'does not match' not in item['error']
+                paths.append(catalog[1] / item['path'])
+                assert not paths[-1].exists()
+                assert (paths[-1].parent / 'source.json').read_bytes() == raw
+                if attempt == 1:
+                    token = uuid4()
+                    jobs.retry(job['id'], token)
+                    jobs.retry(job['id'], token)
+        finally:
+            runner.cancel()
+            await asyncio.gather(runner, return_exceptions=True)
+    asyncio.run(check())
+    assert paths[0] != paths[1]
+    assert all((path.parent / 'source.json').read_bytes() == raw for path in paths)
+    assert browse()['items'] == []
+    with catalog[3]() as connection:
+        assert connection.execute('SELECT count(*) FROM twitter_downloads').fetchone()[0] == 1
+
+
 @pytest.mark.parametrize('post_kind', ['video', 'photo', 'text'])
 @pytest.mark.parametrize('avatar_extension', ['jpg', 'png', 'webp'])
 def test_real_helper_download_verify_publish_and_local_registration_retry(catalog, monkeypatch, tmp_path, post_kind, avatar_extension):

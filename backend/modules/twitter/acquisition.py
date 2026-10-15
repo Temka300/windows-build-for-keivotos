@@ -85,9 +85,24 @@ def new_file(spec, name, content):
         os.fsync(handle.fileno())
 
 
+class AnonymousCaptureUnavailable(ValueError):
+    code = 'twitter_anonymous_unavailable'
+
+    def __init__(self):
+        super().__init__(f'[{self.code}] This post is unavailable through anonymous capture')
+
+
 def record(spec, source):
-    if not isinstance(source, dict) or source.get('id_str') != spec['post_id']:
+    if not isinstance(source, dict):
+        raise ValueError('Source response is not a supported post object')
+    source_id = source.get('id_str')
+    if source_id is not None and source_id != spec['post_id']:
         raise ValueError('Source response does not match the requested post')
+    if (not source or source.get('__typename') in ('TweetTombstone', 'TweetUnavailable') or
+            isinstance(source.get('tombstone'), dict)):
+        raise AnonymousCaptureUnavailable()
+    if source_id is None:
+        raise ValueError('Source response has no supported post ID')
     user = source.get('user')
     if not isinstance(user, dict):
         raise ValueError('Post has no supported author')
