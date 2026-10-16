@@ -15,12 +15,11 @@ bash scripts/release/build_linux.sh --target linux
 
 The builder uses a temporary source/dependency workspace, the existing locks,
 frontend checks/build, freezer specs and delivery catalog. Native tools/resources
-and isolated HTTP startup are checked before creating archives. It produces:
+and isolated HTTP startup are checked before creating the archive. It produces:
 
-- A primary `Keivotos-V<version>-linux-x64.tar.gz` and `.tar.gz.sha256`.
-- The compatibility `Keivotos-V<version>-linux-x64.zip` and `.zip.sha256`.
+- `Keivotos-V<version>-linux-x64.tar.gz` and `.tar.gz.sha256`.
 
-Both contain the same files. Archives are made before any user profile is started
+Linux ZIP output is no longer produced. The archive is made before any user profile is started
 inside the package. Existing outputs are refused. `--output-directory` selects a
 new directory inside the checkout. No user library, database or credentials belong
 in a portable artifact. The build reads its version from `backend/product.py`.

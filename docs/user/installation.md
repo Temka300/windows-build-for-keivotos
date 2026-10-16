@@ -18,7 +18,7 @@ Linux artifacts target x86_64. Download the `.tar.gz` and its `.sha256`, verify
 with `sha256sum -c <archive>.tar.gz.sha256`, then extract with
 `tar -xzf <archive>.tar.gz`. Replace `<archive>` with the downloaded filename
 without its `.tar.gz` suffix. Keep the entire extracted folder together.
-The compatibility ZIP and its checksum contain the same application files.
+Linux releases provide tar.gz and its checksum; Windows releases provide ZIP.
 
 In a terminal inside the extracted folder, choose one launch:
 

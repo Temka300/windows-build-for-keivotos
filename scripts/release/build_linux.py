@@ -17,7 +17,6 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
@@ -86,18 +85,14 @@ def smoke(stage: Path, home: Path) -> None:
 
 
 def archive(stage: Path, destination: Path) -> None:
-    if destination.name.endswith('.tar.gz'):
-        def neutral_owner(item):
-            item.uid = item.gid = 0
-            item.uname = item.gname = ''
-            return item
-        with tarfile.open(destination, 'x:gz') as output:
-            output.add(stage, arcname=stage.name, filter=neutral_owner)
-        return
-    # ZipInfo.from_file preserves Unix execute bits for unzip on Linux.
-    with zipfile.ZipFile(destination, "x", zipfile.ZIP_DEFLATED) as output:
-        for item in sorted(stage.rglob("*")):
-            output.write(item, Path(stage.name) / item.relative_to(stage))
+    if not destination.name.endswith('.tar.gz'):
+        raise ValueError('Linux portable archives must use .tar.gz')
+    def neutral_owner(item):
+        item.uid = item.gid = 0
+        item.uname = item.gname = ''
+        return item
+    with tarfile.open(destination, 'x:gz') as output:
+        output.add(stage, arcname=stage.name, filter=neutral_owner)
 
 
 def install_launchers(source: Path, stage: Path) -> None:
@@ -191,10 +186,9 @@ def main(argv=None) -> int:
             parser.error(f"Use Linux {tool}, not the Windows installation")
     name = f"Keivotos-V{version}-linux-x64"
     output.mkdir(parents=True, exist_ok=True)
-    destination = output / f"{name}.zip"
-    checksum = output / f"{name}.zip.sha256"
-    portable_tar = output / f"{name}.tar.gz"
-    if any(path.exists() for path in (destination, checksum, portable_tar, portable_tar.with_name(portable_tar.name + '.sha256'))):
+    destination = output / f"{name}.tar.gz"
+    checksum = destination.with_name(destination.name + '.sha256')
+    if any(path.exists() for path in (destination, checksum)):
         parser.error("Artifact already exists; choose another --output-directory")
     with tempfile.TemporaryDirectory(prefix="keivotos-linux-build-") as temporary:
         work = Path(temporary)
@@ -235,12 +229,11 @@ def main(argv=None) -> int:
         shutil.copy2(source / "packaging/linux/FFMPEG_SOURCE.md", ffmpeg_licenses)
         install_launchers(source, stage)
         smoke(stage, work / "smoke-home")
-        for artifact in (portable_tar, destination):
-            archive(stage, artifact)
-            with artifact.open('rb') as stream:
-                digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-            artifact.with_name(artifact.name + '.sha256').write_text(f'{digest}  {artifact.name}\n')
-    print(f"Portable archives: {portable_tar}\nCompatibility archive: {destination}")
+        archive(stage, destination)
+        with destination.open('rb') as stream:
+            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        checksum.write_text(f'{digest}  {destination.name}\n')
+    print(f"Portable archive: {destination}")
     if args.target == "both":
         build_windows(version, output, native_tools)
     return 0

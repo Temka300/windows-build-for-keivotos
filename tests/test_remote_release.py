@@ -42,7 +42,8 @@ def test_manifest_path_escape_rejected(tmp_path):
         remote.verify_artifact(tmp_path, SHA, "linux")
 
 
-def test_declared_linux_tar_and_zip_are_both_verified(tmp_path):
+@pytest.mark.parametrize('formats', [['tar.gz'], ['tar.gz', 'zip']])
+def test_declared_linux_formats_are_all_verified(tmp_path, formats):
     artifact(tmp_path)
     tar = tmp_path / 'Keivotos-V1.2.3-linux-x64.tar.gz'
     tar.write_bytes(b'generated tar fixture')
@@ -50,15 +51,15 @@ def test_declared_linux_tar_and_zip_are_both_verified(tmp_path):
     checksum.write_text(hashlib.sha256(tar.read_bytes()).hexdigest() + '  ' + tar.name + '\n')
     manifest = tmp_path / 'build-manifest.json'
     value = json.loads(manifest.read_text())
-    value['archive_formats'] = ['tar.gz', 'zip']
+    value['archive_formats'] = formats
     manifest.write_text(json.dumps(value))
-    assert len(remote.verify_artifact(tmp_path, SHA, 'linux')) == 4
+    assert len(remote.verify_artifact(tmp_path, SHA, 'linux')) == 2 * len(formats)
     tar.write_bytes(b'changed')
     with pytest.raises(RuntimeError, match='Checksum mismatch'):
         remote.verify_artifact(tmp_path, SHA, 'linux')
 
 
-@pytest.mark.parametrize('formats', [['../bad'], ['tar.gz'], ['zip', 'zip'], None, 'zip'])
+@pytest.mark.parametrize('formats', [['../bad'], ['zip', 'tar.gz'], ['zip', 'zip'], None, 'zip'])
 def test_invalid_declared_archive_formats_refuse(tmp_path, formats):
     artifact(tmp_path)
     manifest = tmp_path / 'build-manifest.json'
@@ -94,6 +95,38 @@ def test_download_success_and_no_overwrite(tmp_path):
         assert len(list(destination.glob("*.zip"))) == 2
         with pytest.raises(RuntimeError, match="already exists"):
             remote.download("owner/repo", 123, SHA, "both", tmp_path)
+
+
+def test_download_current_linux_tar_and_windows_zip(tmp_path):
+    def download(args, **kwargs):
+        target = args[args.index('--name') + 1].removeprefix('keivotos-')
+        directory = Path(args[args.index('--dir') + 1])
+        path = artifact(directory, target)
+        extension = 'tar.gz' if target == 'linux' else 'zip'
+        if target == 'linux':
+            path.rename(path.with_suffix('.tar.gz'))
+            path.with_name(path.name + '.sha256').unlink()
+            path = path.with_suffix('.tar.gz')
+            path.with_name(path.name + '.sha256').write_text(hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + path.name)
+        manifest = directory / 'build-manifest.json'
+        value = json.loads(manifest.read_text()); value['archive_formats'] = [extension]
+        manifest.write_text(json.dumps(value))
+    with patch.object(remote.subprocess, 'run', side_effect=download):
+        destination = remote.download('owner/repo', 123, SHA, 'both', tmp_path)
+    assert len(list(destination.iterdir())) == 6  # Four assets and two provenance records.
+    assert len(list(destination.glob('*-linux-x64.tar.gz'))) == 1
+    assert not list(destination.glob('*-linux-x64.zip*'))
+    assert len(list(destination.glob('*-windows-x64.zip'))) == 1
+
+
+@pytest.mark.parametrize('formats', [['tar.gz'], ['tar.gz', 'zip']])
+def test_windows_manifest_cannot_request_linux_archive_formats(tmp_path, formats):
+    artifact(tmp_path, 'windows')
+    manifest = tmp_path / 'build-manifest.json'
+    value = json.loads(manifest.read_text()); value['archive_formats'] = formats
+    manifest.write_text(json.dumps(value))
+    with pytest.raises(RuntimeError, match='Unsupported archive formats'):
+        remote.verify_artifact(tmp_path, SHA, 'windows')
 
 
 def test_dirty_tree_never_dispatches(monkeypatch, tmp_path):
@@ -161,3 +194,21 @@ def test_workflow_is_manual_and_tests_both_native_platforms():
     uploads = next(i for i, s in enumerate(steps) if s.get("uses", "").startswith("actions/upload-artifact@"))
     assert test < uploads
     assert "python -m pytest" in steps[test]["run"]
+    provenance = next(s['run'] for s in steps if s.get('name') == 'Record artifact provenance')
+    # Execute the actual manifest writer for both matrix legs in isolation.
+    import os
+    import shlex
+    import sys
+    import tempfile
+    code = shlex.split(provenance)[-1]
+    for target, expected in [('linux', ['tar.gz']), ('windows', ['zip'])]:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary); (directory / 'artifacts').mkdir()
+            subprocess.run([sys.executable, '-c', code], cwd=directory, check=True,
+                           env={**os.environ, 'PYTHONPATH': str(ROOT), 'BUILD_COMMIT': SHA, 'BUILD_TARGET': target})
+            assert json.loads((directory / 'artifacts/build-manifest.json').read_text())['archive_formats'] == expected
+    paths = steps[uploads]['with']['path'].splitlines()
+    assert paths[-1] == 'artifacts/build-manifest.json'
+    for target, expected in [('linux', 'tar.gz'), ('windows', 'zip')]:
+        resolved = [p.replace('${{ matrix.target }}', target).replace("${{ matrix.target == 'linux' && 'tar.gz' || 'zip' }}", expected) for p in paths[:-1]]
+        assert resolved == [f'artifacts/Keivotos-*-{target}-x64.{expected}', f'artifacts/Keivotos-*-{target}-x64.{expected}.sha256']

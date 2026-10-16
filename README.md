@@ -28,7 +28,7 @@ Verify the adjacent checksum, then extract the whole `.tar.gz` with `tar -xzf`.
 Open a terminal in the extracted folder and run `sh ./start-keivotos.sh`.
 Use `sh ./start-portable.sh` to keep data beside the application instead.
 The package includes its Python runtime and tools; running it needs no uv,
-Python installation, Node.js or administrator access. The ZIP remains available.
+Python installation, Node.js or administrator access. Linux downloads use tar.gz.
 See [installation](docs/user/installation.md#portable-linux-build) for permissions,
 data locations and the optional application-menu shortcut.
 

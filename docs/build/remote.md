@@ -40,9 +40,10 @@ specific request, and downloads archives/checksums into `artifacts/github-<run-i
 It verifies each platform's recorded commit and SHA-256 before exposing the
 completed output folder. Existing output folders are never replaced.
 
-Linux supplies a primary tar.gz plus the compatibility ZIP; Windows supplies its
-ZIP. The manifest declares the formats, and each archive's checksum is verified.
-Resuming an older ZIP-only run remains supported. See [Linux builds](linux.md).
+Linux supplies tar.gz and its checksum; Windows supplies ZIP and its checksum.
+The manifest declares the formats, and each archive's checksum is verified.
+Resuming older ZIP-only or dual-format Linux runs remains supported without
+changing their original manifests. See [Linux builds](linux.md).
 
 The working tree must be clean: commit your intended changes first. Ignored
 application data is not uploaded by this tool. GitHub builds only the selected

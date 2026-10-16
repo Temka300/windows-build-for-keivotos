@@ -8,7 +8,6 @@ import sys
 import tarfile
 from types import SimpleNamespace
 from unittest.mock import patch
-import zipfile
 
 import pytest
 
@@ -19,23 +18,17 @@ builder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(builder)
 
 
-def test_archive_preserves_executable_mode_and_refuses_overwrite(tmp_path):
+def test_linux_archive_refuses_zip_without_creating_output(tmp_path):
     stage = tmp_path / "Keivotos-linux"
     stage.mkdir()
     executable = stage / "Keivotos"
     executable.write_text("#!/bin/sh\nexit 0\n")
     executable.chmod(0o755)
     destination = tmp_path / "artifact.zip"
-    builder.archive(stage, destination)
-    with zipfile.ZipFile(destination) as archive:
-        info = archive.getinfo("Keivotos-linux/Keivotos")
-        if sys.platform != "win32":
-            assert info.external_attr >> 16 & stat.S_IXUSR
-        assert archive.read(info) == executable.read_bytes()
-    original = destination.read_bytes()
-    with pytest.raises(FileExistsError):
+    with pytest.raises(ValueError, match='must use .tar.gz'):
         builder.archive(stage, destination)
-    assert destination.read_bytes() == original
+    assert not destination.exists()
+    assert executable.read_text() == "#!/bin/sh\nexit 0\n"
 
 
 def test_failed_build_step_stops(tmp_path):
@@ -43,7 +36,7 @@ def test_failed_build_step_stops(tmp_path):
         builder.run(sys.executable, "-c", "raise SystemExit(7)", cwd=tmp_path)
 
 
-def test_tar_preserves_modes_and_same_payload_without_overwriting(tmp_path):
+def test_tar_preserves_modes_and_payload_without_overwriting(tmp_path):
     stage = tmp_path / 'Keivotos-linux'
     stage.mkdir()
     (stage / 'Keivotos').write_bytes(b'generated application')
@@ -254,8 +247,11 @@ def test_both_target_runs_linux_then_windows(tmp_path, monkeypatch, installed):
     assert builder.main(["--target", "both"]) == 0
     assert sequence == ["linux", "windows"]
     assert tool_builds == (["gallery-dl"] if installed else [])
-    assert (tmp_path / "artifacts/Keivotos-V1.2.3-linux-x64.zip.sha256").is_file()
+    assert not list((tmp_path / 'artifacts').glob('*.zip*'))
     assert (tmp_path / "artifacts/Keivotos-V1.2.3-linux-x64.tar.gz.sha256").is_file()
+    import hashlib
+    artifact = tmp_path / 'artifacts/Keivotos-V1.2.3-linux-x64.tar.gz'
+    assert artifact.with_name(artifact.name + '.sha256').read_text() == hashlib.sha256(artifact.read_bytes()).hexdigest() + '  ' + artifact.name + '\n'
     with tarfile.open(tmp_path / 'artifacts/Keivotos-V1.2.3-linux-x64.tar.gz') as archive:
         tools = archive.extractfile('Keivotos-V1.2.3-linux-x64/linux-tools.txt').read().decode().splitlines()
         assert ('gallery-dl' in tools) == installed
