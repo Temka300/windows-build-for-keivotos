@@ -79,4 +79,4 @@ def descriptor(suite_home: Path, version: str):
         credentials=None, api_prefix='/api/youtube', log_prefix='youtube',
         user_agent=f'Keivotos/{version} (YouTube)', disableable=True, is_base=False,
         user_schema_provider=lambda: SCHEMA + PERSONAL_SCHEMA, publish_hook=_publish, router_provider=_routers,
-        adopt_hook=adopt, release_hook=release, startup_hook=_startup, background_tasks_hook=_tasks)
+        adopt_hook=adopt, release_hook=release, shared_folder_relocation=True, startup_hook=_startup, background_tasks_hook=_tasks)

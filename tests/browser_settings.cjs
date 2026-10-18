@@ -11,10 +11,11 @@ const report = { checks: [], errors: [], requests: [] };
  const context = await browser.newContext({ viewport:{width:1440,height:1000} });
  await context.tracing.start({ screenshots:true,snapshots:true });
  const page = await context.newPage();
+ const expectedHttpErrors = new Set();
  page.setDefaultTimeout(10000);
  page.on('pageerror', e=>report.errors.push(e.message));
- page.on('console', m=>{if(m.type()==='error')report.errors.push(m.text());});
- page.on('response', r=>{if(r.status()>=400)report.errors.push(`${r.status()} ${r.url()}`);});
+ page.on('console', m=>{if(m.type()==='error' && !(expectedHttpErrors.has(m.location().url) && m.text().startsWith('Failed to load resource:')))report.errors.push(m.text());});
+ page.on('response', r=>{if(r.status()>=400 && !expectedHttpErrors.has(r.url()))report.errors.push(`${r.status()} ${r.url()}`);});
  let credentialReads=0;
  let toolFixture=false, toolState="running";
  await page.route('**/*',route=>{
@@ -167,6 +168,115 @@ const report = { checks: [], errors: [], requests: [] };
   await dialog.locator('#setting-danbooru-access > summary').click();
   assert.equal(await dialog.getByRole('button',{name:'Betabooru',exact:true}).getAttribute('aria-pressed'),'true');
   check('selected Danbooru host survives reload');
+
+  toolFixture=false;
+  await section('Folders').click();
+  const actions=dialog.getByLabel('Folder actions').first();
+  const editor=page.getByRole('dialog',{name:'Edit folder path',exact:true});
+  async function edit(){await actions.click();await dialog.getByRole('button',{name:'Edit path…',exact:true}).first().click();await editor.waitFor();}
+  await edit();
+  const pathField=editor.getByRole('textbox',{name:'Folder path',exact:true});
+  assert.equal(await pathField.inputValue(),'D:\\Library');
+  assert.equal(await pathField.evaluate(n=>n===document.activeElement),true);
+  for(let i=0;i<9;i++){await page.keyboard.press('Tab');assert.equal(await editor.evaluate(n=>n.contains(document.activeElement)),true);}
+  await pathField.fill('/cancelled edit');
+  const mutationsBefore=report.requests.filter(request=>request.startsWith('PUT /api/suite/folders/')).length;
+  await pathField.dispatchEvent('compositionstart');
+  await editor.getByRole('button',{name:'Save',exact:true}).click();
+  await page.waitForTimeout(80);
+  assert.equal(report.requests.filter(request=>request.startsWith('PUT /api/suite/folders/')).length,mutationsBefore,'IME composition must not submit the path');
+  await pathField.dispatchEvent('compositionend');
+  await editor.getByRole('button',{name:'Cancel',exact:true}).click();
+  const registered=()=>page.evaluate(async()=>(await fetch('/api/files/sources')).json());
+  assert.equal((await registered()).find(s=>s.source_id==='copied-windows-root').path,'D:\\Library');
+  check('offline Windows folder offers Edit path, traps focus and Cancel preserves registration');
+
+  await edit();
+  await pathField.fill(config.media+'/missing folder');
+  const endpoint=config.url+'/api/suite/folders/copied-windows-root/path';
+  expectedHttpErrors.add(endpoint);
+  await editor.getByRole('button',{name:'Save',exact:true}).click();
+  await editor.getByRole('alert').filter({hasText:'Folder does not exist'}).waitFor();
+  assert.equal((await registered()).find(s=>s.source_id==='copied-windows-root').path,'D:\\Library');
+  await pathField.fill('D:\\Library');
+  assert.equal(await editor.getByRole('alert').count(),0);
+  expectedHttpErrors.add(config.url+'/api/files/fs?'+new URLSearchParams({path:'D:\\Library'}));
+  await editor.getByRole('button',{name:'Browse…',exact:true}).click();
+  const picker=page.getByRole('dialog',{name:'Choose a folder',exact:true});
+  await picker.waitFor();
+  await picker.getByRole('textbox',{name:'Folder path'}).fill(config.media+'/Copied library 한글');
+  await picker.getByRole('button',{name:'Go',exact:true}).click();
+  await page.waitForFunction(()=>!document.querySelector('dialog[aria-label="Choose a folder"] footer button:last-child')?.disabled);
+  await picker.getByRole('button',{name:'Choose this folder',exact:true}).click();
+  assert.equal(await pathField.inputValue(),config.media+'/Copied library 한글');
+  assert.equal((await registered()).find(s=>s.source_id==='copied-windows-root').path,'D:\\Library');
+  check('invalid Save preserves registration; Browse stages a Unicode Linux location without implicit save');
+
+  let releaseSave;
+  const gate=new Promise(resolve=>{releaseSave=resolve;});
+  await page.route('**/api/suite/folders/copied-windows-root/path',async route=>{await gate;await route.continue();});
+  await editor.getByRole('button',{name:'Save',exact:true}).click();
+  await editor.getByRole('button',{name:'Saving…',exact:true}).waitFor();
+  await page.keyboard.press('Escape');
+  assert.equal(await editor.isVisible(),true);
+  assert.equal(await editor.getByRole('button',{name:'Cancel',exact:true}).isDisabled(),true);
+  releaseSave();
+  await editor.waitFor({state:'hidden'});
+  await dialog.getByText('Updated Copied library. Files were not moved.',{exact:true}).waitFor();
+  assert.equal((await registered()).filter(s=>s.source_id==='copied-windows-root').length,1);
+  const nodes=await page.evaluate(async()=>(await fetch('/api/files/browse?source_id=copied-windows-root')).json());
+  assert(nodes.some(n=>n.name==='one.txt'));
+  const info=await page.evaluate(async()=>(await fetch('/api/files/info?source_id=copied-windows-root&path=')).json());
+  assert(JSON.stringify(info).includes('Preserved folder note'));
+  check('pending Save stays modal; actual relink immediately browses copied files with original folder metadata');
+
+  await page.unroute('**/api/suite/folders/copied-windows-root/path');
+  await page.reload();await open();await section('Folders').click();
+  await edit();assert.equal(await pathField.inputValue(),config.media+'/Copied library 한글');
+  await editor.getByRole('button',{name:'Save',exact:true}).click();
+  await editor.waitFor({state:'hidden'});
+  assert.equal((await registered()).filter(s=>s.source_id==='copied-windows-root').length,1);
+  await page.setViewportSize({width:420,height:820});
+  await edit();
+  assert.equal(await editor.evaluate(n=>n.getBoundingClientRect().right<=innerWidth),true);
+  await page.keyboard.press('Escape');await editor.waitFor({state:'hidden'});
+  check('path survives reload, same-path retry is idempotent and narrow keyboard dismissal preserves Settings');
+
+  await page.setViewportSize({width:1440,height:1000});
+  await section('Modules').click();
+  const twitterSwitch=page.getByRole('switch',{name:'Twitter module',exact:true});
+  await twitterSwitch.click();
+  await page.waitForFunction(()=>document.querySelector('[data-module-id="twitter"] [role="switch"]')?.getAttribute('aria-checked')==='true');
+  await section('Folders').click();
+  async function relink(name,newPath){
+   const row=dialog.getByText(name,{exact:true}).locator('xpath=ancestor::div[.//summary[@aria-label="Folder actions"]][1]');
+   await row.getByLabel('Folder actions').click();
+   await row.getByRole('button',{name:'Edit path…',exact:true}).click();
+   await editor.waitFor();await pathField.fill(newPath);
+   await editor.getByRole('button',{name:'Save',exact:true}).click();
+   await editor.waitFor({state:'hidden'});
+  }
+  async function nestedOwnership(parentId,childId){
+   const nodes=await page.evaluate(async id=>(await fetch('/api/files/browse?source_id='+id)).json(),childId);
+   assert.deepEqual(nodes.map(n=>n.name),['post.txt']);
+   const matches=await page.evaluate(async id=>(await fetch('/api/files/search?source_id='+id+'&q=post.txt')).json(),parentId);
+   assert.equal(matches.length,1);assert.equal(matches[0].source_id,childId);
+   const note=await page.evaluate(async id=>(await fetch('/api/files/info?source_id='+id+'&path=')).json(),childId);
+   assert(JSON.stringify(note).includes('Preserved child note'));
+   assert.equal((await registered()).find(s=>s.source_id===childId).role,'twitter');
+  }
+  await relink('Nested child',config.media+'/Copied library 한글/hehetwitter');
+  await nestedOwnership('copied-windows-root','copied-child-root');
+  assert.equal((await registered()).find(s=>s.source_id==='reverse-parent').path,'E:\\Library','Other saved Windows paths are not translated');
+  check('parent-first nested repair transfers derived parent claims and preserves Twitter identity and notes');
+
+  await relink('Reverse child',config.media+'/Reverse library/hehetwitter');
+  assert.equal((await registered()).find(s=>s.source_id==='reverse-parent').path,'E:\\Library');
+  await relink('Reverse library',config.media+'/Reverse library');
+  await nestedOwnership('reverse-parent','reverse-child');
+  await relink('Reverse child',config.media+'/Reverse library/hehetwitter');
+  await nestedOwnership('reverse-parent','reverse-child');
+  check('child-first nested repair and same-path retry preserve descendant ownership without bulk path changes');
 
   assert.deepEqual(report.errors,[]);
   check('presentation cleanup and clean browser/API logs');

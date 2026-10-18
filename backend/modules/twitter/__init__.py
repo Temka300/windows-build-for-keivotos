@@ -50,7 +50,7 @@ def descriptor(suite_home: Path, version: str) -> ModuleDescriptor:
         home=suite_home / 'modules/twitter', database=suite_home / 'base/files.sqlite',
         credentials=None, api_prefix='/api/twitter', log_prefix='twitter',
         user_agent=f'Keivotos/{version} (Twitter)', disableable=True, is_base=False,
-        experimental=True, router_provider=_routers, adopt_hook=adopt, release_hook=release,
+        experimental=True, router_provider=_routers, adopt_hook=adopt, release_hook=release, shared_folder_relocation=True,
         user_schema_provider=lambda: SCHEMA, publish_hook=publish,
         startup_hook=_startup, background_tasks_hook=_tasks,
     )

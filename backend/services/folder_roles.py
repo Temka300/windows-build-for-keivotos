@@ -2,16 +2,18 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import suite_modules
-from config import FILES_DB_PATH, MODULE_REGISTRY, SUITE_HOME
+from config import FILES_DB_PATH, MODULE_REGISTRY, SUITE_HOME, USER_DB_PATH
 from database import get_user_db
 from files_base import index, sources
-from maintenance import module_operation
+from files_base.serving import ServeDenied, resolve_within_source
+from maintenance import exclusive_tool_operation, module_operation
 
 
 class FolderRegistryError(RuntimeError):
@@ -33,6 +35,17 @@ class FolderChange:
 
 @contextmanager
 def _folder_work(source_ids: list[str], roles: tuple[str, ...] | list[str] = ()):
+    try:
+        with _guard_folder_work(source_ids, roles), index.source_work(wait=False):
+            yield
+    except RuntimeError as exc:
+        if isinstance(exc, FolderRegistryError):
+            raise
+        raise FolderRegistryError(409, str(exc)) from exc
+
+
+@contextmanager
+def _guard_folder_work(source_ids: list[str], roles: tuple[str, ...] | list[str] = ()):
     with get_user_db() as connection:
         sources.ensure_sources_schema(connection)
         owners = {sources.canonical_role(role) for role in roles}
@@ -128,6 +141,7 @@ def _scan_registered_source(
     index_connection,
     source: sources.Source,
     all_sources: list[sources.Source],
+    *, commit: bool = True,
 ) -> dict[str, int]:
     excluded = [
         Path(candidate.path)
@@ -138,6 +152,7 @@ def _scan_registered_source(
         source.source_id,
         Path(source.path),
         excluded_roots=excluded,
+        commit=commit,
     )
 
 
@@ -271,30 +286,45 @@ def _rescan(source_id: str) -> dict[str, Any]:
 
 
 def relocate(source_id: str, new_path: str) -> dict[str, Any]:
-    with _folder_work([source_id]):
+    with _folder_work([source_id]), exclusive_tool_operation('editing a folder path', wait=False):
         return _relocate(source_id, new_path)
 
 
 def _relocate(source_id: str, new_path: str) -> dict[str, Any]:
-    """Point a moved folder at its new location through its owning module.
-
-    Files folders take their identity from their path, so relocating one is just
-    removing it and adding the new path — the caller should do that instead. A
-    module folder keeps a stable identity: its module rewrites its own index and
-    re-publishes the shared source (a new path-derived id), and we then refresh
-    the base index at the new location.
-    """
+    """Keep shared source identity, or dispatch to the owner's relocation hook."""
     with get_user_db() as connection:
         sources.ensure_sources_schema(connection)
         source = sources.get_source(connection, source_id)
     if source is None:
         raise FolderRegistryError(404, "Unknown folder source")
     descriptor = _require_owner(source.role)
-    if descriptor.is_base:
-        raise FolderRegistryError(
-            400,
-            "Files folders are identified by their path — remove this one and add it at the new location.",
-        )
+    raw = new_path.strip()
+    target = Path(raw).expanduser()
+    if not raw or not target.is_absolute():
+        raise FolderRegistryError(400, 'Choose an absolute folder path for this system')
+    target = target.resolve(strict=False)
+    reason = sources.unsafe_source_reason(target, [SUITE_HOME])
+    if reason:
+        raise FolderRegistryError(400, reason)
+    try:
+        with os.scandir(target) as entries:
+            next(entries, None)
+    except OSError as exc:
+        raise FolderRegistryError(400, 'Cannot read the selected folder') from exc
+    with get_user_db() as connection:
+        all_sources = sources.list_sources(connection)
+    for other in all_sources:
+        if other.source_id == source_id:
+            continue
+        if _normalized_path(other.path) == _normalized_path(target):
+            raise FolderRegistryError(409, 'This folder is already registered')
+    if _normalized_path(source.path) == _normalized_path(target):
+        return {'source_id': source_id, 'files_updated': 0}
+    if descriptor.is_base or descriptor.shared_folder_relocation:
+        try:
+            return _relocate_shared(source, target)
+        except (OSError, sqlite3.Error) as exc:
+            raise FolderRegistryError(409, 'The folder path was not changed. Check the folder and try again.') from exc
     try:
         result = descriptor.relocate(source_id, new_path)
     except ValueError as exc:
@@ -302,16 +332,83 @@ def _relocate(source_id: str, new_path: str) -> dict[str, Any]:
     with get_user_db() as connection:
         sources.ensure_sources_schema(connection)
         descriptor.publish(connection)
-        moved = sources.get_source(connection, sources.deterministic_source_id(new_path))
-        all_sources = sources.list_sources(connection)
+        moved = sources.get_source_by_path(connection, target)
+        if moved is not None:
+            if moved.source_id != source_id:
+                if sources.get_source(connection, source_id) is not None:
+                    raise FolderRegistryError(409, 'The folder owner did not finish updating its registration')
+                connection.execute('UPDATE files_sources SET source_id=? WHERE source_id=?', (source_id, moved.source_id))
+            sources.update_source(connection, source_id, display_name=source.display_name, visible=source.visible)
     if moved is not None:
-        with index.open_index(FILES_DB_PATH) as index_connection:
-            index.drop_source(index_connection, source_id)
-            _scan_registered_source(index_connection, moved, all_sources)
+        descriptor.update_folder(source_id)
+        _relocate_shared(source, target)
     return {
-        "source_id": moved.source_id if moved is not None else source_id,
+        "source_id": source_id,
         "files_updated": int(result.get("files_updated", 0)),
     }
+
+
+def _relocate_shared(source: sources.Source, target: Path) -> dict[str, Any]:
+    """Repoint registry and disposable index atomically; all user keys stay put."""
+    with get_user_db() as user_connection:
+        registered = sources.list_sources(user_connection)
+    moved = replace(source, path=str(target))
+    current = [moved if item.source_id == source.source_id else item for item in registered]
+    by_id = {item.source_id: item for item in current}
+    ancestors = {}
+    others = [item for item in current if item.source_id != source.source_id]
+    for path in (source.path, target):
+        ancestor = sources.nearest_ancestor_source(path, others)
+        if ancestor is not None:
+            ancestors[ancestor.source_id] = ancestor
+    descendants = sources.descendant_sources(moved, current)
+    affected = {source.source_id, *ancestors, *(item.source_id for item in descendants)}
+    with index.open_index(FILES_DB_PATH) as connection:
+        connection.execute('ATTACH DATABASE ? AS userdb', (str(USER_DB_PATH),))
+        try:
+            connection.execute('BEGIN IMMEDIATE')
+            for table, states in (('youtube_downloads', ('queued', 'downloading', 'merging')),
+                                  ('twitter_downloads', ('queued', 'running'))):
+                exists = connection.execute("SELECT 1 FROM userdb.sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+                if exists:
+                    active = connection.execute(f"SELECT source_id FROM userdb.{table} WHERE status IN ({','.join('?' for _ in states)})", states).fetchall()
+                    if any(item['source_id'] in affected for item in active):
+                        raise FolderRegistryError(409, 'Wait for downloads using this folder or its nested folders to finish')
+            rows = connection.execute('SELECT id, relative_path FROM files_index WHERE source_id=?', (source.source_id,)).fetchall()
+            for row in rows:
+                relative = str(row['relative_path'])
+                try:
+                    path = resolve_within_source(str(target), relative, [SUITE_HOME], must_exist=False)
+                except ServeDenied as exc:
+                    raise FolderRegistryError(409, 'An indexed path cannot be relinked safely') from exc
+                owner = sources.nearest_ancestor_source(path, current)
+                if owner is not None and owner.source_id != source.source_id:
+                    # Preserve the moved root's unmatched historical row. A
+                    # registered descendant owns this location and is scanned below.
+                    continue
+                occupied = connection.execute('SELECT id, source_id FROM files_index WHERE path=? AND id<>?', (str(path), row['id'])).fetchone()
+                if occupied:
+                    previous_owner = by_id.get(occupied['source_id'])
+                    if previous_owner is None or not sources.is_strict_descendant_path(target, previous_owner.path):
+                        raise FolderRegistryError(409, 'The new location conflicts with an indexed file')
+                    # These are duplicate disposable facts previously indexed by
+                    # the containing root, never annotations or module records.
+                    connection.execute('DELETE FROM files_index WHERE id=?', (occupied['id'],))
+                connection.execute('UPDATE files_index SET path=?, relative_path=?, parent=?, available=0, content_hash=NULL, hashed_at=NULL WHERE id=?',
+                    (str(path), relative, relative.rpartition('/')[0], row['id']))
+            connection.execute('UPDATE userdb.files_sources SET path=? WHERE source_id=?', (str(target), source.source_id))
+            for ancestor in ancestors.values():
+                _scan_registered_source(connection, ancestor, current, commit=False)
+            _scan_registered_source(connection, moved, current, commit=False)
+            for descendant in descendants:
+                _scan_registered_source(connection, descendant, current, commit=False)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.execute('DETACH DATABASE userdb')
+    return {'source_id': source.source_id, 'files_updated': len(rows)}
 
 
 def forget_preview(source_id: str) -> dict[str, Any]:

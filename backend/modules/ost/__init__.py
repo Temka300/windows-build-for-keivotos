@@ -39,5 +39,5 @@ def descriptor(suite_home: Path, version: str) -> ModuleDescriptor:
         home=suite_home / "modules" / "ost", database=suite_home / "base" / "files.sqlite",
         credentials=None, api_prefix="/api/ost", log_prefix="ost",
         user_agent=f"Keivotos/{version} (OST)", disableable=True, is_base=False,
-        experimental=True, router_provider=_routers, adopt_hook=adopt, release_hook=release,
+        experimental=True, router_provider=_routers, adopt_hook=adopt, release_hook=release, shared_folder_relocation=True,
     )

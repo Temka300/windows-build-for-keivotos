@@ -45,6 +45,7 @@ uvicorn.run(server.app, host='127.0.0.1', port=int(sys.argv[2]))
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--node', default=shutil.which('node'))
+    parser.add_argument('--port', type=int, default=0, help='Optional available loopback port for host browser forwarding')
     parser.add_argument('--dist', type=Path, help='Prebuilt scratch frontend; skip the runner build')
     parser.add_argument('--script', choices=('modularization', 'backup', 'danbooru', 'settings', 'import', 'modules', 'settings_failures', 'appearance', 'video', 'manga', 'youtube', 'language', 'ost', 'twitter', 'module_locations', 'storage', 'absence'), default='modularization')
     parser.add_argument('--output', required=True, type=Path, help='New directory for logs, screenshots and timing report')
@@ -65,6 +66,34 @@ def main() -> int:
         home = base / 'home'
         home.mkdir()
         (home / 'config.json').write_text(json.dumps({'default_library_created': True}))
+        if args.script == 'settings':
+            (home / 'config.json').write_text(json.dumps({'default_library_created': True, 'show_experimental_modules': True}))
+            media = base / 'media'
+            (media / 'Copied library 한글').mkdir(parents=True)
+            (media / 'Copied library 한글' / 'one.txt').write_text('preserved copied file', encoding='utf-8')
+            for name in ('Copied library 한글', 'Reverse library'):
+                nested = media / name / 'hehetwitter'
+                nested.mkdir(parents=True)
+                (nested / 'post.txt').write_text('preserved nested file', encoding='utf-8')
+            sys.path.insert(0, str(ROOT / 'backend'))
+            from files_base import sources, annotations
+            with sqlite3.connect(home / 'user.sqlite') as connection:
+                sources.ensure_sources_schema(connection)
+                annotations.ensure_annotations_schema(connection)
+                connection.execute("INSERT INTO files_sources(source_id,path,display_name,role,visible) VALUES('copied-windows-root',?,'Copied library','files',1)", ('D:\\Library',))
+                connection.execute("INSERT INTO files_annotations(subject_kind,source_id,relative_path,description) VALUES('folder','copied-windows-root','','Preserved folder note')")
+                for source_id, path, name, role in (
+                    ('copied-child-root', 'D:\\Library\\hehetwitter', 'Nested child', 'twitter'),
+                    ('reverse-parent', 'E:\\Library', 'Reverse library', 'files'),
+                    ('reverse-child', 'E:\\Library\\hehetwitter', 'Reverse child', 'twitter')):
+                    connection.execute('INSERT INTO files_sources(source_id,path,display_name,role,visible) VALUES(?,?,?,?,1)', (source_id, path, name, role))
+                    connection.execute("INSERT INTO files_annotations(subject_kind,source_id,relative_path,description) VALUES('folder',?,'','Preserved child note')", (source_id,))
+            from files_base.schema import ensure_files_schema
+            (home / 'base').mkdir(exist_ok=True)
+            with sqlite3.connect(home / 'base/files.sqlite') as connection:
+                ensure_files_schema(connection)
+                for source_id, path in (('copied-child-root', 'D:\\Library\\hehetwitter\\post.txt'), ('reverse-child', 'E:\\Library\\hehetwitter\\post.txt')):
+                    connection.execute("INSERT INTO files_index(source_id,path,relative_path,parent,name,is_dir,available) VALUES(?,?,'post.txt','','post.txt',0,1)", (source_id, path))
         if args.script == 'storage':
             thumbnails=home/'base/thumbnails';thumbnails.mkdir(parents=True)
             for suffix in ('','_600','_1200'):
@@ -145,7 +174,7 @@ def main() -> int:
                 subprocess.run([args.node, 'node_modules/vite/bin/vite.js', 'build', '--outDir', str(dist)],
                                cwd=project / 'frontend', stdout=log, stderr=subprocess.STDOUT, check=True)
         with socket.socket() as probe:
-            probe.bind(('127.0.0.1', 0))
+            probe.bind(('127.0.0.1', args.port))
             port = probe.getsockname()[1]
         url = f'http://127.0.0.1:{port}'
         context = base / 'context.json'
@@ -184,6 +213,44 @@ def main() -> int:
             assert 'user_settings' in tables
             assert not {'favorites', 'collections', 'collection_items'} & tables
             assert (base / 'media/preserved.txt').read_text() == 'Files-only preservation fixture'
+        if args.script == 'settings' and result.returncode == 0:
+            with socket.socket() as probe:
+                probe.bind(('127.0.0.1', 0)); restart_port = probe.getsockname()[1]
+            restart_url = f'http://127.0.0.1:{restart_port}'
+            with (output / 'restart.log').open('w') as log:
+                restarted = subprocess.Popen([sys.executable, '-c', SERVER, str(dist), str(restart_port)],
+                    cwd=project, env=env, stdout=log, stderr=subprocess.STDOUT)
+                try:
+                    deadline = time.monotonic() + 30
+                    while time.monotonic() < deadline:
+                        try:
+                            with urllib.request.urlopen(restart_url + '/api/files/sources', timeout=.5) as response:
+                                rows = json.load(response)
+                            break
+                        except OSError:
+                            if restarted.poll() is not None: raise RuntimeError('Restarted fixture server exited')
+                            time.sleep(.1)
+                    else: raise RuntimeError('Restarted fixture server timed out')
+                    copied = [row for row in rows if row['source_id'] == 'copied-windows-root']
+                    assert len(copied) == 1 and copied[0]['path'] == str(base / 'media/Copied library 한글')
+                    with urllib.request.urlopen(restart_url + '/api/files/browse?source_id=copied-windows-root') as response:
+                        assert any(row['name'] == 'one.txt' for row in json.load(response))
+                    with sqlite3.connect(home / 'user.sqlite') as connection:
+                        assert connection.execute("SELECT description FROM files_annotations WHERE source_id='copied-windows-root'").fetchone()[0] == 'Preserved folder note'
+                    assert (base / 'media/Copied library 한글/one.txt').read_text() == 'preserved copied file'
+                    for source_id, relative in (('copied-child-root', 'Copied library 한글/hehetwitter'), ('reverse-parent', 'Reverse library'), ('reverse-child', 'Reverse library/hehetwitter')):
+                        assert next(row for row in rows if row['source_id'] == source_id)['path'] == str(base / 'media' / relative)
+                    for source_id in ('copied-child-root', 'reverse-child'):
+                        with urllib.request.urlopen(restart_url + '/api/files/browse?source_id=' + source_id) as response:
+                            assert any(row['name'] == 'post.txt' for row in json.load(response))
+                    for relative in ('Copied library 한글/hehetwitter/post.txt', 'Reverse library/hehetwitter/post.txt'):
+                        assert (base / 'media' / relative).read_text() == 'preserved nested file'
+                    (output / 'restart.json').write_text(json.dumps({'passed': True, 'source_id': 'copied-windows-root', 'original_bytes_preserved': True}))
+                finally:
+                    restarted.terminate()
+                    try: restarted.wait(timeout=20)
+                    except subprocess.TimeoutExpired: restarted.kill(); restarted.wait()
+            if 'ERROR:' in (output / 'restart.log').read_text(): raise RuntimeError('Restart logged an error')
         log_text = (output / 'server.log').read_text()
         if 'Traceback (most recent call last)' in log_text or 'ERROR:' in log_text:
             raise RuntimeError('Isolated server logged errors; inspect server.log')

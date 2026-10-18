@@ -1,6 +1,6 @@
 <script lang="ts">
   import { settingsStyle } from '../../lib/appearance';
-  import { getContext, onMount } from 'svelte';
+  import { getContext, onMount, onDestroy, tick } from 'svelte';
   import { get } from 'svelte/store';
   import { SETTINGS_SESSION, type SettingsSession } from '../../lib/settingsSession';
   import { iconPath, formatByteCount, compactSegmentClass } from '../../lib/settingsControls';
@@ -200,29 +200,97 @@
     }
   }
 
-  // A module-owned folder keeps a stable identity, so it can be relocated (Files
-  // folders are keyed by path — remove + re-add instead, so no Relocate is shown).
-  function isModuleFolder(role: string): boolean {
-    return role !== 'files' && role !== 'base';
+  let editingSource: SourceInfo | null = null;
+  let editPath = '';
+  let editError = '';
+  let editBusy = false;
+  let editBrowsing = false;
+  let editDialog: HTMLDialogElement;
+  let editInput: HTMLInputElement;
+  let editReturnFocus: HTMLElement | null = null;
+  let editGeneration = 0;
+  let editComposing = false;
+
+  async function editRoleFolder(source: SourceInfo) {
+    if (rescanBusyId || editBusy) return;
+    editReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const menu = editReturnFocus?.closest('details');
+    if (menu) {
+      editReturnFocus = menu.querySelector('summary');
+      menu.removeAttribute('open');
+    }
+    editingSource = source;
+    editPath = source.path;
+    editError = '';
+    editComposing = false;
+    ++editGeneration;
+    await tick();
+    editDialog.showModal();
+    editInput.focus();
+    editInput.select();
   }
 
-  // Relocate = the folder moved on disk; re-point its module index at the new
-  // path without moving any files. Uses the native picker for the new location.
-  async function relocateRoleFolder(source: SourceInfo) {
-    if (rescanBusyId) return;
-    rescanError = '';
-    rescanMessage = '';
+  function closePathEditor() {
+    if (editBusy || editBrowsing) return;
+    ++editGeneration;
+    editDialog?.close();
+    editingSource = null;
+    void tick().then(() => { if (editReturnFocus?.isConnected) editReturnFocus.focus(); });
+  }
+
+  async function browseEditPath() {
+    if (editBusy || editBrowsing) return;
+    const generation = editGeneration;
+    editBrowsing = true;
+    await tick();
+    editDialog.focus();
     try {
-      const pickedPath = await session.pickDirectory(source.path);
-      if (!pickedPath) return;
-      const result = await suiteApi.relocateFolder(source.source_id, pickedPath);
-      await Promise.all([loadRoleSources(true), session.reloadFolders()]);
-      rescanMessage = `Relocated ${source.display_name} — ${result.files_updated.toLocaleString()} indexed references updated. Files were not moved.`;
-      session.refreshImages();
+      const path = await session.pickDirectory(editPath);
+      if (generation === editGeneration && path) { editPath = path; editError = ''; }
     } catch (error) {
-      rescanError = error instanceof Error ? error.message : String(error);
+      if (generation === editGeneration) editError = error instanceof Error ? error.message : String(error);
+    } finally {
+      if (generation === editGeneration) editBrowsing = false;
     }
   }
+
+  async function saveEditPath() {
+    if (!editingSource || editBusy || editBrowsing || editComposing || !editPath.trim()) return;
+    const source = editingSource;
+    const generation = editGeneration;
+    editBusy = true;
+    editError = '';
+    await tick();
+    editDialog.focus();
+    try {
+      const result = await suiteApi.relocateFolder(source.source_id, editPath.trim());
+      if (generation !== editGeneration) return;
+      roleSources = roleSources.map(row => row.source_id === source.source_id
+        ? { ...row, source_id: result.source_id, path: editPath.trim() } : row);
+      rescanMessage = `Updated ${source.display_name}. Files were not moved.`;
+      session.refreshImages();
+      void session.reloadFolders();
+      void loadRoleSources(true).catch(() => { rescanError = 'The folder was updated. Reopen Folders to refresh its counts.'; });
+      editBusy = false;
+      closePathEditor();
+    } catch (error) {
+      if (generation === editGeneration) editError = error instanceof Error ? error.message : String(error);
+    } finally {
+      if (generation === editGeneration) editBusy = false;
+    }
+  }
+
+  function editKeydown(event: KeyboardEvent) {
+    event.stopPropagation();
+    if (event.key !== 'Tab') return;
+    const controls = Array.from(editDialog.querySelectorAll<HTMLElement>('input:not([disabled]), button:not([disabled])'));
+    if (!controls.length) { event.preventDefault(); return; }
+    const first = controls[0], last = controls[controls.length - 1];
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus(); }
+  }
+
+  onDestroy(() => { ++editGeneration; editDialog?.close(); });
 
 </script>
 
@@ -249,7 +317,7 @@
                     <details class="group relative shrink-0">
                       <summary class="grid h-8 w-8 cursor-pointer list-none place-items-center rounded-lg text-gray-500 hover:bg-white/5 hover:text-gray-200" title="Folder actions" aria-label="Folder actions">•••</summary>
                       <div class="absolute right-0 top-9 z-20 w-40 overflow-hidden rounded-lg border border-[#303040] bg-[#191920] p-1 shadow-xl shadow-black/50">
-                        {#if isModuleFolder(source.role)}<button class="w-full rounded-md px-3 py-2 text-left text-xs text-cyan-200 hover:bg-cyan-500/10" type="button" disabled={toolRunning} on:click={() => relocateRoleFolder(source)}>Relocate…</button>{/if}
+                        <button class="w-full rounded-md px-3 py-2 text-left text-xs text-cyan-200 hover:bg-cyan-500/10" type="button" disabled={toolRunning || rescanBusyId !== null} on:click={() => editRoleFolder(source)}>Edit path…</button>
                         <button class="w-full rounded-md px-3 py-2 text-left text-xs text-red-300 hover:bg-red-500/10" type="button" on:click={() => removeRoleFolder(source)}>Remove…</button>
                       </div>
                     </details>
@@ -318,6 +386,29 @@
 {/if}
 
 <div class="contents" use:session.portal>
+  <dialog bind:this={editDialog} aria-labelledby="edit-folder-path-title" tabindex="-1"
+    class="m-auto w-[min(560px,92vw)] rounded-xl border border-[#303040] bg-[#14141c] p-5 text-gray-200 shadow-2xl"
+    on:click|stopPropagation
+    on:cancel={(event) => { event.preventDefault(); closePathEditor(); }}
+    on:keydown={editKeydown}>
+    <form on:submit|preventDefault={saveEditPath}>
+      <h3 id="edit-folder-path-title" class="text-sm font-semibold">Edit folder path</h3>
+      <p class="mt-2 text-xs text-gray-400">Choose the current location of {editingSource?.display_name ?? 'this folder'}. Your files will stay where they are.</p>
+      <label class="mt-4 block text-xs text-gray-400" for="edit-folder-path">Folder path</label>
+      <div class="mt-2 flex gap-2">
+        <input id="edit-folder-path" bind:this={editInput} bind:value={editPath} disabled={editBusy || editBrowsing}
+          class="min-w-0 flex-1 rounded border border-[#303040] bg-[#0d0d13] px-3 py-2 text-xs outline-none focus:border-cyan-400"
+          autocomplete="off" spellcheck="false" on:input={() => { editError = ''; }}
+          on:compositionstart={() => { editComposing = true; }} on:compositionend={() => { editComposing = false; }} />
+        <button type="button" class="rounded border border-[#303040] px-3 py-2 text-xs disabled:opacity-40" disabled={editBusy || editBrowsing} on:click={browseEditPath}>{editBrowsing ? 'Browsing…' : 'Browse…'}</button>
+      </div>
+      {#if editError}<p role="alert" class="mt-3 text-xs text-red-300">{editError}</p>{/if}
+      <div class="mt-5 flex justify-end gap-2">
+        <button type="button" class="rounded px-3 py-2 text-xs hover:bg-white/5 disabled:opacity-40" disabled={editBusy || editBrowsing} on:click={closePathEditor}>Cancel</button>
+        <button type="submit" class="rounded bg-cyan-500/15 px-4 py-2 text-xs text-cyan-200 disabled:opacity-40" disabled={editBusy || editBrowsing || !editPath.trim() || toolRunning}>{editBusy ? 'Saving…' : 'Save'}</button>
+      </div>
+    </form>
+  </dialog>
   {#if showRoleManager}
     <ManageFoldersDialog
       sources={roleSources}

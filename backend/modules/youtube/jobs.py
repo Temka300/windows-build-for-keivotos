@@ -85,8 +85,8 @@ def create(url,source_id=None,video='best',audio='best'):
     url=canonical_url(url);format_selector(video,audio)
     tools=dependencies()
     if not tools['ready']:raise ValueError('Missing: '+', '.join(tools['missing']))
-    _,root=destination(source_id)
-    with _lock, get_user_db() as db:
+    with _lock, exclusive_tool_operation('queuing a YouTube download',wait=False), get_user_db() as db:
+        _,root=destination(source_id)
         job_id=enqueue(db,dict(url=url,source_id=source_id,root=str(root),video=video,audio=audio))
         db.commit()
         _pending.append(job_id)

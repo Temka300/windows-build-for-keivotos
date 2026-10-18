@@ -287,6 +287,22 @@ class FilesApiRouteTests(unittest.TestCase):
         # Reclaiming a nested source's files on forget is covered in
         # test_folder_roles, against the batch apply path.
 
+    def test_edit_path_api_accepts_nested_destination_and_preserves_source_id(self):
+        from routers import suite
+        from services import folder_roles
+        files = self.files
+        parent = files.register_source(files.SourceRegister(path=str(self.library)))
+        old = self.temp / 'old child'; old.mkdir()
+        shutil.copy2(self.library / 'sub' / 'clip.mp4', old / 'clip.mp4')
+        child = files.register_source(files.SourceRegister(path=str(old), display_name='Child'))
+        with patch.object(folder_roles, 'FILES_DB_PATH', self.suite_home / 'base/files.sqlite'), patch.object(folder_roles, 'USER_DB_PATH', self.temp / 'user.sqlite'), patch.object(folder_roles, 'SUITE_HOME', self.suite_home):
+            result = suite.relocate_folder_source(child.source_id, suite.FolderRelocatePayload(path=str(self.library / 'sub')))
+        self.assertEqual(result.source_id, child.source_id)
+        self.assertEqual([node.name for node in files.browse(source_id=child.source_id, parent='')], ['clip.mp4'])
+        files.scan_source(parent.source_id)
+        self.assertEqual([node.name for node in files.search(q='clip', source_id=parent.source_id, limit=200)], ['clip.mp4'])
+        self.assertEqual(next(source for source in files.list_sources() if source.source_id == child.source_id).display_name, 'Child')
+
 
 if __name__ == "__main__":
     unittest.main()

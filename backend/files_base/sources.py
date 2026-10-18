@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -67,6 +68,15 @@ def deterministic_source_id(path: str | Path) -> str:
     """A stable id derived from the absolute path, independent of display name."""
     normalized = os.path.normcase(str(Path(path).expanduser().resolve(strict=False)))
     return "src-" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _unused_source_id(user_conn: sqlite3.Connection, path: Path) -> str:
+    candidate = deterministic_source_id(path)
+    # A path edit keeps that ID at its new location. Reusing the old location
+    # must not claim its annotations or collide with the relocated registration.
+    while get_source(user_conn, candidate) is not None:
+        candidate = 'src-' + uuid.uuid4().hex[:16]
+    return candidate
 
 
 def is_strict_descendant_path(path: str | Path, parent: str | Path) -> bool:
@@ -147,8 +157,8 @@ def register_source(
 ) -> Source:
     """Register ``path`` as a source (idempotent by resolved path). Returns it."""
     resolved = Path(path).expanduser().resolve(strict=False)
-    source_id = deterministic_source_id(resolved)
-    existing = get_source(user_conn, source_id)
+    source_id = _unused_source_id(user_conn, resolved)
+    existing = get_source_by_path(user_conn, resolved)
     if existing is not None:
         return existing
     name = display_name.strip() if display_name and display_name.strip() else resolved.name
@@ -180,6 +190,13 @@ def get_source(user_conn: sqlite3.Connection, source_id: str) -> Source | None:
         (source_id,),
     ).fetchone()
     return _row_to_source(row) if row is not None else None
+
+
+def get_source_by_path(user_conn: sqlite3.Connection, path: str | Path) -> Source | None:
+    """Look up the current location; edited folders keep their original ID."""
+    wanted = os.path.normcase(str(Path(path).expanduser().resolve(strict=False)))
+    return next((source for source in list_sources(user_conn)
+                 if os.path.normcase(str(Path(source.path).expanduser().resolve(strict=False))) == wanted), None)
 
 
 def remove_source(user_conn: sqlite3.Connection, source_id: str) -> bool:
@@ -240,9 +257,11 @@ def upsert_module_source(
 ) -> str:
     """Publish (create or re-role) a module-managed folder in the shared list."""
     resolved = Path(path).expanduser().resolve(strict=False)
-    source_id = deterministic_source_id(resolved)
+    source_id = _unused_source_id(user_conn, resolved)
     name = display_name.strip() if display_name and display_name.strip() else resolved.name
-    existing = get_source(user_conn, source_id)
+    existing = get_source_by_path(user_conn, resolved)
+    if existing is not None:
+        source_id = existing.source_id
     if existing is None:
         user_conn.execute(
             "INSERT INTO files_sources (source_id, path, display_name, role, visible) VALUES (?, ?, ?, ?, 1)",
@@ -260,7 +279,8 @@ def upsert_module_source(
 def remove_source_by_path(user_conn: sqlite3.Connection, path: str | Path) -> bool:
     """Remove a shared-list entry by its path (used when a module drops a folder)."""
     resolved = Path(path).expanduser().resolve(strict=False)
-    return remove_source(user_conn, deterministic_source_id(resolved))
+    source = get_source_by_path(user_conn, resolved)
+    return remove_source(user_conn, source.source_id) if source is not None else False
 
 
 def reconcile_module_sources(

@@ -172,7 +172,8 @@ def _remove_index_rows(
         # Release keeps the folder in Files; forget/removal withdraws it.
         if published and published.get("path"):
             sources.ensure_sources_schema(uconn)
-            source_id = sources.deterministic_source_id(str(published["path"]))
+            shared = sources.get_source_by_path(uconn, str(published["path"]))
+            source_id = shared.source_id if shared is not None else sources.deterministic_source_id(str(published["path"]))
             if keep_files_source:
                 sources.update_source(uconn, source_id, role="files", commit=False)
             else:
