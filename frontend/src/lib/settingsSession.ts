@@ -1,5 +1,4 @@
-import { get, writable } from 'svelte/store';
-import { enabledModules, suiteModules } from './suiteStores';
+import { writable } from 'svelte/store';
 
 export const SETTINGS_SESSION = Symbol('settings-session');
 
@@ -15,11 +14,6 @@ interface SettingsHooks {
 // between sections; the shell knows only these cross-section coordination hooks.
 export function createSettingsSession(pickDirectory: (path: string) => Promise<string | null>) {
   const owners = new Map<string, SettingsHooks>();
-  function activeOwners() {
-    const installed = new Set(get(suiteModules).map(module => module.slug));
-    const enabled = new Set(get(enabledModules));
-    return [...owners].filter(([owner]) => !installed.has(owner) || enabled.has(owner)).map(([, hooks]) => hooks);
-  }
   // Child cleanup can run before the shell restores paused media. Preserve the
   // final owner decision until this dialog session itself is discarded.
   let resumeAfterUnmount = false;
@@ -42,8 +36,8 @@ export function createSettingsSession(pickDirectory: (path: string) => Promise<s
         setBusy(owner, false);
       };
     },
-    async reloadFolders() { await Promise.all(activeOwners().map(owner => owner.reloadFolders?.())); },
-    refreshImages() { for (const owner of activeOwners()) owner.refreshImages?.(); },
+    async reloadFolders() { await Promise.all([...owners.values()].map(owner => owner.reloadFolders?.())); },
+    refreshImages() { for (const owner of owners.values()) owner.refreshImages?.(); },
     startToolPolling(owner: string, toolId: string) { owners.get(owner)?.startToolPolling?.(toolId); },
     resumeMedia() { return resumeAfterUnmount || [...owners.values()].some(owner => owner.resumeMedia?.()); },
     dismissOverlay() { return [...owners.values()].some(owner => owner.dismissOverlay?.()); },

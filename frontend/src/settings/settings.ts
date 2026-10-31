@@ -23,7 +23,6 @@ const contribution: SettingsContribution = {
     { id: 'diagnostics', section: 'general-advanced', label: 'Logs and data', description: 'Open logs, the data folder, and choose diagnostic options.', keywords: ['crash', 'access', 'verbose', 'experimental'] },
     { id: 'motion', section: 'appearance', label: 'Interface motion', description: 'Follow the system or reduce interface animation.', keywords: ['animation', 'reduced motion', 'accessibility'] },
     { id: 'interface-scale', section: 'appearance', label: 'Interface scale', description: 'Use the default or a roomier readable scale.', keywords: ['density', 'comfortable', 'readability', 'text'] },
-    { id: 'notification-position', section: 'appearance', label: 'Notification position', description: 'Choose the corner for action messages.', keywords: ['notifications', 'overlay', 'messages', 'toast', 'corner', 'top', 'bottom', 'left', 'right'] },
     { id: 'startup-module', section: 'startup', label: 'Startup destination', description: `Choose which surface ${SUITE_NAME} opens on launch.`, keywords: ['files', 'module', 'last used', 'launch', 'open'] },
     { id: 'hide-controls-seconds', section: 'player', label: 'Hide controls after', description: 'Set the player idle time from one to ten seconds.', keywords: ['video', 'player', 'timer', 'controls'] },
     { id: 'thumbnail-cache', section: 'storage', label: 'Data & storage', description: 'Application data usage and thumbnail cleanup.', keywords: ['300', '600', '1200', 'cleanup', 'cache'] },

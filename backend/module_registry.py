@@ -53,30 +53,21 @@ except ModuleNotFoundError as exc:
         raise
     ost_descriptor = None
 
-try:
-    from modules.twitter import descriptor as twitter_descriptor
-    from modules.twitter.delivery import contribution as twitter_delivery
-    from modules.twitter.helpers import dispatch_helper as twitter_helper
-except ModuleNotFoundError as exc:
-    if exc.name != 'modules.twitter':
-        raise
-    twitter_descriptor = twitter_delivery = twitter_helper = None
-
 
 # One import/factory entry is the registration boundary for each module.
 _DESCRIPTOR_FACTORIES = (
     files_descriptor,
-) + ((danbooru_descriptor,) if danbooru_descriptor is not None else ()) + ((video_descriptor,) if video_descriptor is not None else ()) + ((manga_descriptor,) if manga_descriptor is not None else ()) + ((youtube_descriptor,) if youtube_descriptor is not None else ()) + ((language_descriptor,) if language_descriptor is not None else ()) + ((ost_descriptor,) if ost_descriptor is not None else ()) + ((twitter_descriptor,) if twitter_descriptor is not None else ())
+) + ((danbooru_descriptor,) if danbooru_descriptor is not None else ()) + ((video_descriptor,) if video_descriptor is not None else ()) + ((manga_descriptor,) if manga_descriptor is not None else ()) + ((youtube_descriptor,) if youtube_descriptor is not None else ()) + ((language_descriptor,) if language_descriptor is not None else ()) + ((ost_descriptor,) if ost_descriptor is not None else ())
 
 
-_DELIVERY_PROVIDERS = ((danbooru_delivery,) if danbooru_delivery is not None else ()) + ((youtube_delivery,) if youtube_delivery is not None else ()) + ((twitter_delivery,) if twitter_delivery is not None else ())
+_DELIVERY_PROVIDERS = ((danbooru_delivery,) if danbooru_delivery is not None else ()) + ((youtube_delivery,) if youtube_delivery is not None else ())
 
 
 def delivery_contributions(target: str):
     return tuple(provider(target) for provider in _DELIVERY_PROVIDERS)
 
 
-_HELPER_HANDLERS = ((danbooru_helper,) if danbooru_helper is not None else ()) + ((youtube_helper,) if youtube_helper is not None else ()) + ((twitter_helper,) if twitter_helper is not None else ())
+_HELPER_HANDLERS = ((danbooru_helper,) if danbooru_helper is not None else ()) + ((youtube_helper,) if youtube_helper is not None else ())
 
 
 def dispatch_helper(

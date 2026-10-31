@@ -3,7 +3,6 @@ import asyncio
 import logging
 from pathlib import Path
 import shutil
-import uuid
 from PIL import Image, ImageDraw
 
 
@@ -40,40 +39,12 @@ def install(media):
             raise RuntimeError('fixture annotation failure after completed publication')
         return original_annotation(*args,**kwargs)
     jobs.annotations.upsert_annotation=annotate
-    def playlist_fixture(job):
-        # Disposable local-only corpus: 131 ordered members, missing media and
-        # a retained missing-job reference. Original fixture bytes are copied.
-        from database import get_user_db
-        source,root=jobs.destination(job['source_id'],job['root'])
-        published=jobs.get(job['id'])
-        refs=[job['id']]
-        with get_user_db() as connection:
-            original=dict(connection.execute('SELECT * FROM youtube_downloads WHERE id=?',(job['id'],)).fetchone())
-            for index in range(1,131):
-                identity=uuid.uuid5(uuid.NAMESPACE_OID,job['id']+':playlist:'+str(index)).hex
-                refs.append(identity)
-                if index==129:continue
-                relative=f'YouTube/{identity}/Video {index:03}.mp4'
-                directory=root/'YouTube'/identity;directory.mkdir()
-                if index not in (1,130):shutil.copy2(media.parent/'fixture-video/sample.mp4',directory/f'Video {index:03}.mp4')
-                shutil.copy2(media.parent/'fixture-cover.png',directory/'cover.png')
-                row={**original,'id':identity,'title':f'Playlist video {index:03}','path':relative,'thumbnail':f'YouTube/{identity}/cover.png'}
-                columns=list(row)
-                connection.execute('INSERT INTO youtube_downloads ('+','.join(columns)+') VALUES ('+','.join('?' for _ in columns)+')',tuple(row[name] for name in columns))
-            for title,positions in [('Ordered queue fixture',range(131)),('Single video fixture',[2]),('Unavailable queue fixture',[1,129,130])]:
-                identity=str(uuid.uuid5(uuid.NAMESPACE_OID,job['id']+':'+title))
-                connection.execute('INSERT INTO youtube_playlists (id,request_id,title) VALUES (?,?,?)',(identity,str(uuid.uuid4()),title))
-                for position in positions:
-                    connection.execute('INSERT INTO youtube_playlist_items (playlist_id,job_id,position) VALUES (?,?,?)',(identity,refs[position],position))
-            connection.commit()
-        return published
-
     async def execute(job):
         _,root=jobs.destination(job['source_id'],job['root'])
         stage=jobs.child_directory(root,['.keivotos','youtube'])/job['id'];stage.mkdir()
         special=job['url'].rsplit('=',1)[-1]
         attempts[special]=attempts.get(special,0)+1
-        title={'retryfailed':'Retry failure fixture','repairvideo':'Registration recovery fixture','stalefailed':'Pagination fixture retry','playlistfix':'Playlist video 000'}.get(special,'A quiet journey through the valley')
+        title={'retryfailed':'Retry failure fixture','repairvideo':'Registration recovery fixture','stalefailed':'Pagination fixture retry'}.get(special,'A quiet journey through the valley')
         if special=='retryfailed' and attempts[special]<=2 or special=='stalefailed' and attempts[special]==1:
             jobs.update(job['id'],title=title)
             (stage/'unfinished.part').write_bytes(b'preserved failed attempt')
@@ -89,5 +60,4 @@ def install(media):
         completion=asyncio.create_task(asyncio.to_thread(jobs.publish,job,stage,{'path':'Valley.mp4','thumbnail':'cover.png','title':title}))
         try:await asyncio.shield(completion)
         except asyncio.CancelledError:await completion;raise
-        if special=='playlistfix':await asyncio.to_thread(playlist_fixture,job)
     jobs.execute=execute

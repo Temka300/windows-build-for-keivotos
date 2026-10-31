@@ -2,22 +2,12 @@
   import {onMount,onDestroy,tick} from 'svelte';
   import AppDrawer from '../../components/AppDrawer.svelte';
   import ModuleLocationMenu from '../../components/ModuleLocationMenu.svelte';
-  import ModuleSidebarDock from '../../components/ModuleSidebarDock.svelte';
   import {settingsInitialSection,settingsOpen} from '../../lib/suiteStores';
-  import {languageApi,type IndexRefresh,type LanguageDocument,type LanguageFile,type LanguageFolder} from './api';
+  import {languageApi,type LanguageDocument,type LanguageFile,type LanguageFolder} from './api';
   import MarkdownEditor from './MarkdownEditor.svelte';
-  import LanguageSidebar from './LanguageSidebar.svelte';
-  import KoreanPractice from './KoreanPractice.svelte';
-  import VocabularyView from './VocabularyView.svelte';
 
-  type OpenNote = LanguageDocument & {sourceId:string; savedContent:string; sessionId:string; dirty:boolean; saving:boolean; error:string; indexNames?:string[]; indexBusy?:boolean; indexGeneration?:number};
+  type OpenNote = LanguageDocument & {sourceId:string; savedContent:string; sessionId:string; dirty:boolean; saving:boolean; error:string};
   type Decision = 'save'|'keep'|'discard';
-  type Section = 'markdown'|'practice'|'vocabulary';
-  let section:Section='markdown',sectionBusy=false,sectionRequest=0;
-  let practiceMounted=false;
-  $: if(section==='practice')practiceMounted=true;
-  let vocabularyMounted=false,vocabulary:VocabularyView;
-  $: if(section==='vocabulary')vocabularyMounted=true;
   let drawer=false, loading=true, error='';
   let folders:LanguageFolder[]=[], sourceId='', files:LanguageFile[]=[], tabs:OpenNote[]=[], openNames:string[]=[], activeName='', openSourceId='';
   let editingName='', nameDraft='', renameBusy=false, nameInput:HTMLInputElement;
@@ -103,28 +93,6 @@
     files=result.files;
     if(openSourceId!==owner){openNames=files.map(file=>file.name);openSourceId=owner;}
   }
-  function indexAcknowledgement(tab:OpenNote,result:IndexRefresh|undefined,names:string[]){
-    const pending=new Set(tab.indexNames??[]);
-    if(result?.status==='failed')names.forEach(name=>pending.add(name));
-    else names.forEach(name=>pending.delete(name));
-    tab.indexNames=[...pending];
-    tab.index_refresh=pending.size?{status:'failed',warning:'The file change is saved; the Files listing needs refresh.'}:result;
-    tab.indexGeneration=(tab.indexGeneration??0)+1;
-  }
-  async function refreshListing(tab:OpenNote){
-    if(tab.indexBusy)return;
-    const name=tab.name,generation=tab.indexGeneration??0;
-    const previous=(tab.indexNames??[]).filter(value=>value!==name).slice(0,64);
-    tab.indexBusy=true;tabs=[...tabs];
-    try{
-      const result=await languageApi.refreshIndex(tab.sourceId,name,previous);
-      if(alive&&tab.name===name&&(tab.indexGeneration??0)===generation)indexAcknowledgement(tab,result,[name,...previous]);
-    }catch(caught){
-      if(alive&&tab.name===name&&(tab.indexGeneration??0)===generation){
-        tab.index_refresh={status:'failed',warning:caught instanceof Error?caught.message:'Could not refresh the Files listing.'};
-      }
-    }finally{tab.indexBusy=false;if(alive)tabs=[...tabs];}
-  }
   function saveTab(tab:OpenNote):Promise<boolean>{
     const source=tab.sourceId, name=tab.name, session=tab.sessionId;
     saveQueue=saveQueue.then(async()=>{
@@ -133,7 +101,6 @@
       tab.saving=true;tab.error='';tabs=[...tabs];
       try{
         const saved=await languageApi.save(source,name,content,tab.revision,session);
-        indexAcknowledgement(tab,saved.index_refresh,[name]);
         tab.revision=saved.revision;
         tab.savedContent=content;
         tab.dirty=tab.content!==content;
@@ -232,27 +199,7 @@
     catch(caught){if(ownsFolder(next,selectedEpoch))error=caught instanceof Error?caught.message:'Could not list Language notes.';}
   }
   async function beforeNavigate(slug:string){
-    if(slug==='language')return true;
-    if(vocabulary&&!await vocabulary.beforeNavigate()){drawer=false;return false;}
-    return await guardTabs(tabs,'switch modules');
-  }
-  async function selectSection(next:Section){
-    if(sectionBusy||pendingDecision||next===section)return;
-    const owner=sourceId,epoch=folderEpoch,request=++sectionRequest;
-    sectionBusy=true;
-    try{
-      if(section==='vocabulary'&&!await vocabulary?.beforeNavigate())return;
-      if(section==='markdown'&&!await guardTabs(tabs,`open ${next==='practice'?'Practice':'Vocabulary'}`)){
-        if(ownsFolder(owner,epoch)&&request===sectionRequest){await tick();editor?.focus();}
-        return;
-      }
-      if(!ownsFolder(owner,epoch)||request!==sectionRequest)return;
-      if(section==='markdown')editor?.suspend();
-      openRequest++;openTarget='';editingName='';locationMenu=null;
-      section=next;
-      await tick();
-      if(section==='markdown'&&ownsFolder(owner,epoch)&&request===sectionRequest)editor?.focus();
-    }finally{if(alive&&request===sectionRequest)sectionBusy=false;}
+    return slug==='language'||await guardTabs(tabs,'switch modules');
   }
   async function create(){
     if(!sourceId)return;
@@ -263,7 +210,7 @@
       const result=await languageApi.create(owner);
       if(!ownsFolder(owner,epoch))return;
       if(!files.some(file=>file.name===result.name))files=[...files,{name:result.name,size:0}].sort((a,b)=>a.name.localeCompare(b.name));
-      if(!tabs.some(tab=>tab.sourceId===owner&&tab.name===result.name))tabs=[...tabs,{...result,sourceId:owner,savedContent:result.content,sessionId:crypto.randomUUID().replaceAll('-',''),dirty:false,saving:false,error:'',indexNames:result.index_refresh?.status==='failed'?[result.name]:[]}];
+      if(!tabs.some(tab=>tab.sourceId===owner&&tab.name===result.name))tabs=[...tabs,{...result,sourceId:owner,savedContent:result.content,sessionId:crypto.randomUUID().replaceAll('-',''),dirty:false,saving:false,error:''}];
       if(!openNames.includes(result.name))openNames=[...openNames,result.name];
       if(request!==openRequest)return;
       activeName=result.name;
@@ -297,7 +244,6 @@
       const result=await languageApi.rename(tab.sourceId,oldName,nextName,tab.revision);
       if(!ownsFolder(owner,epoch))return;
       const wasActive=activeName===oldName;
-      indexAcknowledgement(tab,result.index_refresh,[oldName,result.name]);
       tab.name=result.name;
       files=files.map(file=>file.name===oldName?{...file,name:result.name}:file).sort((a,b)=>a.name.localeCompare(b.name));
       openNames=openNames.map(name=>name===oldName?result.name:name);
@@ -316,20 +262,20 @@
   }
   function keydown(event:KeyboardEvent){
     if(event.key.toLowerCase()!=='s'||(!event.ctrlKey&&!event.metaKey)||event.altKey||event.shiftKey)return;
-    if(section!=='markdown'||!active||editingName||pendingDecision)return;
+    if(!active||editingName||pendingDecision)return;
     const target=event.target;
     if(target!==document.body&&(!(target instanceof Node)||!surface?.contains(target)))return;
     event.preventDefault();
     void saveTab(active);
   }
   function beforeUnload(event:BeforeUnloadEvent){
-    if(!tabs.some(tab=>tab.dirty||tab.saving)&&!vocabulary?.hasDraft())return;
+    if(!tabs.some(tab=>tab.dirty||tab.saving))return;
     event.preventDefault();event.returnValue='';
   }
   function foldersSettings(){settingsInitialSection.set('roots');settingsOpen.set(true);}
   onMount(()=>{window.addEventListener('beforeunload',beforeUnload);void loadFolders();});
   onDestroy(()=>{
-    alive=false;folderEpoch++;openRequest++;sectionRequest++;
+    alive=false;folderEpoch++;openRequest++;
     window.removeEventListener('beforeunload',beforeUnload);
     if(pendingDecision)decide('keep');
     for(const tab of tabs)if(tab.dirty)remember(tab);
@@ -340,10 +286,6 @@
 
 <div class="language-surface" bind:this={surface}>
   <header><button class="menu" aria-label="Open Keivotos menu" on:click={()=>drawer=true}>☰</button><span>Language</span></header>
-  <div class="language-body">
-    <ModuleSidebarDock owner="language" label="Language"><LanguageSidebar {section} busy={sectionBusy||!!pendingDecision} on:select={event=>void selectSection(event.detail)}/></ModuleSidebarDock>
-    <div class="language-content">
-    <div class="markdown-section" hidden={section!=='markdown'} inert={section!=='markdown'} aria-label="Markdown notes">
   {#if error}<p class="notice" role="alert">{error} <button on:click={loadFolders}>Retry</button></p>{/if}
   {#if loading}<p class="notice" role="status">Loading Language folders…</p>{/if}
   {#if !loading&&!folders.length}<div class="empty"><p>Assign a folder the Language role to write Markdown notes.</p><button on:click={foldersSettings}>Add Language folders in Settings</button></div>{/if}
@@ -391,18 +333,11 @@
       {/key}
       <div class="save-status" role="status">
         {#if active.error}<span class="failed">{active.error}</span>{/if}
-        {#if active.index_refresh?.status==='failed'}<span class="failed">{active.index_refresh.warning}</span>{/if}
-        <button disabled={active.indexBusy||active.saving||renameBusy} aria-label={`${active.index_refresh?.status==='failed'?'Retry Files refresh':'Refresh Files listing'} for ${active.name}`} on:click={()=>refreshListing(active)}>{active.indexBusy?'Refreshing…':active.index_refresh?.status==='failed'?'Retry Files refresh':'Refresh Files listing'}</button>
         <span>{#if active.saving}Saving…{:else if active.dirty}Unsaved changes…{:else}Saved{/if}</span>
         {#if active.dirty}<button aria-label={`Save ${active.name}`} on:click={()=>saveTab(active)}>{active.error?'Retry save':'Save'}</button>{/if}
       </div>
     {:else}<div class="empty"><p>{files.length?'Choose a Markdown tab or create a new file.':'Create a Markdown file with +.'}</p></div>{/if}
   {/if}
-    </div>
-    {#if practiceMounted}<div class="practice-host" hidden={section!=='practice'} inert={section!=='practice'}><KoreanPractice active={section==='practice'}/></div>{/if}
-    {#if vocabularyMounted}<div class="vocabulary-host" hidden={section!=='vocabulary'} inert={section!=='vocabulary'}><VocabularyView bind:this={vocabulary} active={section==='vocabulary'}/></div>{/if}
-    </div>
-  </div>
 </div>
 {#if drawer}<AppDrawer beforeNavigate={beforeNavigate} on:close={()=>drawer=false}/>{/if}
 {#if locationMenu}
@@ -424,11 +359,6 @@
 
 <style>
   .language-surface{display:flex;flex:1;min-height:0;flex-direction:column;background:#0f0f14;color:#e0e0e8}
-  .language-body{display:flex;flex:1;min-height:0;min-width:0;overflow:hidden}
-  .language-content{display:flex;flex-direction:column;flex:1;min-width:0;min-height:0}
-  .markdown-section{display:flex;flex-direction:column;flex:1;min-width:0;min-height:0}.markdown-section[hidden]{display:none}
-  .practice-host{display:flex;flex:1;min-height:0;min-width:0}.practice-host[hidden]{display:none}
-  .vocabulary-host{display:flex;flex:1;min-height:0;min-width:0}.vocabulary-host[hidden]{display:none}
   header{display:flex;align-items:center;gap:16px;min-height:60px;padding:8px 16px;border-bottom:1px solid #292936;font-size:18px;font-weight:600}
   .menu{width:36px;height:36px;border-radius:8px;background:#1e1e2e;font-size:16px}
   .tabs{display:flex;align-items:stretch;min-height:48px;border-bottom:1px solid #393946;background:#17171f;min-width:0}

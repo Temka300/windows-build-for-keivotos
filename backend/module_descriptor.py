@@ -65,7 +65,6 @@ class ModuleDescriptor:
     folder_update_hook: FolderUpdateHook | None = None
     rescan_hook: RescanHook | None = None
     relocate_hook: RelocateHook | None = None
-    shared_folder_relocation: bool = False
     router_provider: RouterProvider | None = None
     startup_hook: StartupHook | None = None
     background_tasks_hook: BackgroundTasksHook | None = None

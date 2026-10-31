@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT / 'backend'))
 def test_specs_and_frozen_checks_with_physical_module_absence(tmp_path, installed, target):
     source = tmp_path / 'source'
     source.mkdir()
-    omitted = ('__pycache__',) if installed else ('__pycache__', 'danbooru', 'youtube', 'language', 'ost', 'twitter')
+    omitted = ('__pycache__',) if installed else ('__pycache__', 'danbooru', 'youtube', 'language', 'ost')
     shutil.copytree(ROOT / 'backend', source / 'backend', ignore=shutil.ignore_patterns(*omitted))
     shutil.copytree(ROOT / 'packaging', source / 'packaging')
     shutil.copy2(ROOT / 'app.py', source / 'app.py')
@@ -131,24 +131,3 @@ def test_delivery_composition_accepts_another_owner_without_configuration(monkey
     plan = delivery_plan('linux')
     assert [tool.name for tool in plan.tools] == ['fixture', 'ffmpeg']
     assert plan.helpers == (('Fixture', 'scripts/fixture.py'), ('Folder picker', 'scripts/windows_folder_picker.py'))
-
-
-def test_twitter_helper_and_engine_delivery_are_independent_of_other_optional_modules(tmp_path):
-    source = tmp_path / 'source'
-    source.mkdir()
-    shutil.copytree(ROOT / 'backend', source / 'backend', ignore=shutil.ignore_patterns('__pycache__', 'danbooru', 'youtube', 'language', 'ost'))
-    code = '''import sys;from pathlib import Path
-sys.path.insert(0,str(Path.cwd()/'backend'))
-import module_registry
-from delivery import delivery_plan
-from unittest.mock import patch
-plan=delivery_plan('win32')
-assert 'yt_dlp' in plan.collect_packages and 'modules.twitter.worker' in plan.hidden_imports
-with patch('modules.twitter.worker.main',return_value=17) as worker:
- assert module_registry.dispatch_helper(['--twitter-worker'],load_configuration=lambda:None,run_helper=lambda *_:0)==17
- worker.assert_called_once_with([])
-assert 'modules.twitter.jobs' not in sys.modules and 'yt_dlp' not in sys.modules
-'''
-    result = subprocess.run([sys.executable, '-c', code], cwd=source, capture_output=True, text=True,
-                            env={**os.environ, 'KEIVOTOS_HOME':str(tmp_path / 'home')}, timeout=30)
-    assert result.returncode == 0, result.stdout + result.stderr

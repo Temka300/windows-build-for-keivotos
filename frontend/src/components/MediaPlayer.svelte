@@ -13,10 +13,6 @@
   export let canWrap=false;
   export let navigating=false;
   export let navigationNotice='';
-  export let panelActive=false;
-  export let hasPanel=false;
-  export let onDismissPanel:()=>boolean=()=>false;
-  export let mayReplayCurrent:()=>boolean=()=>true;
   export let onClose:()=>void;
   export let onNavigate:(direction:-1|1,wrap:boolean)=>Promise<boolean>;
   export let onFailure:(item:PlaybackMedia,reason:PlaybackFailure)=>Promise<unknown>;
@@ -62,20 +58,19 @@
     endBusy=true;
     try{
       const moved=await onNavigate(1,loopMode==='all');
-      if(alive&&media===item&&!moved&&loopMode==='all'&&mayReplayCurrent())await replay();
+      if(alive&&media===item&&!moved&&loopMode==='all')await replay();
     }catch{if(alive&&media===item)notice='Could not load the next video. Try again.';}
     finally{endBusy=false;}
   }
   function clearIdle(){if(idleTimer!==undefined){clearTimeout(idleTimer);idleTimer=undefined;}}
   function scheduleIdle(){
     clearIdle();
-    if(!playing||failure||notice||navigationNotice||panelActive||pointerOverControls||keyboardActive)return;
+    if(!playing||failure||notice||navigationNotice||pointerOverControls||keyboardActive)return;
     idleTimer=setTimeout(()=>{controlsVisible=false;idleTimer=undefined;if(viewer?.contains(document.activeElement))viewer.focus();},idleSeconds*1000);
   }
   function reveal(){controlsVisible=true;scheduleIdle();}
   function pointerMove(event:PointerEvent){
     keyboardActive=false;
-    if(panelActive){reveal();return;}
     pointerOverControls=event.target instanceof Element&&!!event.target.closest('button,input');
     const bounds=viewer.getBoundingClientRect();
     const atEdge=event.clientX>=bounds.left&&event.clientX<=bounds.right&&event.clientY>=bounds.top&&event.clientY<=bounds.bottom&&
@@ -95,7 +90,6 @@
   function controlFocus(event:FocusEvent){if(event.target!==viewer&&keyboardActive){controlsVisible=true;clearIdle();}}
   function controlBlur(){void tick().then(()=>{if(alive&&(!viewer?.contains(document.activeElement)||document.activeElement===viewer)){keyboardActive=false;scheduleIdle();}});}
   $: if(navigationNotice){controlsVisible=true;clearIdle();}
-  $: if(panelActive){controlsVisible=true;clearIdle();}else if(mounted)scheduleIdle();
   $: if(mounted) void open(media);
   async function report(reason: PlaybackFailure) {
     if (!media || reported.has(reason)) return;
@@ -115,8 +109,7 @@
     playing = false; position = 0; duration = 0; failure = ''; notice = ''; reported = new Set();
     clearIdle();controlsVisible=true;keyboardActive=false;pointerOverControls=false;pointerInteracting=false;
     endBusy=false;
-    await tick(); if (!alive || media !== item) return;
-    if(panelActive)enabledControls(viewer.querySelector<HTMLElement>('[data-player-panel]')??viewer)[0]?.focus();else viewer?.focus();
+    await tick(); if (!alive || media !== item) return; viewer?.focus();
     player.volume=volume/100;
     if (!['mp4','m4v','webm'].includes(item.ext)) {
       failure = 'This format cannot play here. See Logs.'; void report('unsupported_format'); return;
@@ -143,21 +136,10 @@
     if (document.fullscreenElement === viewer) await document.exitFullscreen().catch(() => {});
     onClose();
   }
-  function enabledControls(root:HTMLElement=viewer):HTMLElement[]{
-    return [...root.querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled)')].filter(node=>!node.closest('[inert]'));
-  }
   function playerKeys(event: KeyboardEvent) {
-    if(event.key==='Tab'&&panelActive){
-      event.preventDefault();keyboardActive=true;controlsVisible=true;clearIdle();
-      const controls=enabledControls(viewer.querySelector<HTMLElement>('[data-player-panel]')??viewer);
-      (event.shiftKey?controls.at(-1):controls[0])?.focus();return;
-    }
-    if(event.key==='Tab'&&!controlsVisible){event.preventDefault();keyboardActive=true;controlsVisible=true;clearIdle();void tick().then(()=>{const controls=enabledControls();(event.shiftKey?controls.at(-1):controls[0])?.focus();});return;}
+    if(event.key==='Tab'&&!controlsVisible){event.preventDefault();keyboardActive=true;controlsVisible=true;clearIdle();void tick().then(()=>{const controls=[...viewer.querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled)')];(event.shiftKey?controls.at(-1):controls[0])?.focus();});return;}
     if(event.key==='Tab'||event.key.startsWith('Arrow')){keyboardActive=true;controlsVisible=true;clearIdle();}
-    if (event.key === 'Escape' && !document.fullscreenElement) {
-      if(onDismissPanel()){event.preventDefault();event.stopPropagation();return;}
-      void close(); return;
-    }
+    if (event.key === 'Escape' && !document.fullscreenElement) {void close(); return;}
     const target=event.target instanceof HTMLElement?event.target:null;
     const editing=target?.closest('button,input,textarea,select,a,[contenteditable="true"]');
     if(!editing&&!event.isComposing&&!event.altKey&&!event.ctrlKey&&!event.metaKey&&!event.shiftKey&&player&&!failure){
@@ -176,7 +158,7 @@
       }
     }
     if (event.key !== 'Tab') return;
-    const controls = enabledControls();
+    const controls = [...viewer.querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled)')];
     const first = controls[0], last = controls[controls.length - 1];
     if (event.shiftKey && (document.activeElement === first || document.activeElement === viewer)) {event.preventDefault(); last?.focus();}
     else if (!event.shiftKey && document.activeElement === last) {event.preventDefault(); first?.focus();}
@@ -214,15 +196,12 @@
           <div class="auto-next"><SettingsSwitch label="Auto next" checked={autoNext} on:click={toggleAutoNext}/></div>
           <button class="loop-button" class:off={loopMode==='off'} class:all={loopMode==='all'} class:one={loopMode==='one'} aria-label={loopMode==='one'?'Loop one':loopMode==='all'?'Loop all':'Loop off'} title={loopMode==='one'?'Loop one':loopMode==='all'?'Loop all':'Loop off'} aria-pressed={loopMode!=='off'} on:click={cycleLoop}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17 2l3 3-3 3"/><path d="M3 11V9a4 4 0 0 1 4-4h13"/><path d="M7 22l-3-3 3-3"/><path d="M21 13v2a4 4 0 0 1-4 4H4"/></svg>{#if loopMode==='one'}<span class="loop-one-mark">1</span>{/if}</button>
           <button class="fullscreen" aria-label="Fullscreen" on:click={fullscreen}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4H4v5m11-5h5v5M4 15v5h5m11-5v5h-5" /></svg></button>
-          {#if $$slots.transport&&hasPanel}<div class="owner-transport"><slot name="transport"/></div>{/if}
         </div>
       </div>
     </div>
-    {#if $$slots.panel&&hasPanel}<div class="owner-panel" data-player-panel inert={!panelActive}><slot name="panel"/></div>{/if}
   </div>
 <style>
- .video-viewer{position:fixed;inset:0;z-index:110;background:black;display:grid;place-items:center;overflow:hidden}
- .owner-transport{display:flex;flex:none;align-items:center}.owner-panel{position:absolute;inset:0;pointer-events:none}
+ .video-viewer{position:fixed;inset:0;z-index:110;background:black;display:grid;place-items:center}
  video{width:100%;height:100%;max-height:100dvh;object-fit:contain}
  .back{position:absolute;top:16px;left:16px;width:40px;height:40px;display:grid;place-items:center;border:0;background:transparent;border-radius:999px;color:#eee;transition:width .18s ease,background-color .18s ease,opacity .18s ease}
  .back:hover,.back:focus-visible{width:56px;background:#33333b}

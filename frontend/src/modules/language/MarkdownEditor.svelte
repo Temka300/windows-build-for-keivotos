@@ -14,9 +14,6 @@
   let menuSerial=0;
 
   export function format(kind:Format){engine?.format(kind);}
-  export function focus(){engine?.focus();}
-  export function suspend(){menu=null;engine?.closeContext(false);}
-  $: if(engine)engine.setContent(value);
 
   onMount(()=>{
     let mounted=true;

@@ -3,7 +3,7 @@
   import AppDrawer from '../../components/AppDrawer.svelte';
   import ModuleLocationMenu from '../../components/ModuleLocationMenu.svelte';
   import {settingsOpen,settingsInitialSection,suiteModules} from '../../lib/suiteStores';
-  import {mangaApi,createPagePrefetch,progressIdentity,type Manga,type Chapter,type ReadingPosition,type ReadingState,type PageMetadata} from './api';
+  import {mangaApi,createPagePrefetch,type Manga,type Chapter} from './api';
   let drawer=false, query='', loading=false, error='';
   let items:Manga[]=[], total=0;
   let selected:Manga|null=null, chapters:Chapter[]=[], chapter:Chapter|null=null;
@@ -14,74 +14,6 @@
   const pageNodes=new Map<number,HTMLElement>();
   const prefetch=createPagePrefetch();
   let loadedPage='';
-  type Session={identity:ReturnType<typeof progressIdentity>;generation:number;sequence:number;pending:Omit<ReadingPosition,'page_count'|'updated_at'>|null;last:string};
-  let readingSession:Session|null=null,progressQueue:Promise<void>=Promise.resolve();
-  let progressTimer:ReturnType<typeof setTimeout>|undefined,progressNotice='',alive=true;
-  let chapterPositions:Record<string,ReadingPosition>={};
-  let positionsLoading=false,positionsError=false, positionsRequest:AbortController|null=null;
-  const chapterKey=(item:Pick<Chapter,'kind'|'path'>)=>item.kind+'/'+item.path;
-  let loadedVertical=new Set<number>(),restoreAnchor:{page:number;anchor:number}|null=null;
-  function observeProgress(page:number,layout:'paged'|'vertical',anchor=0.5){
-    const session=readingSession;if(!session||!chapter||!pageCount||restoreAnchor)return;
-    const signature=JSON.stringify([page,layout,Math.round(anchor*10000)/10000]);
-    if(session.last===signature)return;
-    session.last=signature;session.sequence++;
-    session.pending={...session.identity,generation:session.generation,sequence:session.sequence,page,mode:layout,anchor};
-    clearTimeout(progressTimer);progressTimer=setTimeout(()=>void flushProgress(),400);
-  }
-  function flushProgress(){
-    clearTimeout(progressTimer);
-    const session=readingSession,position=session?.pending;
-    if(!session||!position)return progressQueue;
-    progressQueue=progressQueue.then(async()=>{
-      if(session.pending!==position)return;
-      try{
-        const saved=await mangaApi.saveProgress(position);
-        if(session.pending===position)session.pending=null;
-        if(alive&&selected?.source_id===saved.source_id&&selected.path===saved.series_path){
-          chapterPositions={...chapterPositions,[chapterKey(saved)]:saved};
-          if(readingSession===session)progressNotice='';
-        }
-      }catch(e){if(alive)progressNotice='Reading position could not be saved. '+(e instanceof Error?e.message:'Try again.');}
-    });
-    return progressQueue;
-  }
-  async function loadChapterPositions(manga:Manga){
-    positionsRequest?.abort();const current=new AbortController();positionsRequest=current;positionsLoading=true;positionsError=false;
-    try{
-      let offset=0,next:Record<string,ReadingPosition>={};
-      do{
-        const result=await mangaApi.seriesProgress(manga,offset,current.signal);
-        if(current.signal.aborted||selected!==manga||chapter)return;
-        for(const position of result.items)next[chapterKey(position)]=position;
-        chapterPositions={...next};offset+=120;
-        if(offset>=result.total)break;
-      }while(true);
-      if(progressNotice.startsWith('Saved reading positions are unavailable.'))progressNotice='';
-    }catch(e){
-      if(!current.signal.aborted&&selected===manga){positionsError=true;progressNotice='Saved reading positions are unavailable. '+(e instanceof Error?e.message:'Try again.');}
-    }finally{if(positionsRequest===current)positionsLoading=false;}
-  }
-  async function activateReading(manga:Manga,item:Chapter,metadata:PageMetadata,state:ReadingState|null,current:AbortController){
-    let generation:number|null=null;
-    try{if(state)generation=(await mangaApi.beginProgress(manga,item,metadata.revision,state.generation)).generation;}
-    catch(e){if(!current.signal.aborted)progressNotice='Reading position is unavailable. '+(e instanceof Error?e.message:'Reopen to retry.');}
-    if(current.signal.aborted)return;
-    const position=state?.position;
-    chapterRevision=metadata.revision;pageRevisions=metadata.revisions;
-    pageIndex=position?.page??0;verticalIndex=pageIndex;
-    if(position)mode=position.mode;
-    readingSession=generation===null?null:{identity:progressIdentity(manga,item,chapterRevision),generation,sequence:0,pending:null,last:''};
-    pageCount=metadata.count;
-    if(mode==='vertical')restoreAnchor={page:pageIndex,anchor:position?.anchor??0.5};
-    await tick();if(current.signal.aborted)return;reader?.focus();
-    if(restoreAnchor)positionVertical(restoreAnchor);
-  }
-  function positionVertical(position:{page:number;anchor:number}){
-    const node=pageNodes.get(position.page);if(!node||!reader)return;
-    const rect=node.getBoundingClientRect(),bounds=reader.getBoundingClientRect();
-    reader.scrollTop+=rect.top+rect.height*position.anchor-(bounds.top+bounds.height/2);
-  }
   let dialog:HTMLDivElement, reader:HTMLDivElement;
   let tileFocus:HTMLElement|null=null, chapterFocus:HTMLElement|null=null;
   let libraryRequest:AbortController|null=null, detailRequest:AbortController|null=null, pageRequest:AbortController|null=null;
@@ -117,42 +49,25 @@
   function folders(){settingsInitialSection.set('roots');settingsOpen.set(true);}
   async function open(manga:Manga){
     refreshRequest?.abort();
-    positionsRequest?.abort();
-    tileFocus=document.activeElement as HTMLElement;selected=manga;chapters=[];chapterPositions={};progressNotice='';chapterError='';chapterLoading=true;
+    tileFocus=document.activeElement as HTMLElement;selected=manga;chapters=[];chapterError='';chapterLoading=true;
     detailRequest?.abort();const current=new AbortController();detailRequest=current;
     await tick();dialog?.focus();
-    try{const result=await mangaApi.chapters(manga,current.signal);if(!current.signal.aborted){chapters=result.items;void loadChapterPositions(manga);}}
+    try{const result=await mangaApi.chapters(manga,current.signal);if(!current.signal.aborted)chapters=result.items;}
     catch(e){if(!current.signal.aborted)chapterError=e instanceof Error?e.message:'Could not load chapters.';}
     finally{if(detailRequest===current)chapterLoading=false;}
   }
-  async function close(){positionsRequest?.abort();detailRequest?.abort();refreshRequest?.abort();selected=null;await tick();tileFocus?.focus();}
+  async function close(){detailRequest?.abort();refreshRequest?.abort();selected=null;await tick();tileFocus?.focus();}
   async function read(item:Chapter){
     if(!selected)return;
-    const manga=selected;
     if(!reader?.contains(document.activeElement))chapterFocus=document.activeElement as HTMLElement;
+    refreshRequest?.abort();clearPages();chapter=item;pageIndex=0;controlsVisible=true;readerError='';ratios={};
     pageRequest?.abort();const current=new AbortController();pageRequest=current;
-    await flushProgress();if(current.signal.aborted)return;
-    positionsRequest?.abort();refreshRequest?.abort();clearPages();chapter=item;pageIndex=0;controlsVisible=true;readerError='';ratios={};progressNotice='';
     await tick();reader?.focus();
-    try{
-      const metadata=await mangaApi.pages(manga,item,current.signal);if(current.signal.aborted)return;
-      let state:ReadingState|null=null;
-      try{state=await mangaApi.progress(manga,item,metadata.revision);}
-      catch(e){progressNotice='Saved reading position is unavailable. '+(e instanceof Error?e.message:'Try reopening.');}
-      if(current.signal.aborted)return;
-      if(state?.position&&(state.position.page<0||state.position.page>=metadata.count||state.position.page_count!==metadata.count||state.position.revision!==metadata.revision)){state={...state,position:null};}
-      await activateReading(manga,item,metadata,state,current);
-    }catch(e){if(!current.signal.aborted)readerError=e instanceof Error?e.message:'Could not open chapter. See Logs.';}
+    try{const result=await mangaApi.pages(selected,item,current.signal);if(!current.signal.aborted){chapterRevision=result.revision;pageRevisions=result.revisions;pageCount=result.count;}}
+    catch(e){if(!current.signal.aborted)readerError=e instanceof Error?e.message:'Could not open chapter. See Logs.';}
   }
-  function clearPages(){
-    clearTimeout(progressTimer);readingSession=null;restoreAnchor=null;loadedVertical=new Set();
-    prefetch.clear();loadedPage='';cancelScrollFrame();verticalIndex=0;pageNodes.clear();observer?.disconnect();observer=null;pageCount=0;chapterRevision='';pageRevisions=[];converted=new Set();failedPage=null;visible=new Set();
-  }
-  async function back(){
-    const current=pageRequest;pageRequest?.abort();refreshRequest?.abort();await flushProgress();if(pageRequest!==current)return;clearPages();chapter=null;
-    if(selected&&detailRequest&&!detailRequest.signal.aborted)void loadChapterPositions(selected);
-    await tick();chapterFocus?.focus();
-  }
+  function clearPages(){prefetch.clear();loadedPage='';cancelScrollFrame();verticalIndex=0;pageNodes.clear();observer?.disconnect();observer=null;pageCount=0;chapterRevision='';pageRevisions=[];converted=new Set();failedPage=null;visible=new Set();}
+  async function back(){pageRequest?.abort();refreshRequest?.abort();clearPages();chapter=null;await tick();chapterFocus?.focus();}
   function pageUrl(index:number,revisions=pageRevisions,fallback=converted){return mangaApi.page(selected!,chapter!,index,false,revisions[index],fallback.has(index)?'webp':'original');}
   function warmPages(manga:Manga|null,item:Chapter|null,count:number,index:number,layout:string,revisions:string[],fallback:Set<number>,loaded:string){
     if(!manga||!item||!count||layout!=='paged'){prefetch.clear();return;}
@@ -162,7 +77,7 @@
   $: warmPages(selected,chapter,pageCount,pageIndex,mode,pageRevisions,converted,loadedPage);
   function pageLoaded(event:Event,index:number,url:string){
     const image=event.currentTarget as HTMLImageElement;
-    if(chapter&&pageCount&&mode==='paged'&&index===pageIndex&&pageUrl(index)===url&&image.getAttribute('src')===url&&image.naturalWidth>0){loadedPage=url;observeProgress(index,'paged');}
+    if(chapter&&pageCount&&mode==='paged'&&index===pageIndex&&pageUrl(index)===url&&image.getAttribute('src')===url)loadedPage=url;
   }
   function pageFailed(event:Event,index:number,url:string){
     if(!chapter||!pageCount||pageUrl(index)!==url||(mode==='paged'&&index!==pageIndex))return;
@@ -174,11 +89,11 @@
     refreshRequest?.abort();const current=new AbortController();refreshRequest=current;
     const openChapter=chapter,openManga=selected;
     await load(false,true);if(current.signal.aborted)return;
-    if(error){positionsRequest?.abort();pageRequest?.abort();detailRequest?.abort();clearPages();chapter=null;selected=null;items=[];return;}
+    if(error){pageRequest?.abort();detailRequest?.abort();clearPages();chapter=null;selected=null;items=[];return;}
     if(openManga){
       const fresh=items.find(item=>item.source_id===openManga.source_id&&item.path===openManga.path);
-      if(!fresh){positionsRequest?.abort();pageRequest?.abort();detailRequest?.abort();clearPages();chapter=null;selected=null;return;}
-      if(selected?.source_id===openManga.source_id&&selected.path===openManga.path){selected=fresh;if(!chapter)void loadChapterPositions(fresh);}
+      if(!fresh){pageRequest?.abort();detailRequest?.abort();clearPages();chapter=null;selected=null;return;}
+      if(selected?.source_id===openManga.source_id&&selected.path===openManga.path)selected=fresh;
     }
     if(!openChapter||!openManga||chapter!==openChapter||!pageCount)return;
     try{
@@ -218,13 +133,7 @@
     observer.observe(node);
     return {destroy(){observer?.unobserve(node);if(pageNodes.get(index)===node)pageNodes.delete(index);}};
   }
-  async function dimensions(event:Event,index:number,url:string){
-    const image=event.currentTarget as HTMLImageElement;
-    if(!chapter||!pageCount||mode!=='vertical'||pageUrl(index)!==url||image.getAttribute('src')!==url||!image.naturalWidth)return;
-    ratios={...ratios,[index]:image.naturalWidth/image.naturalHeight};loadedVertical.add(index);
-    if(restoreAnchor?.page===index){const position=restoreAnchor;await tick();if(restoreAnchor===position){positionVertical(position);restoreAnchor=null;}}
-    trackVerticalPage();
-  }
+  function dimensions(event:Event,index:number){const image=event.currentTarget as HTMLImageElement;ratios={...ratios,[index]:image.naturalWidth/image.naturalHeight};trackVerticalPage();}
   function nearestPage(all=false){
     const bounds=reader.getBoundingClientRect(),center=bounds.top+bounds.height/2;
     let nearest=verticalIndex,distance=Infinity;
@@ -240,17 +149,9 @@
   function cancelScrollFrame(){if(scrollFrame!==null)cancelAnimationFrame(scrollFrame);scrollFrame=null;}
   function trackVerticalPage(){
     if(mode!=='vertical'||!reader||!pageCount||scrollFrame!==null)return;
-    scrollFrame=requestAnimationFrame(()=>{
-      scrollFrame=null;if(mode!=='vertical'||!reader||!pageCount)return;
-      verticalIndex=nearestPage();
-      const node=pageNodes.get(verticalIndex),image=node?.querySelector('img');
-      if(!node||!loadedVertical.has(verticalIndex)||!image?.complete||!image.naturalWidth||image.getAttribute('src')!==pageUrl(verticalIndex))return;
-      const rect=node.getBoundingClientRect(),bounds=reader.getBoundingClientRect(),center=bounds.top+bounds.height/2;
-      if(rect.top<=center&&rect.bottom>center)observeProgress(verticalIndex,'vertical',(center-rect.top)/rect.height);
-    });
+    scrollFrame=requestAnimationFrame(()=>{scrollFrame=null;if(mode==='vertical'&&reader&&pageCount)verticalIndex=nearestPage();});
   }
   async function changeMode(){
-    void flushProgress();restoreAnchor=null;
     if(mode==='paged'){
       cancelScrollFrame();pageIndex=nearestPage(true);
       reader.scrollTo({top:0});
@@ -263,9 +164,8 @@
   function pointerDown(event:PointerEvent){pointerStart={x:event.clientX,y:event.clientY};pointerDragged=false;}
   function pointerMove(event:PointerEvent){if(pointerStart&&Math.hypot(event.clientX-pointerStart.x,event.clientY-pointerStart.y)>8)pointerDragged=true;}
   function readerClick(event:MouseEvent){
-    if(!pageCount)return;
     if(pointerDragged){pointerDragged=false;return;}
-    if((event.target as HTMLElement).closest('.reader-controls,.reader-error,.progress-notice'))return;
+    if((event.target as HTMLElement).closest('.reader-controls,.reader-error'))return;
     const bounds=reader.getBoundingClientRect(),position=(event.clientY-bounds.top)/bounds.height;
     if(mode==='paged'&&position<=.25)turnPage(-1);
     else if(mode==='paged'&&position>=.75)turnPage(1);
@@ -277,11 +177,11 @@
   onMount(()=>{
     void load();let settingsSeen=false;
     const stopSettings=settingsOpen.subscribe(value=>{if(value)settingsSeen=true;else if(settingsSeen){settingsSeen=false;void refreshSources();}});
-    const stopModules=suiteModules.subscribe(modules=>{if(modules.find(module=>module.id==='manga')?.enabled===false){positionsRequest?.abort();libraryRequest?.abort();detailRequest?.abort();pageRequest?.abort();refreshRequest?.abort();clearPages();chapter=null;selected=null;items=[];}});
+    const stopModules=suiteModules.subscribe(modules=>{if(modules.find(module=>module.id==='manga')?.enabled===false){libraryRequest?.abort();detailRequest?.abort();pageRequest?.abort();refreshRequest?.abort();clearPages();chapter=null;selected=null;items=[];}});
     const focus=()=>{if(!settingsSeen)void refreshSources();};window.addEventListener('focus',focus);
     return()=>{stopSettings();stopModules();window.removeEventListener('focus',focus);};
   });
-  onDestroy(()=>{void flushProgress();alive=false;clearTimeout(progressTimer);prefetch.clear();cancelScrollFrame();clearTimeout(debounce);positionsRequest?.abort();libraryRequest?.abort();detailRequest?.abort();pageRequest?.abort();refreshRequest?.abort();observer?.disconnect();});
+  onDestroy(()=>{prefetch.clear();cancelScrollFrame();clearTimeout(debounce);libraryRequest?.abort();detailRequest?.abort();pageRequest?.abort();refreshRequest?.abort();observer?.disconnect();});
 </script>
 
 <svelte:window on:resize={trackVerticalPage}/>
@@ -320,18 +220,10 @@
         <h2 class="series-title" title={selected.name}>{selected.name}</h2>
       </div>
       <div class="chapter-cover"><img alt={selected.name} src={mangaApi.page(selected,selected.cover,0,true)} on:load={e=>(e.currentTarget as HTMLImageElement).style.visibility=''} on:error={e=>(e.currentTarget as HTMLImageElement).style.visibility='hidden'}/></div>
-      <div class="chapter-list" aria-busy={chapterLoading||positionsLoading}>
+      <div class="chapter-list" aria-busy={chapterLoading}>
         {#if chapterLoading}<p class="muted">Loading…</p>{/if}
         {#if chapterError}<p role="alert">{chapterError}</p>{/if}
-        {#if progressNotice&&!chapter}<p role="status">{progressNotice}</p>{/if}
-        {#each chapters as item (`${item.kind}/${item.path}`)}
-          {@const position=chapterPositions[chapterKey(item)]}
-          {@const percent=position?(position.page+1)/position.page_count*100:0}
-          <button class="chapter-row" aria-label={item.name} on:click={()=>read(item)} on:contextmenu={event=>openLocation(event,item.name,selected!.source_id,item.path)} on:keydown={event=>locationKey(event,item.name,selected!.source_id,item.path)}>
-            <span class="chapter-label">{item.name}<span class="chapter-chevron" aria-hidden="true">›</span></span>
-            <span class="chapter-progress" role="progressbar" aria-label={item.name+' reading position'} aria-valuemin="0" aria-valuemax="100" aria-valuenow={percent} aria-valuetext={position?`Page ${position.page+1} of ${position.page_count}`:positionsError?'Reading position unavailable':positionsLoading?'Loading reading position':'Not started'}><span class="chapter-progress-fill" style={`width:${percent}%`}></span></span>
-          </button>
-        {/each}
+        {#each chapters as item (`${item.kind}/${item.path}`)}<button on:click={()=>read(item)} on:contextmenu={event=>openLocation(event,item.name,selected!.source_id,item.path)} on:keydown={event=>locationKey(event,item.name,selected!.source_id,item.path)}>{item.name}<span aria-hidden="true">›</span></button>{/each}
       </div>
     </div>
   </div>
@@ -347,7 +239,6 @@
       <span class="page-counter" role="status" aria-live="off" aria-label={pageCount?`Page ${(mode==='vertical'?verticalIndex:pageIndex)+1} of ${pageCount}`:'Page count unavailable'}>{pageCount?`${(mode==='vertical'?verticalIndex:pageIndex)+1} / ${pageCount}`:'— / —'}</span>
       <select aria-label="Reading layout" bind:value={mode} on:change={changeMode}><option value="paged">Paged</option><option value="vertical">Vertical scroll</option></select>
     </div>
-    {#if progressNotice}<div class="progress-notice" role="status">{progressNotice}{#if readingSession?.pending}<button on:click={()=>flushProgress()}>Retry saving position</button>{/if}</div>{/if}
     {#if readerError}<div class="reader-error" role="alert">{readerError}
       {#if failedPage!==null&&!converted.has(failedPage)}<button on:click={convertFailed}>Open converted page</button>{/if}
       <button on:click={()=>chapter&&read(chapter)}>Reopen chapter</button>
@@ -359,7 +250,7 @@
     {:else if mode==='vertical'}
       {#each Array(pageCount) as _,i}
         <div class="page" data-page={i} style={`--ratio:${ratios[i]||2/3}`} use:watchPage={i}>
-          {#if visible.has(i)}{@const url=pageUrl(i,pageRevisions,converted)}<img alt={`Page ${i+1}`} src={url} on:load={e=>dimensions(e,i,url)} on:error={event=>pageFailed(event,i,url)}/>{/if}
+          {#if visible.has(i)}{@const url=pageUrl(i,pageRevisions,converted)}<img alt={`Page ${i+1}`} src={url} on:load={e=>dimensions(e,i)} on:error={event=>pageFailed(event,i,url)}/>{/if}
         </div>
       {/each}
     {/if}
@@ -367,7 +258,6 @@
 {/if}
 
 <style>
- .progress-notice{position:fixed;bottom:16px;left:16px;right:16px;z-index:2;background:#26262d;border-radius:8px;padding:10px 16px;font-size:13px}.progress-notice button{text-decoration:underline;margin-left:12px}
  .manga-surface{display:flex;flex:1;min-height:0;flex-direction:column;background:#0f0f14;color:#e0e0e8}
  header{display:flex;align-items:center;gap:16px;min-height:60px;border-bottom:1px solid #2a2a3a;padding:8px 16px}
  .menu{width:36px;height:36px;border-radius:8px;background:#1e1e2e}
@@ -382,17 +272,11 @@
  svg{width:24px;height:24px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
  .empty{text-align:center;color:#9292a5;padding:40px}.more{display:block;margin:24px auto;padding:8px 12px}
  .scrim{position:fixed;inset:0;z-index:110;display:grid;place-items:center;background:#000b;padding:24px}
- .chapter-dialog{position:relative;display:grid;grid-template-columns:minmax(0,230px) minmax(0,1fr);grid-template-rows:minmax(0,1fr);gap:32px;width:min(720px,100%);height:min(500px,80dvh);max-height:calc(100dvh - 48px);overflow:hidden;padding:88px 32px 32px;background:#19191f;border-radius:14px;color:#eee}
- .chapter-cover{aspect-ratio:2/3;max-height:100%;min-height:0;background:#24242d;border-radius:6px;overflow:hidden;align-self:start}
- .chapter-cover img{width:100%;height:100%;object-fit:contain}
- .chapter-list{overflow-y:auto;overflow-x:hidden;min-height:0;min-width:0;overscroll-behavior:contain;scrollbar-gutter:stable;padding:4px}
- .chapter-row{position:relative;display:block;width:100%;text-align:left;padding:13px 12px;border-radius:6px;font-size:14px;line-height:20px;overflow-wrap:anywhere;overflow:hidden}
- .chapter-row:hover{background:#ffffff0b}
- .chapter-row:focus-visible{outline-offset:-2px}
- .chapter-label{display:flex;align-items:center;justify-content:space-between;gap:16px}
- .chapter-chevron{font-size:20px;line-height:20px;color:#888}
- .chapter-progress{position:absolute;left:0;right:0;bottom:0;display:block;height:4px;overflow:hidden}
- .chapter-progress-fill{display:block;height:100%;background:var(--accent)}
+ .chapter-dialog{position:relative;display:grid;grid-template-columns:minmax(0,230px) minmax(0,1fr);gap:32px;width:min(720px,100%);max-height:80dvh;padding:88px 32px 32px;background:#19191f;border-radius:14px;color:#eee}
+ .chapter-cover{aspect-ratio:2/3;background:#24242d;border-radius:6px;overflow:hidden;align-self:start}
+ .chapter-cover img{width:100%;height:100%;object-fit:cover}
+ .chapter-list{overflow:auto;min-height:0}.chapter-list button{display:flex;align-items:center;justify-content:space-between;width:100%;text-align:left;padding:16px 12px;border-radius:6px;font-size:14px;gap:16px;overflow-wrap:anywhere}
+ .chapter-list button:hover{background:#ffffff0b}.chapter-list span{font-size:23px;color:#888}
  .back{display:grid;place-items:center;flex-shrink:0;width:40px;height:40px;border:0;background:transparent;border-radius:999px;color:#eee;transition:width .18s ease,background-color .18s ease}
  .back:hover,.back:focus-visible{width:56px;background:#33333b}
  .chapter-heading{position:absolute;top:16px;left:16px;right:16px}

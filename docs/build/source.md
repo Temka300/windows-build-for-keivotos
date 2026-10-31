@@ -2,10 +2,6 @@
 
 ## Requirements
 
-These are developer/source requirements. An extracted [Linux portable
-build](../user/installation.md#portable-linux-build) includes its runtime and
-does not require installing these tools.
-
 - Windows 10 or later, or Linux/WSL (see platform limitations below)
 - [uv](https://docs.astral.sh/uv/)
 - Node.js 24 or another version accepted by the locked frontend toolchain, only when building the frontend

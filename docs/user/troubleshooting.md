@@ -71,24 +71,6 @@ missing, enter the key again. Windows-encrypted keys cannot be decrypted on Linu
 A complete `DANBOORU_USERNAME` / `DANBOORU_API_KEY` environment override works
 without an unlocked vault. Do not paste keys into bug reports or command history.
 
-## A Linux portable build does not launch
-
-Extract the whole tar.gz first, then run `sh ./start-keivotos.sh` in its folder.
-Use `sh ./start-portable.sh --launcher-check` to diagnose execution/resource/data
-permissions without starting the server. An execute-permission error names the
-file to allow in Properties or with `chmod u+x`. A `noexec` error names a drive
-restriction: move the complete application folder to an executable location such
-as one under your Linux home. No root or automatic system-package installation is
-needed. Keep the listed bundled tools, `_internal`, launchers and `linux-tools.txt`.
-
-For an unwritable data folder, use a location owned by your user through
-`KEIVOTOS_HOME`, or correct the folder's permissions. Do not delete `user.sqlite`
-or existing profile files. If the default port is occupied, stop the existing
-instance or select another with `--port N`. An incompatible host library error
-needs the Linux distribution/version and exact message; see
-[build/platform limits](../build/linux.md). In WSL or a session without browser
-integration, use `--no-browser` and open the printed loopback address manually.
-
 ## Report a problem
 
 Include the Keivotos version, Windows version, exact action, first relevant console error, and whether the issue occurs with an isolated `KEIVOTOS_HOME`. The exact dated runtime and HTTP access log paths are shown in Settings → Library. Use the runtime file for startup, background work, mutations, warnings, and errors; use the access file for request methods, paths, and status codes. Remove personal paths, credentials, API keys, and media before attaching logs.

@@ -80,7 +80,6 @@ def resolve_within_source(
     source_root: str | Path,
     relative_path: str,
     forbidden_roots: list[Path],
-    *, must_exist: bool = True,
 ) -> Path:
     """Resolve ``source_root`` + ``relative_path`` to a safe, existing path.
 
@@ -107,7 +106,7 @@ def resolve_within_source(
         if resolved_key == fenced or resolved_key.startswith(fenced + os.sep):
             raise ServeDenied(403, "That location is not served")
 
-    if must_exist and not resolved.exists():
+    if not resolved.exists():
         raise ServeDenied(404, "File not found on disk")
     return resolved
 

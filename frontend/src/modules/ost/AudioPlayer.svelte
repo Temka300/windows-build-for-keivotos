@@ -15,7 +15,7 @@
   export let onBrowse:()=>void;
   let audio:HTMLAudioElement,view:HTMLDivElement;
   let mounted=false,alive=true,serial=0,endBusy=false;
-  let playing=false,position=0,duration=0,failure='',notice='',artMissing=false,activeUrl='';
+  let playing=false,position=0,duration=0,failure='',notice='',artMissing=false;
   let loopMode:LoopMode='off',autoNext=true,volume=100;
   let stopLoop=()=>{},stopAuto=()=>{},stopVolume=()=>{};
   const loopOrder:LoopMode[]=['off','all','one'];
@@ -26,13 +26,7 @@
     const whole=Math.max(0,Math.floor(Number.isFinite(seconds)?seconds:0));
     return `${Math.floor(whole/60)}:${String(whole%60).padStart(2,'0')}`;
   }
-  function current(event:Event){return alive&&event.currentTarget===audio&&audio.currentSrc===activeUrl;}
-  function synchronize(event:Event){
-    if(!current(event))return;
-    playing=!audio.paused&&!audio.ended;
-    position=Number.isFinite(audio.currentTime)?audio.currentTime:0;
-    duration=Number.isFinite(audio.duration)&&audio.duration>0?audio.duration:0;
-  }
+  function current(event:Event){return alive&&event.currentTarget===audio;}
   function mediaError(event:Event){
     if(!current(event)||!audio.error||audio.error.code===1)return;
     failure='This track is unavailable or its audio format cannot play here. Choose another track or Retry.';
@@ -40,7 +34,7 @@
   }
   async function play(item=track,generation=serial){
     const element=audio;
-    try{await element.play();if(alive&&track===item&&generation===serial&&element===audio)notice='';}
+    try{await element.play();if(alive&&track===item&&generation===serial)notice='';}
     catch(caught){
       if(!alive||track!==item||generation!==serial||element!==audio)return;
       if(caught instanceof DOMException&&caught.name==='AbortError')return;
@@ -55,18 +49,17 @@
     audio?.pause();playing=false;position=0;duration=0;failure='';notice='';artMissing=false;endBusy=false;
     await tick();
     if(!alive||track!==item||generation!==serial)return;
-    activeUrl=filesApi.fileUrl(item.source_id,item.path);
-    audio.src=activeUrl;audio.load();
     audio.volume=volume/100;
     void play(item,generation);
   }
   async function retry(){
-    await open(track);
+    ++serial;failure='';notice='';position=0;duration=0;
+    audio.load();await play();
   }
   function togglePlay(){if(!audio||failure)return;if(audio.paused)void play();else audio.pause();}
   async function navigate(direction:-1|1){await onNavigate(direction,loopMode==='all');}
   async function ended(event:Event){
-    if(!current(event)||!audio.ended||failure||endBusy)return;
+    if(!current(event)||failure||endBusy)return;
     playing=false;
     const item=track,generation=serial;
     if(loopMode==='one'){audio.currentTime=0;void play(item,generation);return;}
@@ -104,11 +97,16 @@
 </script>
 
 <div class="audio-player" class:expanded>
-  <!-- svelte-ignore a11y_media_has_caption -->
-  <audio bind:this={audio} preload="metadata" on:error={mediaError} on:ended={ended}
-    on:play={synchronize} on:playing={synchronize} on:pause={synchronize}
-    on:timeupdate={synchronize} on:loadedmetadata={synchronize} on:durationchange={synchronize}
-    on:volumechange={volumeChanged}></audio>
+  {#key `${track.source_id}:${track.path}`}
+    <!-- svelte-ignore a11y_media_has_caption -->
+    <audio bind:this={audio} src={filesApi.fileUrl(track.source_id,track.path)} preload="metadata"
+      on:error={mediaError} on:ended={ended}
+      on:play={event=>{if(current(event))playing=true;}}
+      on:pause={event=>{if(current(event))playing=false;}}
+      on:timeupdate={event=>{if(current(event))position=audio.currentTime;}}
+      on:durationchange={event=>{if(current(event))duration=Number.isFinite(audio.duration)?audio.duration:0;}}
+      on:volumechange={volumeChanged}></audio>
+  {/key}
   {#if expanded}
     <!-- svelte-ignore a11y_no_noninteractive_tabindex a11y_no_noninteractive_element_interactions -->
     <div class="cover-view" role="region" aria-label="OST player" tabindex="-1" bind:this={view} on:keydown={keys}>
@@ -141,8 +139,8 @@
     </div>
     <div class="seek-row">
       <span class="time" aria-label="Current time">{stamp(position)}</span>
-      <input class="seek" aria-label="Seek" aria-valuetext={duration?`${stamp(position)} of ${stamp(duration)}`:'Duration unavailable'} type="range" min="0" max={duration||0} step="0.1" value={position} disabled={!duration||!!failure} style={`--progress:${duration?position/duration*100:0}%`} on:input={seek}/>
-      <span class="time" aria-label="Track duration">{duration?stamp(duration):'—:—'}</span>
+      <input class="seek" aria-label="Seek" aria-valuetext={`${stamp(position)} of ${stamp(duration)}`} type="range" min="0" max={duration||0} step="0.1" value={position} disabled={!duration||!!failure} style={`--progress:${duration?position/duration*100:0}%`} on:input={seek}/>
+      <span class="time" aria-label="Track duration">{stamp(duration)}</span>
     </div>
   </section>
 </div>

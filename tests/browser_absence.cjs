@@ -51,37 +51,14 @@ const report={checks:[],errors:[],requests:[]};
   for(const name of ['Startup','Data & storage','Backup','Folders','Attachments','Appearance']){
    await dialog.getByRole('navigation',{name:'Settings sections'}).getByRole('button',{name,exact:true}).click();
   }
-  await dialog.getByRole('navigation',{name:'Settings sections'}).getByRole('button',{name:'Appearance',exact:true}).first().click();
-  await page.getByLabel('Notification position',{exact:true}).selectOption('top-right');
-  assert.equal(await page.locator('.notification-overlay').getAttribute('data-position'),'top-right');
-  assert.equal(await page.locator('.action-notification').count(),0);
-  check('Shared notification host and saved position setting work with all optional modules physically absent');
   await page.getByRole('button',{name:'Close settings',exact:true}).click();
   check('suite drawer and every remaining Settings section work without module UI');
-
   const paths=(await (await context.request.get(config.url+'/openapi.json')).json()).paths;
   assert(!paths['/api/images']);assert(!paths['/api/danbooru/credentials']);assert(!paths['/api/language/documents']);assert(paths['/api/files/sources']);
   assert(!paths['/api/ost/folders']);assert(!paths['/api/ost/library']);
   assert(!paths['/api/ost/cover']);
-  assert(!paths['/api/ost/tracks']);
-  assert(!Object.keys(paths).some(p=>p.startsWith('/api/twitter')));
-  assert(!report.requests.some(p=>p.startsWith('/api/twitter')));
-  assert.equal(await page.getByRole('switch',{name:'Twitter module',exact:true}).count(),0);
-  assert.equal(await page.getByRole('navigation',{name:'Twitter sections'}).count(),0);
-  assert.equal(await page.locator('.twitter-surface').count(),0);
-  assert.equal(await page.getByRole('textbox',{name:'Search saved posts or paste a Twitter URL'}).count(),0);
-  assert.equal(await page.getByRole('navigation',{name:'OST sections'}).count(),0);
   assert.equal(await page.getByRole('switch',{name:'OST module',exact:true}).count(),0);
   assert(!report.requests.some(p=>p.startsWith('/api/ost')));
-  assert(!Object.keys(paths).some(p=>p.startsWith('/api/youtube')));
-  assert(!report.requests.some(p=>p.startsWith('/api/youtube')));
-  assert.equal(await page.getByRole('navigation',{name:'YouTube sections'}).count(),0);
-  assert.equal(await page.getByRole('navigation',{name:'Language sections'}).count(),0);
-  assert.equal(await page.locator('[data-sidebar-owner]').count(),0);
-  assert.equal(await page.locator('.module-sidebar-grip-track,.practice-actions,.practice-card').count(),0);
-  assert.equal(await page.getByRole('menuitem',{name:'Add to playlists'}).count(),0);
-  assert.equal(await page.getByRole('dialog',{name:'Add to playlists'}).count(),0);
-  check('Files-only UI has no YouTube sidebar or playlist routes/requests when optional owners are absent');
   assert(!report.requests.some(p=>p.startsWith('/api/danbooru')||p.startsWith('/api/language')||p==='/api/images'||p==='/api/tools'));
   assert.deepEqual(report.errors,[]);
   check('module endpoints absent, no module requests or browser errors');

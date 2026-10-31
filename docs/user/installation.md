@@ -14,49 +14,15 @@ See [`../build/source.md`](../build/source.md). Both a Git clone and an extracte
 
 ## Portable Linux build
 
-Linux artifacts target x86_64. Download the `.tar.gz` and its `.sha256`, verify
-with `sha256sum -c <archive>.tar.gz.sha256`, then extract with
-`tar -xzf <archive>.tar.gz`. Replace `<archive>` with the downloaded filename
-without its `.tar.gz` suffix. Keep the entire extracted folder together.
-Linux releases provide tar.gz and its checksum; Windows releases provide ZIP.
+Linux artifacts target x86_64 and require a compatible Linux system. Verify
+the ZIP with `sha256sum -c <archive>.zip.sha256`, then extract the complete
+folder with `unzip <archive>.zip`. Run `./Keivotos` from the extracted folder.
+Keep `gallery-dl`, `ffmpeg`, `_internal`, and the bundled notices together.
+If your extractor loses execute permissions, run
+`chmod +x Keivotos gallery-dl ffmpeg` first.
 
-In a terminal inside the extracted folder, choose one launch:
-
-```sh
-sh ./start-keivotos.sh
-```
-
-Normal launch uses `$XDG_DATA_HOME/Keivotos`, or `~/.local/share/Keivotos`.
-For data beside the application, use:
-
-```sh
-sh ./start-portable.sh
-```
-
-Portable launch chooses the adjacent `data/` folder. Both launches honor an
-explicit `KEIVOTOS_HOME` and existing empty/custom `portable.txt` settings;
-they do not move or convert an existing profile. Keep the terminal open while
-using the app; Ctrl+C stops it. The browser opens when ready at
-<http://localhost:52325/>. `--no-browser` keeps it closed; `--port N` chooses a port.
-
-No uv, Python, Node.js or administrator access is needed to run the package.
-Your Linux system still needs compatible host libraries. The build baseline and
-verification limits are in [Linux builds](../build/linux.md).
-
-To check execution and write permissions without starting the server, run
-`sh ./start-portable.sh --launcher-check`. Standard tar extraction retains execute
-permissions. If an extractor removes them, allow execution for `Keivotos` and
-each tool listed in `linux-tools.txt`, or run `chmod u+x` on those files.
-If the drive is mounted `noexec`, copy the entire folder to an executable location
-under your Linux home; `chmod` cannot change a mount restriction. The launcher
-reports missing files and unwritable data folders without replacing existing data.
-
-An optional user-level menu shortcut is created only when you run
-`sh ./install-desktop.sh`, or `sh ./install-desktop.sh --portable`. It opens a
-terminal for the server and preserves existing shortcuts by refusing replacement.
-Keep the application folder in place after installing its shortcut.
-
-Saving Danbooru credentials requires an unlocked Secret Service vault in the
-same Linux desktop session; environment overrides remain available. Portable
-profiles do not make Windows-encrypted or Linux vault credentials transferable.
-See [troubleshooting](troubleshooting.md) for host/permission diagnostics.
+An empty `portable.txt` beside the application selects a local `data/` folder.
+Saving Danbooru credentials requires an unlocked Secret Service vault in your
+Linux desktop session; environment overrides remain available. Build scripts
+and their platform requirements are described in
+[the portable build instructions](../build/windows.md#linux-target-from-powershell-or-bash).

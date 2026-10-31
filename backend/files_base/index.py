@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -30,18 +29,6 @@ from files_base.schema import ensure_files_schema
 # Keivotos-generated directories that live inside a user's folder but must never
 # be indexed as browsable content (currently the attachment byte store).
 EXCLUDED_DIR_NAMES = {".keivotos"}
-_source_work_lock = threading.RLock()
-
-
-@contextmanager
-def source_work(*, wait: bool = True):
-    """Serialize source snapshots, scans and path changes in this process."""
-    if not _source_work_lock.acquire(blocking=wait):
-        raise RuntimeError('Wait for folder work to finish before editing folders')
-    try:
-        yield
-    finally:
-        _source_work_lock.release()
 
 
 @dataclass(frozen=True)
@@ -107,7 +94,6 @@ def scan_source(
     root: Path,
     *,
     excluded_roots: Iterable[Path] = (),
-    commit: bool = True,
 ) -> dict[str, int]:
     """Index every file and directory beneath ``root`` for ``source_id``.
 
@@ -195,8 +181,7 @@ def scan_source(
         "SELECT COUNT(*) FROM files_index WHERE source_id = ? AND available = 0",
         (source_id,),
     ).fetchone()[0]
-    if commit:
-        connection.commit()
+    connection.commit()
     return {
         "added": added,
         "updated": updated,

@@ -17,7 +17,7 @@ try {
     await fs.cp(path.join(frontend, 'src'), path.join(project, 'src'), { recursive: true });
     await fs.symlink(path.join(frontend, 'node_modules'), path.join(project, 'node_modules'), 'dir');
     if (mode === 'absent') {
-      for (const owner of ['danbooru','ost','twitter']) await fs.rm(path.join(project, 'src/modules', owner), { recursive: true });
+      for (const owner of ['danbooru','ost']) await fs.rm(path.join(project, 'src/modules', owner), { recursive: true });
     }
     if (mode === 'additional') {
       const extra = path.join(project, 'src/modules/fixture');
@@ -60,7 +60,7 @@ ${mode !== 'absent' ? "export { activeCollectionId, selectedImageId, viewMode } 
     assert.equal(get(registry.startupModule), mode === 'additional' ? 'fixture' : 'last');
     assert.deepEqual(registry.settingsContributions.map(owner => owner.group.id),
       mode === 'absent' ? ['general', 'files', 'youtube'] : mode === 'additional'
-        ? ['general', 'files', 'danbooru', 'fixture', 'youtube', 'twitter'] : ['general', 'files', 'danbooru', 'youtube', 'twitter']);
+        ? ['general', 'files', 'danbooru', 'fixture', 'youtube'] : ['general', 'files', 'danbooru', 'youtube']);
     assert.equal(moduleUi('files').slug, 'files');
     assert.deepEqual(moduleUi('files').drawerActions, []);
     assert.equal(surfaceComponent('files').owner, 'FilesView.svelte');
@@ -75,15 +75,11 @@ ${mode !== 'absent' ? "export { activeCollectionId, selectedImageId, viewMode } 
       assert(!Object.keys(chunk.modules).some(id => id.includes('/danbooru/')));
       assert.strictEqual(surfaceComponent('ost'), surfaceComponent('files'));
       assert(!Object.keys(chunk.modules).some(id => id.includes('/ost/')));
-      assert.strictEqual(surfaceComponent('twitter'), surfaceComponent('files'));
-      assert(!Object.keys(chunk.modules).some(id => id.includes('/twitter/')));
       assert(!writes.includes('keivotos:image-size'), 'absent module must not initialize stores');
     } else {
       const { activeCollectionId, selectedImageId, viewMode } = registry;
       assert.equal(surfaceComponent('ost').owner, 'OstSurface.svelte');
       assert.equal(moduleUi('ost').slug, 'ost');
-      assert.equal(surfaceComponent('twitter').owner, 'TwitterSurface.svelte');
-      assert.equal(moduleUi('twitter').slug, 'twitter');
       activeCollectionId.set(123); selectedImageId.set(456); viewMode.set('tags');
       activateModule('danbooru');
       assert.equal(get(activeModule), 'danbooru');

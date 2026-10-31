@@ -330,11 +330,6 @@ def list_sources() -> list[SourceInfo]:
 
 @router.post("/api/files/sources", response_model=SourceInfo)
 def register_source(payload: SourceRegister) -> SourceInfo:
-    with index.source_work():
-        return _register_source(payload)
-
-
-def _register_source(payload: SourceRegister) -> SourceInfo:
     reason = sources.unsafe_source_reason(payload.path, _forbidden_source_paths())
     if reason is not None:
         raise HTTPException(status_code=400, detail=reason)
@@ -350,11 +345,6 @@ def _register_source(payload: SourceRegister) -> SourceInfo:
 
 @router.post("/api/files/sources/{source_id}/scan", response_model=ScanSummary)
 def scan_source(source_id: str) -> ScanSummary:
-    with index.source_work():
-        return _scan_source(source_id)
-
-
-def _scan_source(source_id: str) -> ScanSummary:
     with get_user_db() as user_conn:
         sources.ensure_sources_schema(user_conn)
         source = sources.get_source(user_conn, source_id)

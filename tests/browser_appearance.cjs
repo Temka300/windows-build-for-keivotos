@@ -62,20 +62,6 @@ const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
   await section('Backup').click();await page.waitForTimeout(250);await page.screenshot({path:path.join(config.output,'modern-backup.png')});
   await section('Appearance').click();await page.waitForTimeout(250);await page.screenshot({path:path.join(config.output,'appearance.png')});
   check('accent and style persist independently across reload and switch back without losing settings');
-
-  const notificationCorner=page.getByLabel('Notification position',{exact:true});
-  assert.equal(await notificationCorner.inputValue(),'bottom-right');
-  for(const corner of ['top-left','top-right','bottom-left','bottom-right']){
-   await notificationCorner.selectOption(corner);
-   assert.equal(await page.locator('.notification-overlay').getAttribute('data-position'),corner);
-   assert.equal(await page.evaluate(()=>JSON.parse(localStorage.getItem('keivotos:notification-position'))),corner);
-  }
-  await notificationCorner.selectOption('bottom-left');await page.reload();await open();
-  assert.equal(await notificationCorner.inputValue(),'bottom-left');
-  await page.evaluate(()=>localStorage.setItem('keivotos:notification-position',JSON.stringify('invalid-corner')));await page.reload();await open();
-  assert.equal(await notificationCorner.inputValue(),'bottom-right');
-  assert.equal(await page.getByLabel('Accent style',{exact:true}).inputValue(),'cyan');
-  check('Notification corner is saved independently of appearance and invalid stored values safely fall back to Bottom right');
   assert.deepEqual(report.errors,[]);
  }finally{fs.writeFileSync(path.join(config.output,'report.json'),JSON.stringify(report,null,2));await context.tracing.stop({path:path.join(config.output,'trace.zip')});await browser.close();}
 })().catch(error=>{console.error(error);process.exitCode=1;});

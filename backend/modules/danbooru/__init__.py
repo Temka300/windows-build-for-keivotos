@@ -18,7 +18,7 @@ def publish_sources(user_connection: sqlite3.Connection) -> None:
     folders = [(str(row["path"]), row["display_name"]) for row in rows]
     sources.reconcile_module_sources(user_connection, "danbooru", folders)
     for path, _name in folders:
-        source = sources.get_source_by_path(user_connection, path)
+        source = sources.get_source(user_connection, sources.deterministic_source_id(path))
         if source is not None:
             user_connection.execute(
                 "UPDATE registered_folders SET display_name=? WHERE path=?",

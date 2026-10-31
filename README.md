@@ -9,8 +9,7 @@ Keivotos is a local-first library that indexes the files you already own. Instea
 | Platform | Status |
 |---|---|
 | Windows | ✅ |
-| Linux x86_64 | Extracted portable build; see [platform limits](docs/build/linux.md) |
-| macOS | untested, source may run |
+| Linux / macOS | untested, source may run |
 
 ## Getting started
 
@@ -21,16 +20,6 @@ Keivotos is a local-first library that indexes the files you already own. Instea
 3. Your browser opens at <http://localhost:52325/>.
 
 If you downloaded a release with a `.sha256` file next to it, you can use it to verify the ZIP.
-
-### Portable build (Linux)
-
-Verify the adjacent checksum, then extract the whole `.tar.gz` with `tar -xzf`.
-Open a terminal in the extracted folder and run `sh ./start-keivotos.sh`.
-Use `sh ./start-portable.sh` to keep data beside the application instead.
-The package includes its Python runtime and tools; running it needs no uv,
-Python installation, Node.js or administrator access. Linux downloads use tar.gz.
-See [installation](docs/user/installation.md#portable-linux-build) for permissions,
-data locations and the optional application-menu shortcut.
 
 ### From source
 
@@ -65,9 +54,7 @@ Windows also supports double-clicking `run.bat`; Linux/WSL can use `sh run.sh`. 
 
 ## Where your data lives
 
-On Windows, the default writable home is `%LOCALAPPDATA%\Keivotos`. On Linux,
-it is `$XDG_DATA_HOME/Keivotos`, or `~/.local/share/Keivotos` when unset.
-An explicit `KEIVOTOS_HOME` and existing `portable.txt` keep their precedence.
+By default everything Keivotos writes goes to `%LOCALAPPDATA%\Keivotos`.
 
 To run **portable** — keeping all data next to the executable so the whole
 folder can be moved or copied between machines — put an empty file named

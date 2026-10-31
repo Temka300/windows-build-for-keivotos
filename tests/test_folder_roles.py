@@ -31,7 +31,6 @@ class FolderRoleServiceTests(unittest.TestCase):
         self.patchers = [
             patch.object(database, "USER_DB_PATH", self.user_db),
             patch.object(folder_roles, "FILES_DB_PATH", self.files_db),
-            patch.object(folder_roles, "USER_DB_PATH", self.user_db),
             patch.object(folder_roles, "SUITE_HOME", self.temp / "suite"),
         ]
         for patcher in self.patchers:
@@ -291,253 +290,14 @@ class FolderRoleServiceTests(unittest.TestCase):
             folder_roles.rescan("does-not-exist")
         self.assertEqual(caught.exception.status_code, 404)
 
-    def test_relocate_files_preserves_identity_annotations_and_unavailable_rows(self) -> None:
+    def test_relocate_rejects_a_files_folder(self) -> None:
         added = folder_roles.apply_changes([
             folder_roles.FolderChange(None, str(self.library), "Library", "files")
         ])
         source = added["sources"][0]
-        from files_base import annotations
-        with database.get_user_db() as connection:
-            annotations.ensure_annotations_schema(connection)
-            connection.execute("INSERT INTO files_annotations(subject_kind,source_id,relative_path,description) VALUES('folder',?,'','Keep this note')", (source.source_id,))
-            connection.execute('UPDATE files_sources SET path=?, visible=0 WHERE source_id=?', ('D:\\Library', source.source_id))
-            connection.commit()
-        with index.open_index(self.files_db) as connection:
-            connection.execute("INSERT INTO files_index(source_id,path,relative_path,name,available) VALUES(?,?,'missing.txt','missing.txt',1)", (source.source_id, 'D:\\Library\\missing.txt'))
-            connection.commit()
-        target = self.temp / 'New folder 한글'
-        target.mkdir(); (target / 'one.txt').write_text('copied file')
-        result = folder_roles.relocate(source.source_id, str(target.resolve()))
-        self.assertEqual(result['source_id'], source.source_id)
-        with database.get_user_db() as connection:
-            current = sources.get_source(connection, source.source_id)
-            self.assertEqual(current.path, str(target.resolve()))
-            self.assertEqual((current.display_name, current.role, current.visible), ('Library', 'files', False))
-            self.assertEqual(connection.execute('SELECT description FROM files_annotations').fetchone()['description'], 'Keep this note')
-            self.assertEqual(sources.register_source(connection, target).source_id, source.source_id)
-            reused_old_path = sources.register_source(connection, self.library, 'Different folder')
-            self.assertNotEqual(reused_old_path.source_id, source.source_id)
-            self.assertEqual(sources.get_source(connection, source.source_id).path, str(target.resolve()))
-        with index.open_index(self.files_db) as connection:
-            missing = connection.execute("SELECT * FROM files_index WHERE relative_path='missing.txt'").fetchone()
-            self.assertFalse(missing['available'])
-            self.assertEqual(missing['source_id'], source.source_id)
-        self.assertEqual(folder_roles.relocate(source.source_id, str(target.resolve()))['files_updated'], 0)
-
-    def test_relocate_validation_and_scan_failure_preserve_original_state(self):
-        source = folder_roles.apply_changes([folder_roles.FolderChange(None, str(self.library), 'Library', 'files')])['sources'][0]
-        target = self.temp / 'target'; target.mkdir()
-        for invalid in ('relative/folder', str(self.temp / 'missing'), str(self.library / 'one.txt'), str(self.temp / 'suite')):
-            with self.subTest(path=invalid), self.assertRaises(folder_roles.FolderRegistryError):
-                folder_roles.relocate(source.source_id, invalid)
-        other = self.temp / 'other'; other.mkdir()
-        folder_roles.apply_changes([folder_roles.FolderChange(None, str(other), 'Other', 'files')])
-        for invalid in (other, self.temp):
-            with self.assertRaises(folder_roles.FolderRegistryError):
-                folder_roles.relocate(source.source_id, str(invalid.resolve()))
-        with patch.object(index, 'scan_source', side_effect=OSError('generated scan failure')):
-            with self.assertRaisesRegex(folder_roles.FolderRegistryError, 'path was not changed'):
-                folder_roles.relocate(source.source_id, str(target.resolve()))
-        with database.get_user_db() as connection:
-            self.assertEqual(sources.get_source(connection, source.source_id).path, str(self.library.resolve()))
-        with index.open_index(self.files_db) as connection:
-            self.assertEqual(connection.execute('SELECT path FROM files_index WHERE source_id=?', (source.source_id,)).fetchone()[0], str((self.library / 'one.txt').resolve()))
-        self.assertEqual((self.library / 'one.txt').read_text(), 'one')
-
-    def test_shared_module_relocation_preserves_source_keyed_personal_state(self):
-        from modules.manga.user_schema import SCHEMA
-        for role in ('video', 'manga', 'ost', 'language', 'youtube', 'twitter'):
-            with self.subTest(role=role):
-                old = self.temp / role; old.mkdir()
-                target = self.temp / (role + '-moved'); target.mkdir()
-                with database.get_user_db() as connection:
-                    suite_modules.set_enabled(connection, role, True)
-                    source = sources.register_source(connection, old, role, role=role)
-                    connection.executescript(SCHEMA)
-                    connection.execute("INSERT INTO manga_reading_sessions(source_id,path,kind,generation) VALUES(?,'chapter.cbz','archive',7)", (source.source_id,))
-                    connection.commit()
-                self.assertEqual(folder_roles.relocate(source.source_id, str(target.resolve()))['source_id'], source.source_id)
-                with database.get_user_db() as connection:
-                    self.assertEqual(sources.get_source(connection, source.source_id).role, role)
-                    self.assertEqual(connection.execute('SELECT generation FROM manga_reading_sessions WHERE source_id=?', (source.source_id,)).fetchone()['generation'], 7)
-
-    def test_active_download_refuses_path_edit_without_mutation(self):
-        source = folder_roles.apply_changes([folder_roles.FolderChange(None, str(self.library), 'Library', 'files')])['sources'][0]
-        target = self.temp / 'target'; target.mkdir()
-        with database.get_user_db() as connection:
-            connection.execute('CREATE TABLE youtube_downloads(source_id TEXT, status TEXT)')
-            connection.execute("INSERT INTO youtube_downloads VALUES(?,'queued')", (source.source_id,))
-            connection.commit()
-        with self.assertRaisesRegex(folder_roles.FolderRegistryError, 'Wait for downloads'):
-            folder_roles.relocate(source.source_id, str(target.resolve()))
-        with database.get_user_db() as connection:
-            self.assertEqual(sources.get_source(connection, source.source_id).path, str(self.library.resolve()))
-
-    def test_relocation_refuses_concurrent_scan_and_unsafe_index_paths(self):
-        import threading
-        source = folder_roles.apply_changes([folder_roles.FolderChange(None, str(self.library), 'Library', 'files')])['sources'][0]
-        target = self.temp / 'target'; target.mkdir()
-        held = threading.Event(); release = threading.Event()
-        def scanning():
-            with index.source_work():
-                held.set(); release.wait(5)
-        worker = threading.Thread(target=scanning)
-        worker.start(); self.assertTrue(held.wait(3))
-        try:
-            with self.assertRaisesRegex(folder_roles.FolderRegistryError, 'folder work'):
-                folder_roles.relocate(source.source_id, str(target.resolve()))
-        finally:
-            release.set(); worker.join(5)
-        with index.open_index(self.files_db) as connection:
-            connection.execute("UPDATE files_index SET relative_path='../escape'")
-            connection.commit()
-        with self.assertRaisesRegex(folder_roles.FolderRegistryError, 'relinked safely'):
-            folder_roles.relocate(source.source_id, str(target.resolve()))
-        with database.get_user_db() as connection:
-            self.assertEqual(sources.get_source(connection, source.source_id).path, str(self.library.resolve()))
-
-    def copied_nested_roots(self):
-        from files_base import annotations
-        parent = self.temp / 'copied library'
-        child = parent / 'hehetwitter'
-        child.mkdir(parents=True)
-        (parent / 'parent.txt').write_text('parent original', encoding='utf-8')
-        (child / 'post.txt').write_text('child original', encoding='utf-8')
-        self.copied_old_parent = 'D:\\Library' if sys.platform != 'win32' else str(self.temp / 'absent windows copy')
-        self.copied_old_child = self.copied_old_parent + '\\hehetwitter'
-        with database.get_user_db() as connection:
-            annotations.ensure_annotations_schema(connection)
-            suite_modules.set_enabled(connection, 'twitter', True)
-            for source_id, path, role in [('parent-id', self.copied_old_parent, 'files'),
-                                          ('child-id', self.copied_old_child, 'twitter')]:
-                connection.execute('INSERT INTO files_sources(source_id,path,display_name,role,visible) VALUES(?,?,?,?,1)',
-                                   (source_id, path, source_id, role))
-                cursor = connection.execute("INSERT INTO files_annotations(subject_kind,source_id,relative_path,description) VALUES('folder',?,'',?)", (source_id, 'note for ' + source_id))
-                connection.execute("INSERT INTO files_annotation_links(annotation_id,url,label,kind,position) VALUES(?,'https://example.invalid/original','Keep link','source',0)", (cursor.lastrowid,))
-            connection.commit()
-        with index.open_index(self.files_db) as connection:
-            for source_id, path, relative, is_dir in [
-                ('parent-id', self.copied_old_parent + '\\parent.txt', 'parent.txt', 0),
-                ('parent-id', self.copied_old_child, 'hehetwitter', 1),
-                ('child-id', self.copied_old_child + '\\post.txt', 'post.txt', 0),
-                ('child-id', self.copied_old_child + '\\missing.txt', 'missing.txt', 0)]:
-                connection.execute('INSERT INTO files_index(source_id,path,relative_path,parent,name,is_dir,available) VALUES(?,?,?,?,?,?,1)',
-                                   (source_id, path, relative, '', relative, is_dir))
-            connection.commit()
-        return parent, child
-
-    def nested_user_records(self):
-        with database.get_user_db() as connection:
-            return {table: connection.execute(f'SELECT * FROM {table} ORDER BY id').fetchall()
-                    for table in ('files_annotations', 'files_annotation_links')}
-
-    def test_parent_first_copied_nested_repair_preserves_ownership_and_metadata(self):
-        # Include duplicate derived entries when a corrected parent initially
-        # indexes the child, whose registration still has its old Windows path.
-        parent, child = self.copied_nested_roots()
-        before = self.nested_user_records()
-        for source_id, path in [('parent-id', parent), ('child-id', child)]:
-            self.assertEqual(folder_roles.relocate(source_id, str(path.resolve()))['source_id'], source_id)
-        self.assertEqual(self.nested_user_records(), before)
-        with index.open_index(self.files_db) as connection:
-            row = connection.execute('SELECT source_id,available FROM files_index WHERE path=?', (str((child / 'post.txt').resolve()),)).fetchone()
-            self.assertEqual((row['source_id'], row['available']), ('child-id', 1))
-            directory = connection.execute('SELECT source_id FROM files_index WHERE path=?', (str(child.resolve()),)).fetchone()
-            self.assertEqual(directory['source_id'], 'parent-id')
-            self.assertEqual(connection.execute("SELECT count(*) FROM files_index WHERE source_id='child-id' AND relative_path='missing.txt' AND available=0").fetchone()[0], 1)
-        with database.get_user_db() as connection:
-            self.assertEqual(sources.get_source(connection, 'child-id').role, 'twitter')
-        self.assertEqual(folder_roles.relocate('child-id', str(child.resolve()))['files_updated'], 0)
-        self.assertEqual(folder_roles.relocate('parent-id', str(parent.resolve()))['files_updated'], 0)
-
-    def test_child_first_repair_preserves_child_ownership_when_parent_is_corrected(self):
-        parent, child = self.copied_nested_roots()
-        before = self.nested_user_records()
-        folder_roles.relocate('child-id', str(child.resolve()))
-        # A legacy parent fact for the same relative file must not replace the
-        # child's existing entry when correcting the containing root.
-        with index.open_index(self.files_db) as connection:
-            child_row = dict(connection.execute('SELECT * FROM files_index WHERE path=?', (str((child / 'post.txt').resolve()),)).fetchone())
-            connection.execute("INSERT INTO files_index(source_id,path,relative_path,name,available) VALUES('parent-id',?,'hehetwitter/post.txt','post.txt',1)", (self.copied_old_child + '\\post.txt',))
-            connection.commit()
-        folder_roles.relocate('parent-id', str(parent.resolve()))
-        with index.open_index(self.files_db) as connection:
-            row = connection.execute('SELECT * FROM files_index WHERE path=?', (str((child / 'post.txt').resolve()),)).fetchone()
-            self.assertEqual((row['source_id'], row['id']), ('child-id', child_row['id']))
-            self.assertEqual(connection.execute("SELECT available FROM files_index WHERE source_id='parent-id' AND relative_path='hehetwitter/post.txt'").fetchone()[0], 0)
-        self.assertEqual(self.nested_user_records(), before)
-
-    def test_relocating_child_out_rescans_its_old_parent(self):
-        parent, child = self.copied_nested_roots()
-        folder_roles.relocate('parent-id', str(parent.resolve()))
-        folder_roles.relocate('child-id', str(child.resolve()))
-        target = self.temp / 'child copy'
-        shutil.copytree(child, target)
-        before = self.nested_user_records()
-        folder_roles.relocate('child-id', str(target.resolve()))
-        with index.open_index(self.files_db) as connection:
-            for path, owner in [(child / 'post.txt', 'parent-id'), (target / 'post.txt', 'child-id')]:
-                row = connection.execute('SELECT source_id,available FROM files_index WHERE path=?', (str(path.resolve()),)).fetchone()
-                self.assertEqual((row['source_id'], row['available']), (owner, 1))
-        self.assertEqual(self.nested_user_records(), before)
-        self.assertEqual((child / 'post.txt').read_text(), 'child original')
-
-    def test_nested_relink_rollback_restores_ancestor_claims_and_user_records(self):
-        parent, child = self.copied_nested_roots()
-        folder_roles.relocate('parent-id', str(parent.resolve()))
-        before = self.nested_user_records()
-        with index.open_index(self.files_db) as connection:
-            indexed = [dict(row) for row in connection.execute('SELECT * FROM files_index ORDER BY id')]
-        original = folder_roles._scan_registered_source
-        def fail_child(connection, source, all_sources, **kwargs):
-            if source.source_id == 'child-id':
-                raise OSError('generated nested scan failure')
-            return original(connection, source, all_sources, **kwargs)
-        with patch.object(folder_roles, '_scan_registered_source', side_effect=fail_child):
-            with self.assertRaisesRegex(folder_roles.FolderRegistryError, 'path was not changed'):
-                folder_roles.relocate('child-id', str(child.resolve()))
-        with index.open_index(self.files_db) as connection:
-            self.assertEqual([dict(row) for row in connection.execute('SELECT * FROM files_index ORDER BY id')], indexed)
-        with database.get_user_db() as connection:
-            self.assertEqual(sources.get_source(connection, 'child-id').path, self.copied_old_child)
-        self.assertEqual(self.nested_user_records(), before)
-
-    def test_nested_relink_keeps_unrelated_index_conflicts_as_refusals(self):
-        parent, child = self.copied_nested_roots()
-        unrelated = self.temp / 'unrelated'; unrelated.mkdir()
-        with database.get_user_db() as connection:
-            foreign = sources.register_source(connection, unrelated)
-        with index.open_index(self.files_db) as connection:
-            connection.execute('INSERT INTO files_index(source_id,path,relative_path,name,available) VALUES(?,?,?,?,1)',
-                               (foreign.source_id, str((child / 'post.txt').resolve()), 'post.txt', 'post.txt'))
-            connection.commit()
-        with self.assertRaisesRegex(folder_roles.FolderRegistryError, 'conflicts with an indexed file'):
-            folder_roles.relocate('child-id', str(child.resolve()))
-        with database.get_user_db() as connection:
-            self.assertEqual(sources.get_source(connection, 'child-id').path, self.copied_old_child)
-
-    def test_nested_relink_refuses_related_active_downloads(self):
-        parent, child = self.copied_nested_roots()
-        folder_roles.relocate('parent-id', str(parent.resolve()))
-        with database.get_user_db() as connection:
-            connection.execute('CREATE TABLE youtube_downloads(source_id TEXT, status TEXT)')
-            connection.execute("INSERT INTO youtube_downloads VALUES('parent-id','queued')")
-            connection.commit()
-        with self.assertRaisesRegex(folder_roles.FolderRegistryError, 'Wait for downloads'):
-            folder_roles.relocate('child-id', str(child.resolve()))
-        with database.get_user_db() as connection:
-            self.assertEqual(sources.get_source(connection, 'child-id').path, self.copied_old_child)
-
-    def test_parent_relink_preserves_disabled_child_without_owner_work(self):
-        parent, child = self.copied_nested_roots()
-        folder_roles.relocate('child-id', str(child.resolve()))
-        with database.get_user_db() as connection:
-            suite_modules.set_enabled(connection, 'twitter', False)
-        before = self.nested_user_records()
-        folder_roles.relocate('parent-id', str(parent.resolve()))
-        with index.open_index(self.files_db) as connection:
-            self.assertEqual(connection.execute('SELECT source_id FROM files_index WHERE path=?', (str((child / 'post.txt').resolve()),)).fetchone()['source_id'], 'child-id')
-        self.assertEqual(self.nested_user_records(), before)
+        with self.assertRaises(folder_roles.FolderRegistryError) as caught:
+            folder_roles.relocate(source.source_id, str(self.temp / "elsewhere"))
+        self.assertEqual(caught.exception.status_code, 400)
 
     def test_relocate_dispatches_to_module_and_reindexes_at_new_path(self) -> None:
         with database.get_user_db() as connection:
@@ -563,16 +323,16 @@ class FolderRoleServiceTests(unittest.TestCase):
         registry = config.MODULE_REGISTRY.replacing(replace(
             danbooru,
             relocate_hook=fake_module_relocate,
-            folder_update_hook=None,
             publish_hook=lambda connection: None,
         ))
         with patch.object(folder_roles, "MODULE_REGISTRY", registry):
             result = folder_roles.relocate(source.source_id, str(moved_dir))
 
-        new_id = source.source_id
+        new_id = sources.deterministic_source_id(moved_dir)
         self.assertEqual(result["source_id"], new_id)
         self.assertEqual(result["files_updated"], 7)
         with index.open_index(self.files_db) as index_connection:
+            self.assertEqual(index.source_entry_count(index_connection, source.source_id), 0)
             self.assertEqual(index.source_entry_count(index_connection, new_id), 1)
 
     def test_rescan_dispatches_to_the_owning_module_hook(self) -> None:

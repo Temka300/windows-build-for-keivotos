@@ -81,5 +81,3 @@ def seed_ost(media: Path):
     for number in range(1, 261):
         write_audio(media / 'Large library' / f'Track {number}.wav')
     write_audio(media / 'Root track.wav')
-    # A separately registered root can contain the exact same relative name.
-    write_audio(media.parent / 'second-music/Album 2/Track 2.wav', seconds=20)

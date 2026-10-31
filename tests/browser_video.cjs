@@ -31,7 +31,6 @@ const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
   check('Files folder path sits below Search and above the file area; source navigation remains clickable');
   await page.getByRole('button',{name:'Open Keivotos menu'}).click();await page.locator('.app-drawer').getByRole('button',{name:'Video',exact:true}).click();
   await page.getByRole('button',{name:'sample.mp4',exact:true}).waitFor();
-  assert.equal(await page.getByRole('button',{name:'Playlist videos',exact:true}).count(),0);
   const sampleTile=page.getByRole('button',{name:'sample.mp4',exact:true});
   const otherTile=page.getByRole('button',{name:'sample.webm',exact:true});
   const videoTitle=page.locator('.video-tile[title="sample.mp4"] .video-name');

@@ -65,9 +65,3 @@ def seed_manga(media):
         converted=BytesIO();image.save(converted,'BMP');z.writestr('21-fallback.bmp',converted.getvalue())
         animated=BytesIO();image.save(animated,'GIF',save_all=True,append_images=[Image.new('RGB',(120,60),'red')],duration=100,loop=0)
         z.writestr('22-animated.gif',animated.getvalue())
-    # A long chapter list exercises dialog containment and progress pagination
-    # while preserving the eight-series fixture and existing ordinary chapters.
-    raw=page(1)
-    for n in range(11,142):
-        chapter=media/'Blue Hour'/f'Chapter {n}';chapter.mkdir()
-        (chapter/'1.png').write_bytes(raw)

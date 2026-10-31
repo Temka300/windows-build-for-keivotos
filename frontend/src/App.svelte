@@ -3,7 +3,6 @@
   import { onMount } from 'svelte';
   import { get } from 'svelte/store';
   import './app.css';
-  import NotificationOverlay from './components/NotificationOverlay.svelte';
   import { SUITE_NAME } from './lib/product';
   import { suiteApi } from './lib/suiteApi';
   import { activeModule, enabledModules, interfaceScale, motionPreference, startupModule, suiteModules, settingsOpen, settingsInitialSection } from './lib/suiteStores';
@@ -83,8 +82,6 @@
     <main class="flex flex-1 items-center justify-center text-gray-400" role="status">Opening Keivotos…</main>
   {/if}
 </div>
-
-<NotificationOverlay />
 
 {#if $settingsOpen && settingsModule}
   <svelte:component this={settingsModule.default} initialSection={$settingsInitialSection} on:close={() => settingsOpen.set(false)} />
