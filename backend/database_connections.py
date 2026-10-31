@@ -77,13 +77,57 @@ def _row_factory(cursor: sqlite3.Cursor, row: tuple) -> dict[str, Any]:
 
 
 @contextmanager
+def read_existing_databases(paths):
+    """One restore lease for a passive multi-store view; no nested read leases."""
+    with _database_access_gate.read():
+        connections=[]
+        try:
+            for path in paths:
+                require_storage_ready(path)
+                path=Path(path)
+                connection=None
+                if path.is_file():
+                    connection=sqlite3.connect(path.resolve().as_uri()+'?mode=ro',uri=True)
+                    connections.append(connection)
+                    connection.execute('PRAGMA query_only=ON')
+                    connection.execute('BEGIN')
+                else:
+                    connections.append(None)
+            yield tuple(connections)
+        finally:
+            for connection in connections:
+                if connection is not None:connection.close()
+
+
+@contextmanager
 def connect_database(path: str | Path) -> Generator[sqlite3.Connection, None, None]:
     with _database_access_gate.read():
-        conn = sqlite3.connect(path, check_same_thread=False)
-        conn.row_factory = _row_factory
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA foreign_keys = ON")
+        require_storage_ready(path)
+        conn = None
         try:
+            conn = sqlite3.connect(path, check_same_thread=False)
+            conn.row_factory = _row_factory
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA foreign_keys = ON")
             yield conn
+        except sqlite3.Error as error:
+            from services.operation_diagnostics import failure
+            failure("storage", "database.failed", reason="Database operation failed",
+                    details={"error_type": type(error).__name__,
+                             "sqlite_errorcode": getattr(error, "sqlite_errorcode", None)}, exception=error)
+            raise
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
+
+
+def require_storage_ready(path):
+    import sys
+    config=sys.modules.get('config')
+    # Explicit pure index/cache callers must not load an application profile.
+    # The running app has already selected config before it opens active stores.
+    if config is None:return
+    active={Path(value).absolute() for value in (config.USER_DB_PATH,config.INDEX_DB_PATH,config.JOBS_DB_PATH,config.FILES_DB_PATH)}
+    if Path(path).absolute() in active and any((config.SUITE_HOME/'state'/name).exists()
+            for name in ('storage-install-pending.json','storage-restart-required.json')):
+        raise RuntimeError('Storage recovery requires a restart before continuing.')

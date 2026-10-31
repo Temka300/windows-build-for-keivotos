@@ -95,7 +95,7 @@ class ModuleHttpGuardTests(unittest.TestCase):
                     self.assertEqual(request('/api/automation')[0], 200)
                     self.assertEqual(request('/api/suite/modules/danbooru/disable', 'POST')[0], 200)
                     self.assertEqual(request('/api/stats')[0], 409)
-                    self.assertTrue(list(home.rglob('danbooru.sqlite')))
+                    self.assertTrue((home/'indexes/index.sqlite').is_file())
                     self.assertEqual(request('/api/suite/modules/danbooru/enable', 'POST')[0], 200)
                     self.assertEqual(request('/api/stats')[0], 200)
                 finally:

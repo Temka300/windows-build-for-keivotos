@@ -30,7 +30,7 @@
   let tagListRequestController: AbortController | null = null;
   let requestedTagDetailKey = '';
 
-  let searchQ = '';
+  let searchQ = '', searchTerm = '', searchComposing = false, searchAlive = true;
   let searchDebounce: ReturnType<typeof setTimeout>;
   let category: string | null = null;
   let sort: 'count' | 'alpha' | 'length' | 'category' = 'count';
@@ -97,6 +97,7 @@
   });
 
   onDestroy(() => {
+    searchAlive = false; tagListRequestSerial++;
     clearTimeout(searchDebounce);
     tagListRequestController?.abort();
   });
@@ -206,7 +207,7 @@
   }
 
   function getFavoriteTagResults(letterFilter = selectedAlphabetLetter) {
-    const q = searchQ.trim().toLowerCase();
+    const q = searchTerm.toLowerCase();
     const filtered = Object.values(favoriteTags)
       .flat()
       .filter(tag => {
@@ -234,12 +235,19 @@
   }
 
   async function fetchTags(options: { showLoader?: boolean } = {}) {
+    if (!searchAlive || searchComposing) return;
+    clearTimeout(searchDebounce);
+    if (searchTerm !== searchQ.trim()) { searchTerm = searchQ.trim(); offset = 0; }
+    const requestId = ++tagListRequestSerial;
+    tagListRequestController?.abort();
+    const requestController = new AbortController();
+    tagListRequestController = requestController;
     const { showLoader = true } = options;
     const shouldClearLoader = showLoader || loading;
     if (showLoader) loading = true;
     if (favoriteOnly || pinnedOnly) {
-      tagListRequestController?.abort();
       await fetchFavoriteTags();
+      if (!searchAlive || requestController.signal.aborted || requestId !== tagListRequestSerial) return;
       const favoriteResults = getFavoriteTagResults();
       tags = favoriteResults.slice(offset, offset + PAGE_SIZE);
       total = favoriteResults.length;
@@ -256,13 +264,9 @@
       min_count: minCount,
     };
     if (category) params.category = category;
-    if (searchQ.trim()) params.q = searchQ.trim();
+    if (searchTerm) params.q = searchTerm;
     if (sort === 'alpha' && alphabetView !== 'off' && selectedAlphabetLetter) params.letter = selectedAlphabetLetter;
 
-    const requestId = ++tagListRequestSerial;
-    tagListRequestController?.abort();
-    const requestController = new AbortController();
-    tagListRequestController = requestController;
     const cacheKey = `tags:${JSON.stringify(params)}`;
     const cached = getCachedView<PaginatedTags>(cacheKey);
     if (cached) {
@@ -272,7 +276,7 @@
     }
     try {
       const res = await api.getTags(params as any, requestController.signal);
-      if (requestId !== tagListRequestSerial) return;
+      if (!searchAlive || requestController.signal.aborted || requestId !== tagListRequestSerial) return;
       tags = res.tags;
       total = res.total;
       cacheView(cacheKey, res);
@@ -284,12 +288,15 @@
   }
 
   function onSearch() {
-    clearTimeout(searchDebounce);
+    clearTimeout(searchDebounce); tagListRequestController?.abort(); tagListRequestSerial++;
+    loading = true;
+    if (searchComposing) return;
     searchDebounce = setTimeout(() => {
-      offset = 0;
-      fetchTags();
+      searchTerm = searchQ.trim(); offset = 0; void fetchTags();
     }, 300);
   }
+  function beginSearchComposition() { searchComposing = true; onSearch(); }
+  function endSearchComposition() { searchComposing = false; onSearch(); }
 
   function setSort(s: typeof sort) {
     if (sort === s) {
@@ -982,6 +989,8 @@
             class="w-full pl-10 pr-3 py-2 bg-[#1a1a24] border border-[#2a2a3a] rounded-lg text-sm text-gray-300 placeholder-gray-600 focus:outline-none focus:border-purple-500/50"
             bind:value={searchQ}
             on:input={onSearch}
+            on:compositionstart={beginSearchComposition}
+            on:compositionend={endSearchComposition}
           />
         </div>
 

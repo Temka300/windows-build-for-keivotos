@@ -36,6 +36,7 @@ class ModuleLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.patches.close)
         # Never run migrations, create a default library, or touch a real DB.
         for name, result in (
+            ("activate_storage", {"generation": "isolated-fixture"}),
             ("promote_user_database", {}),
             ("promote_legacy_module_backups", {}),
             ("migrate_legacy_thumbnail_cache", {}),

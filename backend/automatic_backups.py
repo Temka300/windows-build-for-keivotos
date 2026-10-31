@@ -1,6 +1,7 @@
 """While-running backup scheduling and narrowly owned automatic retention."""
 from __future__ import annotations
 
+from services.operation_diagnostics import observed
 import asyncio
 from datetime import datetime
 import hashlib
@@ -80,6 +81,7 @@ def _retain_owned(state: dict, directory: Path, retention: int) -> None:
     state['owned'] = [entry for entry in entries if entry not in removed]
 
 
+@observed('suite', 'backup.automatic', false_outcome='skipped')
 def run_automatic_backup() -> bool:
     """Return False when busy/disabled; contention is a deferral, not a failure."""
     global _running

@@ -45,7 +45,9 @@ const report = { checks: [], timings: {}, errors: [], requests: [] };
       while (performance.now() - start < duration) {
         const node = document.querySelector(selector);
         const rect = node?.getBoundingClientRect();
-        points.push({ t: performance.now() - start, x: rect?.x, width: rect?.width,
+        const widthProgress = node ? node.getAnimations().filter(animation => animation.transitionProperty === 'width')
+          .map(animation => animation.effect?.getComputedTiming().progress).filter(progress => progress !== null) : [];
+        points.push({ t: performance.now() - start, x: rect?.x, width: rect?.width, widthProgress,
           opacity: node ? Number(getComputedStyle(node).opacity) : null });
         await new Promise(requestAnimationFrame);
       }
@@ -103,9 +105,15 @@ const report = { checks: [], timings: {}, errors: [], requests: [] };
     await browse.click();
     report.timings.sidebarEntrance = await sidebarEntrance;
     await dock.waitFor();
-    assert(report.timings.sidebarEntrance.some(p => p.width > 1 && p.width < 250), 'Browse entry must animate');
+    const openWidth = (await dock.boundingBox()).width;
+    const sidebarEntryPoints = report.timings.sidebarEntrance;
+    assert(sidebarEntryPoints.some(point => point.width <= 1), 'Browse entry must start closed');
+    assert(sidebarEntryPoints.some(point => point.width > 1 && point.width < openWidth - .25 &&
+      point.widthProgress.some(progress => progress > 0 && progress < 1)), 'Browse entry must animate');
+    assert(sidebarEntryPoints.some(point => Math.abs(point.width - openWidth) < .1), 'Browse entry must finish open');
+    report.timings.sidebarEntranceMaxFrameGap = Math.max(...sidebarEntryPoints.slice(1).map((point,index) => point.t - sidebarEntryPoints[index].t));
     assert.equal(await dock.count(), 1);
-    assert((await dock.boundingBox()).width > 250);
+    assert(openWidth > 250);
     await page.getByRole('button', { name: 'Size', exact: true }).click();
     await page.getByRole('button', { name: 'Large', exact: true }).click();
     assert.equal(await stored('image-size'), 'large');

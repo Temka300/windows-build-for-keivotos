@@ -155,6 +155,45 @@ class MetadataRecoveryTests(unittest.TestCase):
         with closing(sqlite3.connect(self.database)) as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM ingest_state WHERE status='error'").fetchone()[0], 1)
 
+    def test_denied_request_stops_with_saved_match_and_retry_preserves_it(self):
+        first, second, third = [self.file(name + ".png") for name in ("a", "b", "c")]
+        self.prepare()
+        denied = urllib.error.HTTPError("https://example.test", 403, "Forbidden",
+                                        {"cf-mitigated": "challenge"}, None)
+        with patch.object(pipeline, "find_post_by_md5", side_effect=[(POST, "indexed_md5", "abc"), denied]) as find:
+            self.assertEqual(self.run_backfill(), 3)
+            self.assertEqual(find.call_count, 2)
+        saved = self.sidecar(first).read_bytes()
+        self.assertFalse(self.sidecar(second).exists())
+        self.assertFalse(self.sidecar(third).exists())
+        with redirect_stdout(self.output):
+            self.assertEqual(pipeline.run_import_finalize(self.args("import-finalize", ["--report-incomplete"])), 3)
+        with closing(sqlite3.connect(self.database)) as connection:
+            states = dict(connection.execute("SELECT relative_path, status FROM ingest_state"))
+        self.assertEqual(states["a.png"], "done")
+        self.assertEqual(states["b.png"], "error")
+        self.assertNotEqual(states["c.png"], "error")
+        self.assertIn("browser challenge", self.output.getvalue())
+        self.assertNotIn("authentication failures", self.output.getvalue())
+        with patch.object(pipeline, "find_post_by_md5", return_value=(POST, "indexed_md5", "abc")) as find:
+            self.assertEqual(self.run_backfill(["--retry-failed"]), 0)
+            self.assertEqual(find.call_count, 2)
+        self.assertEqual(self.sidecar(first).read_bytes(), saved)
+        self.assertTrue(self.sidecar(second).exists())
+        self.assertTrue(self.sidecar(third).exists())
+
+    def test_plain_access_denial_stops_without_marking_the_rest_failed(self):
+        self.file("a.png")
+        self.file("b.png")
+        self.prepare()
+        error = urllib.error.HTTPError("https://example.test", 403, "Forbidden", {}, None)
+        with patch.object(pipeline, "find_post_by_md5", side_effect=error) as find:
+            self.assertEqual(self.run_backfill(), 3)
+            self.assertEqual(find.call_count, 1)
+        self.assertIn("access denied", self.output.getvalue())
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM ingest_state WHERE status='error'").fetchone()[0], 1)
+
     def test_long_server_retry_after_stops_the_whole_batch(self):
         self.file("a.png")
         self.file("b.png")
@@ -211,12 +250,31 @@ class NetworkAndJobTests(unittest.TestCase):
             self.assertIn("--retry-failed", launch.call_args.args[1][2])
             self.assertEqual(launch.call_args.kwargs["incomplete_steps"], {3, 4})
 
+    def test_public_update_and_retry_strip_credentials_before_worker_launch(self):
+        from modules.danbooru import credentials
+        with patch.dict(os.environ, {"DANBOORU_USERNAME": "fixture-user", "DANBOORU_API_KEY": "dummy-key"}), \
+             patch.object(credentials, "effective_credentials", side_effect=AssertionError("public mode read the vault")), \
+             patch.object(routes, "_sync_scan_paths", return_value=["fixture"]), \
+             patch.object(routes, "_launch_tool", return_value={"status": "started"}) as launch:
+            for phase in ("update", "retry", "metadata", "all"):
+                with self.subTest(phase=phase):
+                    routes.run_import(ImportRunRequest(phase=phase, fetch_metadata=True,
+                        confirm_network=True, use_saved_credentials=False))
+                    environment = launch.call_args.kwargs["environment"]
+                    self.assertNotIn("DANBOORU_USERNAME", environment)
+                    self.assertNotIn("DANBOORU_API_KEY", environment)
+            self.assertEqual(os.environ["DANBOORU_API_KEY"], "dummy-key")
+        self.assertTrue(ImportRunRequest(phase="update").use_saved_credentials)
+
     def test_incomplete_metadata_finalizes_but_fatal_errors_do_not(self):
         class ImmediateThread:
             def __init__(self, target, **kwargs): self.target = target
             def start(self): self.target()
         with tempfile.TemporaryDirectory() as directory:
             marker = Path(directory) / "finalized"
+            jobs_patch=patch("config.JOBS_DB_PATH",Path(directory)/"jobs.sqlite")
+            jobs_patch.start()
+            self.addCleanup(jobs_patch.stop)
             for code in (3, 1):
                 with self.subTest(code=code), patch.object(tools.threading, "Thread", ImmediateThread):
                     tool_id = f"incomplete-test-{code}"

@@ -24,6 +24,7 @@ missing file (missing != deleted, section 4.3). Only ``delete_annotation`` does.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -39,6 +40,8 @@ CREATE TABLE IF NOT EXISTS files_annotations (
     description    TEXT NOT NULL DEFAULT '',
     author         TEXT NOT NULL DEFAULT '',
     extra_info     TEXT NOT NULL DEFAULT '',
+    details        TEXT NOT NULL DEFAULT '[]',
+    metadata_applied INTEGER NOT NULL DEFAULT 0,
     created_at     TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -135,6 +138,8 @@ class Annotation:
     updated_at: str | None
     links: list[AnnotationLink] = field(default_factory=list)
     attachments: list[AnnotationAttachment] = field(default_factory=list)
+    details: list[dict[str, str]] = field(default_factory=list)
+    metadata_applied: bool = False
 
 
 def _now() -> str:
@@ -164,6 +169,10 @@ def ensure_annotations_schema(user_conn: sqlite3.Connection) -> None:
             user_conn.execute(
                 f"ALTER TABLE files_annotations ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
             )
+    if "details" not in annotation_columns:
+        user_conn.execute("ALTER TABLE files_annotations ADD COLUMN details TEXT NOT NULL DEFAULT '[]'")
+    if "metadata_applied" not in annotation_columns:
+        user_conn.execute("ALTER TABLE files_annotations ADD COLUMN metadata_applied INTEGER NOT NULL DEFAULT 0")
     user_conn.commit()
 
 
@@ -230,6 +239,8 @@ def _load(user_conn: sqlite3.Connection, row: sqlite3.Row) -> Annotation:
         updated_at=row["updated_at"],
         links=list_links(user_conn, annotation_id),
         attachments=list_attachments(user_conn, annotation_id),
+        details=json.loads(row["details"]),
+        metadata_applied=bool(row["metadata_applied"]),
     )
 
 
@@ -296,6 +307,8 @@ def upsert_annotation(
     description: str | None = None,
     author: str | None = None,
     extra_info: str | None = None,
+    details: list[dict[str, str]] | None = None,
+    metadata_applied: bool | None = None,
 ) -> Annotation:
     """Find-or-create the annotation for a subject and optionally set its fields.
 
@@ -322,8 +335,8 @@ def upsert_annotation(
         user_conn.execute(
             "INSERT INTO files_annotations "
             "(subject_kind, content_hash, source_id, relative_path, description, "
-            " author, extra_info, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " author, extra_info, details, metadata_applied, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 subject_kind,
                 content_hash,
@@ -332,6 +345,8 @@ def upsert_annotation(
                 (description or "").strip(),
                 (author or "").strip(),
                 (extra_info or "").strip(),
+                json.dumps(details or [], ensure_ascii=False),
+                bool(metadata_applied),
                 now,
                 now,
             ),
@@ -348,6 +363,12 @@ def upsert_annotation(
         if extra_info is not None:
             assignments.append("extra_info = ?")
             params.append(extra_info.strip())
+        if details is not None:
+            assignments.append("details = ?")
+            params.append(json.dumps(details, ensure_ascii=False))
+        if metadata_applied is not None:
+            assignments.append("metadata_applied = ?")
+            params.append(bool(metadata_applied))
         params.append(existing.id)
         user_conn.execute(
             f"UPDATE files_annotations SET {', '.join(assignments)} WHERE id = ?",
@@ -530,12 +551,13 @@ def prune_if_empty(user_conn: sqlite3.Connection, annotation_id: int) -> bool:
     matching the PUT path's empty-note cleanup.
     """
     row = user_conn.execute(
-        "SELECT description, author, extra_info FROM files_annotations WHERE id = ?",
+        "SELECT description, author, extra_info, details, metadata_applied FROM files_annotations WHERE id = ?",
         (annotation_id,),
     ).fetchone()
     if row is None:
         return False
-    if row["description"].strip() or row["author"].strip() or row["extra_info"].strip():
+    if (row["description"].strip() or row["author"].strip() or row["extra_info"].strip()
+            or json.loads(row["details"]) or row["metadata_applied"]):
         return False
     has_link = user_conn.execute(
         "SELECT 1 FROM files_annotation_links WHERE annotation_id = ? LIMIT 1",
@@ -579,17 +601,115 @@ def annotated_keys(
     A cheap lookup so the browse grid can badge entries that carry a note without
     a query per tile.
     """
+    # A cleared auto-filled note retains only a suppression marker. It must not
+    # acquire a visible badge or appear in Copy from's annotated-subject picker.
+    visible = """(metadata_applied = 0 OR trim(description) != '' OR trim(author) != '' OR trim(extra_info) != ''
+        OR details != '[]'
+        OR EXISTS (SELECT 1 FROM files_annotation_links WHERE annotation_id = files_annotations.id)
+        OR EXISTS (SELECT 1 FROM files_annotation_attachments WHERE annotation_id = files_annotations.id))"""
     hashes = {
         row["content_hash"]
         for row in user_conn.execute(
-            "SELECT content_hash FROM files_annotations WHERE content_hash IS NOT NULL"
+            "SELECT content_hash FROM files_annotations WHERE content_hash IS NOT NULL AND " + visible
         )
     }
     folders = {
         (row["source_id"], row["relative_path"])
         for row in user_conn.execute(
             "SELECT source_id, relative_path FROM files_annotations "
-            "WHERE content_hash IS NULL"
+            "WHERE content_hash IS NULL AND " + visible
         )
     }
     return hashes, folders
+
+
+def import_catalog_records(connection: sqlite3.Connection) -> int:
+    """Explicit files.annotations/version 1 import, without file access.
+
+    The complete essential snapshot retains authored text, settings, ordering,
+    suppression markers and byte-store roots in their existing owner tables.
+    This bridge adds opaque record/asset identities and immutable identity
+    anchors only. File annotations keep their existing shared-by-hash behavior;
+    attachment hashes describe recorded facts, not newly verified local bytes.
+    """
+    from uuid import NAMESPACE_URL, uuid4, uuid5
+    from services import item_catalog
+
+    if not connection.in_transaction:
+        raise ValueError('Import Files records inside a caller transaction')
+    required = {
+        'files_annotations': {'id', 'subject_kind', 'content_hash', 'source_id', 'relative_path'},
+        'files_annotation_links': {'id', 'annotation_id'},
+        'files_annotation_attachments': {'id', 'annotation_id', 'content_hash', 'media_type', 'size'},
+    }
+    cursor = connection.cursor()
+    cursor.row_factory = sqlite3.Row
+    savepoint = 'files_records_' + uuid4().hex
+    connection.execute('SAVEPOINT ' + savepoint)
+    try:
+        present = {row['name'] for row in cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        tables = present & required.keys()
+        if tables and 'files_annotations' not in tables:
+            raise ValueError('Files annotation owner table is missing')
+        for table in tables:
+            if not required[table] <= {row['name'] for row in cursor.execute(f'PRAGMA table_info({table})')}:
+                raise ValueError('Unsupported Files annotation schema')
+            if cursor.execute(f'SELECT id FROM {table} GROUP BY id HAVING count(*)>1 LIMIT 1').fetchone():
+                raise ValueError('Duplicate Files record identity')
+        for table in tables - {'files_annotations'}:
+            if cursor.execute(f'SELECT 1 FROM {table} c LEFT JOIN files_annotations a '
+                              'ON a.id=c.annotation_id WHERE a.id IS NULL LIMIT 1').fetchone():
+                raise ValueError('Files record has an unknown annotation')
+
+        def legacy_id(value):
+            if type(value) is not int or not 0 < value <= 2**63 - 1:
+                raise ValueError('Invalid Files legacy record identity')
+            return str(value)
+
+        def item_id(value):
+            return str(uuid5(NAMESPACE_URL, 'urn:keivotos:files:annotation:' + legacy_id(value)))
+
+        count = 0
+        if 'files_annotations' in tables:
+            for row in cursor.execute('SELECT id,subject_kind,content_hash,source_id,relative_path '
+                                      'FROM files_annotations ORDER BY id'):
+                key = legacy_id(row['id'])
+                kind, digest = row['subject_kind'], row['content_hash']
+                if (kind not in ('file', 'dir')
+                        or kind == 'file' and (not isinstance(digest, str) or not digest or '\0' in digest)
+                        or kind == 'dir' and digest is not None
+                        or any(not isinstance(row[name], str) or '\0' in row[name]
+                               for name in ('source_id', 'relative_path'))):
+                    raise ValueError('Invalid Files annotation identity')
+                identity = item_id(row['id'])
+                item_catalog.ensure_item(connection, namespace='files.annotation', legacy_key=key,
+                    owner='files', item_type='annotation', item_id=identity)
+                anchor = dict(legacy_id=row['id'], subject_kind=kind, content_hash=digest)
+                if kind == 'dir':
+                    anchor.update(source_id=row['source_id'], relative_path=row['relative_path'])
+                item_catalog.record_capture(connection, item_id=identity, namespace='files.annotation',
+                    capture_key='identity', format_version=1, payload=anchor)
+                count += 1
+        if 'files_annotation_attachments' in tables:
+            for row in cursor.execute('SELECT id,annotation_id,content_hash,media_type,size '
+                                      'FROM files_annotation_attachments ORDER BY id'):
+                key = legacy_id(row['id'])
+                identity = item_id(row['annotation_id'])
+                asset_id = str(uuid5(NAMESPACE_URL, 'urn:keivotos:files:attachment:' + key))
+                item_catalog.record_asset(connection, asset_id=asset_id, media_type=row['media_type'],
+                    byte_size=row['size'], hash_algorithm='md5', content_hash=row['content_hash'])
+                # A stable slot survives display reordering. The existing owner
+                # position/id ordering remains authoritative for presentation.
+                item_catalog.link_asset(connection, item_id=identity, asset_id=asset_id,
+                    role='attachment:' + key)
+                item_catalog.record_capture(connection, item_id=identity, namespace='files.attachment',
+                    capture_key=key, format_version=1,
+                    payload=dict(legacy_id=row['id'], annotation_id=row['annotation_id'], asset_id=asset_id))
+        connection.execute('RELEASE ' + savepoint)
+        return count
+    except BaseException:
+        connection.execute('ROLLBACK TO ' + savepoint)
+        connection.execute('RELEASE ' + savepoint)
+        raise
+    finally:
+        cursor.close()

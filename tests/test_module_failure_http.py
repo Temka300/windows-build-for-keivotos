@@ -22,10 +22,14 @@ import database, lifecycle, suite_modules
 from server import app
 import uvicorn
 # Only this disposable server process receives the failure injection.
+import config
+active_user=database.USER_DB_PATH
+database.USER_DB_PATH=config.LEGACY_USER_DB_PATH
 database.init_user_db(set())
 with database.get_user_db() as connection:
     suite_modules.ensure_schema(connection)
     suite_modules.set_enabled(connection, 'danbooru', True)
+database.USER_DB_PATH=active_user
 mode = os.environ['FIXTURE_FAILURE']
 if mode == 'startup':
     original = lifecycle.init_data_db

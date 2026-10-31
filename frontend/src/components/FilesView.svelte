@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick } from 'svelte';
+  import { onMount, onDestroy, tick } from 'svelte';
   import { filesApi, type DuplicateGroup, type FileNode, type SourceInfo } from '../lib/filesApi';
   import { fileGlyph, hasThumbnail, type Subject } from '../lib/filePreview';
   import GridSizeMenu from './GridSizeMenu.svelte';
@@ -30,6 +30,22 @@
   let entries: FileNode[] = [];
   let searchQuery = '';
   let searchResults: FileNode[] | null = null;
+  const SEARCH_PAGE_SIZE = 200;
+  let searchComposing = false, searchMore = false, loadingMore = false, alive = true;
+  let appliedSearch = '', searchOffset = 0;
+  let readRequest: AbortController | null = null;
+  let readKind: 'browse' | 'search' | null = null;
+  onDestroy(() => { alive = false; readRequest?.abort(); });
+
+  function cancelRead() {
+    readRequest?.abort(); readRequest = null; readKind = null;
+    loading = false; loadingMore = false;
+  }
+
+  function searchChanged() {
+    if (readKind === 'search') cancelRead();
+    if (!searchQuery.trim()) { clearSearch(); void loadEntries(); }
+  }
   let showManager = false;
   let addingFolder = false;
   let loading = false;
@@ -64,7 +80,10 @@
   onMount(loadSources);
 
   function absolutePathFor(sourcePath: string, relativePath: string): string {
-    return normalizedPath(relativePath ? `${sourcePath}/${relativePath}` : sourcePath);
+    if (!relativePath) return sourcePath;
+    const separator = sourcePath.includes('\\') ? '\\' : '/';
+    const root = sourcePath.replace(/[\\/]+$/, '');
+    return `${root}${separator}${relativePath.replace(/\//g, separator)}`;
   }
 
   function buildSubject(
@@ -259,32 +278,36 @@
     selectedSourceId = sourceId;
     currentParent = parent;
     selectedEntry = null;
+    entries = [];
     clearSearch();
     duplicateGroups = null;
     await loadEntries();
   }
 
   async function loadEntries() {
-    if (!selectedSourceId) {
-      entries = [];
-      return;
-    }
-    loading = true;
-    error = '';
+    cancelRead();
+    if (!selectedSourceId) { entries = []; return; }
+    const sourceId = selectedSourceId, parent = currentParent;
+    const current = new AbortController(); readRequest = current; readKind = 'browse';
+    loading = true; error = '';
     try {
-      entries = await filesApi.browse(selectedSourceId, currentParent);
+      const result = await filesApi.browse(sourceId, parent, current.signal);
+      if (!alive || current.signal.aborted || readRequest !== current) return;
+      entries = result;
     } catch (e) {
-      error = (e as Error).message;
-      entries = [];
+      if (alive && !current.signal.aborted && readRequest === current) {
+        error = (e as Error).message; entries = [];
+      }
     } finally {
-      loading = false;
+      if (alive && readRequest === current) loading = false;
     }
-    void loadAnnotatedPaths();
+    if (alive && !current.signal.aborted && readRequest === current) void loadAnnotatedPaths();
   }
 
   async function navigate(parent: string) {
     currentParent = parent;
     selectedEntry = null;
+    entries = [];
     clearSearch();
     duplicateGroups = null;
     await loadEntries();
@@ -393,27 +416,35 @@
     }
   }
 
-  async function runSearch() {
-    const q = searchQuery.trim();
-    if (!q) {
-      clearSearch();
-      return;
-    }
-    if (!selectedSourceId) return;
-    loading = true;
-    error = '';
+  async function runSearch(more = false) {
+    if (searchComposing) return;
+    const q = searchQuery.trim(), sourceId = selectedSourceId;
+    if (!q) { clearSearch(); void loadEntries(); return; }
+    if (!sourceId || more && (loading || q !== appliedSearch || searchResults === null)) return;
+    const offset = more ? searchOffset : 0;
+    cancelRead();
+    const current = new AbortController(); readRequest = current; readKind = 'search';
+    loading = true; loadingMore = more; error = '';
     try {
-      searchResults = await filesApi.search(q, selectedSourceId);
+      const result = await filesApi.search(q, sourceId, offset, SEARCH_PAGE_SIZE, current.signal);
+      if (!alive || current.signal.aborted || readRequest !== current || q !== searchQuery.trim() || sourceId !== selectedSourceId) return;
+      searchResults = more ? [...searchResults!, ...result] : result;
+      appliedSearch = q; searchOffset = offset + result.length;
+      searchMore = result.length === SEARCH_PAGE_SIZE;
     } catch (e) {
-      error = (e as Error).message;
+      if (alive && !current.signal.aborted && readRequest === current) error = (e as Error).message;
     } finally {
-      loading = false;
+      if (alive && readRequest === current) { loading = false; loadingMore = false; }
     }
   }
 
   function clearSearch() {
-    searchQuery = '';
-    searchResults = null;
+    cancelRead(); searchQuery = ''; searchResults = null; error = '';
+    appliedSearch = ''; searchOffset = 0; searchMore = false;
+  }
+
+  function searchKey(event: KeyboardEvent) {
+    if (event.key === 'Enter' && !searchComposing && !event.isComposing && event.keyCode !== 229) void runSearch();
   }
 
   function isSameOrAncestorPath(path: string, child: string): boolean {
@@ -510,10 +541,13 @@
         class="w-full rounded-lg border border-[#2a2a3a] bg-[#1e1e2e] px-3 py-1.5 pr-8 text-sm text-gray-200 outline-none placeholder:text-gray-500 transition-colors focus:border-purple-500 disabled:opacity-40"
         placeholder="Search this folder…"
         bind:value={searchQuery}
-        on:keydown={(event) => event.key === 'Enter' && runSearch()}
+        on:input={searchChanged}
+        on:compositionstart={() => { searchComposing = true; if (readKind === 'search') cancelRead(); }}
+        on:compositionend={() => { searchComposing = false; searchChanged(); }}
+        on:keydown={searchKey}
         disabled={!selectedSource}
       />
-      {#if searchResults !== null}
+      {#if searchResults !== null || searchQuery}
         <button
           type="button"
           class="absolute right-2 top-1/2 -translate-y-1/2 text-sm text-gray-500 hover:text-white"
@@ -662,7 +696,7 @@
             {/each}
           </div>
         {/if}
-      {:else if loading}
+      {:else if loading && !loadingMore}
         <p class="text-sm text-gray-500">Loading…</p>
       {:else if !selectedSource}
         <div class="grid h-full place-items-center text-center">
@@ -723,6 +757,10 @@
             </button>
           {/each}
         </div>
+        {#if searchResults !== null && searchMore}
+          <button type="button" class="mt-4 rounded-lg border border-white/10 px-3 py-1.5 text-sm text-gray-300 transition-colors hover:bg-white/5 disabled:opacity-40"
+            disabled={loading || searchComposing || searchQuery.trim() !== appliedSearch} on:click={() => runSearch(true)}>{loadingMore ? 'Loading…' : 'Load more'}</button>
+        {/if}
       {/if}
     </div>
   </section>

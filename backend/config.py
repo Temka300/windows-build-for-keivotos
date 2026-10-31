@@ -166,6 +166,8 @@ LOG_SESSION_ID = f"{datetime.now().astimezone():%Y-%m-%d_%H-%M-%S}-p{os.getpid()
 SUITE_LOG_PREFIX = SUITE_NAME.casefold()
 RUNTIME_LOG_FILE = LOG_DIR / f"{SUITE_LOG_PREFIX}-runtime-{LOG_SESSION_ID}.log"
 ACCESS_LOG_FILE = LOG_DIR / f"{SUITE_LOG_PREFIX}-access-{LOG_SESSION_ID}.log"
+DIAGNOSTIC_RUN_ID = uuid.uuid4().hex
+DIAGNOSTIC_LOG_FILE = LOG_DIR / DIAGNOSTIC_RUN_ID / "events-0001.jsonl"
 RUNTIME_CONFIG_FILE = SUITE_HOME / "config.json"
 
 # Compatibility name used by existing APIs; it means the module's writable
@@ -205,7 +207,8 @@ def _record_configuration_error(message: str) -> None:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
         with RUNTIME_LOG_FILE.open("a", encoding="utf-8") as handle:
-            handle.write(f"{timestamp} ERROR config: Configuration error: {message}\n")
+            from services.diagnostic_events import redact_log_text
+            handle.write(redact_log_text(f"{timestamp} ERROR config: Configuration error: {message}\n"))
     except OSError:
         pass
 
@@ -555,20 +558,26 @@ if METADATA_DIR.resolve(strict=False) == LEGACY_DEFAULT_METADATA_DIR.resolve(str
     _cfg["metadata_dir"] = str(DEFAULT_METADATA_DIR)
 GALLERY_DL_DIR = _resolve_path(str(_cfg.get("gallery_dl_dir", DEFAULT_GALLERY_DL_DIR)))
 
-DATA_DB_PATH = METADATA_DIR / (
+LEGACY_DATA_DB_PATH = METADATA_DIR / (
     _DEFAULT_DANBOORU_MODULE.database.name if _DEFAULT_DANBOORU_MODULE is not None else "danbooru.sqlite"
 )
 # The shared, irreplaceable user DB lives at suite level (not under a module),
 # so it exists with zero modules enabled. A legacy module-home copy is promoted
 # here on startup via promote_user_database(). See SUITE_MODULE_CONTRACT.md 3.1.
-USER_DB_PATH = SUITE_HOME / "user.sqlite"
-RECOVERY_DIR = SUITE_HOME / "local_recovery"
+LEGACY_USER_DB_PATH = SUITE_HOME / "user.sqlite"
+USER_DB_PATH = SUITE_HOME / "keivotos.sqlite"
+JOBS_DB_PATH = SUITE_HOME / "state" / "jobs.sqlite"
+INDEX_DB_PATH = SUITE_HOME / "indexes" / "index.sqlite"
+DATA_DB_PATH = INDEX_DB_PATH
+ASSETS_DIR = SUITE_HOME / "assets"
+INDEX_PREPARATION_DIR = SUITE_HOME / "state" / "index-preparation"
+RECOVERY_DIR = SUITE_HOME / "recovery"
 USER_CHECKPOINT_DIR = RECOVERY_DIR / "user_database"
 PRESERVED_USER_CHECKPOINT_DIR = RECOVERY_DIR / "preserved_user_database"
 # Read-only compatibility inputs, including custom and pre-flattening layouts.
 LEGACY_USER_CHECKPOINT_DIRS = tuple(dict.fromkeys(
     directory / "local_recovery" / "user_database"
-    for directory in (METADATA_DIR, DEFAULT_METADATA_DIR, LEGACY_DEFAULT_METADATA_DIR)
+    for directory in (SUITE_HOME, METADATA_DIR, DEFAULT_METADATA_DIR, LEGACY_DEFAULT_METADATA_DIR)
 ))
 
 
@@ -591,18 +600,23 @@ CREDENTIALS_PATH = METADATA_DIR / (
 # disk) and lives at suite level, NOT under modules/, because the base exists
 # even with zero modules enabled. See docs/important/SUITE_MODULE_CONTRACT.md.
 BASE_HOME = _DEFAULT_FILES_MODULE.home
-FILES_DB_PATH = _DEFAULT_FILES_MODULE.database
+LEGACY_FILES_DB_PATH = _DEFAULT_FILES_MODULE.database
+FILES_DB_PATH = INDEX_DB_PATH
 # The thumbnail cache is shared by the base and every module, and it is
 # disposable (rebuilt on demand), so it lives under the always-on base home
 # rather than inside the Danbooru module's tree. Relocated from
 # METADATA_DIR/thumbnails in v1.1.3; the old cache is harmless orphaned cruft.
-THUMB_DIR = BASE_HOME / "thumbnails"
+THUMB_DIR = SUITE_HOME / "cache" / "thumbnails"
+RELEASE_METADATA_CACHE_DIR = SUITE_HOME / "cache" / "releases"
 
 # Effective descriptors are the registry consumed by the suite shell. Danbooru
 # still supports an explicitly configured metadata directory, so its module DB
 # and credential paths are rebound while its stable module home remains fixed.
 FILES_MODULE = replace(_DEFAULT_FILES_MODULE, home=BASE_HOME, database=FILES_DB_PATH)
 MODULE_REGISTRY: ModuleRegistry = _DEFAULT_MODULE_REGISTRY.replacing(FILES_MODULE)
+for _owner in tuple(MODULE_REGISTRY):
+    if _owner.database == LEGACY_FILES_DB_PATH:
+        MODULE_REGISTRY = MODULE_REGISTRY.replacing(replace(_owner,database=INDEX_DB_PATH))
 DANBOORU_MODULE = None
 if _DEFAULT_DANBOORU_MODULE is not None:
     DANBOORU_MODULE = replace(
@@ -781,12 +795,12 @@ def migrate_legacy_thumbnail_cache() -> dict[str, Any]:
     preserving the source. Derived data only — never touches originals, metadata,
     sidecars, or user data. Idempotent and flag-guarded, so it runs at most once.
     """
-    if _cfg.get("thumbnail_cache_migrated"):
+    if _cfg.get("thumbnail_cache_migrated_to")==str(THUMB_DIR):
         return {"migrated": False, "copied": 0}
     target = THUMB_DIR.resolve(strict=False)
     legacy_dirs: list[Path] = []
     seen = {target}
-    for candidate in (METADATA_DIR / "thumbnails", LEGACY_DEFAULT_METADATA_DIR / "thumbnails"):
+    for candidate in (BASE_HOME / "thumbnails", METADATA_DIR / "thumbnails", LEGACY_DEFAULT_METADATA_DIR / "thumbnails"):
         resolved = candidate.resolve(strict=False)
         if resolved not in seen and candidate.is_dir():
             legacy_dirs.append(candidate)
@@ -805,7 +819,7 @@ def migrate_legacy_thumbnail_cache() -> dict[str, Any]:
                     copied += 1
                 except OSError:
                     continue
-    save_config({"thumbnail_cache_migrated": True})
+    save_config({"thumbnail_cache_migrated": True,"thumbnail_cache_migrated_to":str(THUMB_DIR)})
     return {"migrated": True, "copied": copied}
 
 
@@ -851,6 +865,18 @@ def set_attachment_store_root(path: str | None) -> None:
         save_config({"attachment_root": None})
     else:
         save_config({"attachment_root": str(Path(path).expanduser())})
+
+
+def get_log_policy() -> dict[str, int]:
+    from services.diagnostic_policy import policy
+    values=_cfg.get("diagnostic_limits", {})
+    try:
+        if not isinstance(values,dict):raise ValueError("Invalid diagnostic policy")
+        return policy(values)
+    except ValueError:
+        from services.log_bootstrap import notice
+        notice("invalid_limits_defaulted")
+        return policy()
 
 
 def get_diagnostics_preferences() -> dict[str, bool]:

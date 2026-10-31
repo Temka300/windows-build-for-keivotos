@@ -122,3 +122,9 @@ export interface DiagnosticsPreferences {
   verbose_logging: boolean;
   show_experimental_modules: boolean;
 }
+
+export interface DiagnosticPolicy {
+  limits: { retention_days:number; total_mib:number; rotation_mib:number };
+  debug: { active:boolean; expires_at:number|null; remaining_seconds:number };
+  status: { buffered:number; dropped:number; recovered:number; fallback:boolean };
+}

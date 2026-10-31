@@ -1,12 +1,14 @@
 <script lang="ts">
   import {onMount,onDestroy,tick} from 'svelte';
+  import {reportDiagnostic} from '../../lib/diagnostics';
   import {filesApi} from '../../lib/filesApi';
-  import {loopModeFor,autoNextFor,volumeFor,type LoopMode} from '../../lib/playbackPreferences';
+  import {loopModeFor,autoNextFor,volumeFor,musicShuffle,type LoopMode} from '../../lib/playbackPreferences';
   import VolumeControl from '../../components/VolumeControl.svelte';
   import SettingsSwitch from '../../components/SettingsSwitch.svelte';
   import {ostApi,type OstItem} from './api';
   export let track:OstItem;
   export let folderLabel:string;
+  export let displayTitle='';
   export let expanded=false;
   export let hasPrevious=false,hasNext=false,canWrap=false,navigating=false;
   export let navigationNotice='';
@@ -15,9 +17,10 @@
   export let onBrowse:()=>void;
   let audio:HTMLAudioElement,view:HTMLDivElement;
   let mounted=false,alive=true,serial=0,endBusy=false;
-  let playing=false,position=0,duration=0,failure='',notice='',artMissing=false;
+  let playing=false,position=0,duration=0,failure='',notice='',artMissing=false,activeUrl='';
   let loopMode:LoopMode='off',autoNext=true,volume=100;
-  let stopLoop=()=>{},stopAuto=()=>{},stopVolume=()=>{};
+  let stopLoop=()=>{},stopAuto=()=>{},stopVolume=()=>{},stopShuffle=()=>{};
+  let shuffle=false,endOrder=0;
   const loopOrder:LoopMode[]=['off','all','one'];
   $: if(mounted)void open(track);
   $: if(expanded&&mounted)void focusView();
@@ -26,15 +29,22 @@
     const whole=Math.max(0,Math.floor(Number.isFinite(seconds)?seconds:0));
     return `${Math.floor(whole/60)}:${String(whole%60).padStart(2,'0')}`;
   }
-  function current(event:Event){return alive&&event.currentTarget===audio;}
+  function current(event:Event){return alive&&event.currentTarget===audio&&audio.currentSrc===activeUrl;}
+  function synchronize(event:Event){
+    if(!current(event))return;
+    playing=!audio.paused&&!audio.ended;
+    position=Number.isFinite(audio.currentTime)?audio.currentTime:0;
+    duration=Number.isFinite(audio.duration)&&audio.duration>0?audio.duration:0;
+  }
   function mediaError(event:Event){
     if(!current(event)||!audio.error||audio.error.code===1)return;
     failure='This track is unavailable or its audio format cannot play here. Choose another track or Retry.';
     notice='';playing=false;
+    reportDiagnostic('media_failed',{component:'ost',reason:audio.error.code===2?'network':audio.error.code===3?'decode':'unsupported_codec'});
   }
   async function play(item=track,generation=serial){
     const element=audio;
-    try{await element.play();if(alive&&track===item&&generation===serial)notice='';}
+    try{await element.play();if(alive&&track===item&&generation===serial&&element===audio)notice='';}
     catch(caught){
       if(!alive||track!==item||generation!==serial||element!==audio)return;
       if(caught instanceof DOMException&&caught.name==='AbortError')return;
@@ -42,6 +52,7 @@
         notice='Press Play to start audio.';return;
       }
       failure||='Could not play this track. Choose another track or Retry.';
+      reportDiagnostic('media_failed',{component:'ost',reason:'playback'});
     }
   }
   async function open(item:OstItem){
@@ -49,28 +60,29 @@
     audio?.pause();playing=false;position=0;duration=0;failure='';notice='';artMissing=false;endBusy=false;
     await tick();
     if(!alive||track!==item||generation!==serial)return;
+    activeUrl=filesApi.fileUrl(item.source_id,item.path);
+    audio.src=activeUrl;audio.load();
     audio.volume=volume/100;
     void play(item,generation);
   }
   async function retry(){
-    ++serial;failure='';notice='';position=0;duration=0;
-    audio.load();await play();
+    await open(track);
   }
   function togglePlay(){if(!audio||failure)return;if(audio.paused)void play();else audio.pause();}
   async function navigate(direction:-1|1){await onNavigate(direction,loopMode==='all');}
   async function ended(event:Event){
-    if(!current(event)||failure||endBusy)return;
+    if(!current(event)||!audio.ended||failure||endBusy)return;
     playing=false;
-    const item=track,generation=serial;
+    const item=track,generation=serial,order=endOrder;
     if(loopMode==='one'){audio.currentTime=0;void play(item,generation);return;}
     if(!autoNext)return;
     endBusy=true;
     try{
       const moved=await onNavigate(1,loopMode==='all');
-      if(alive&&track===item&&serial===generation&&!moved&&loopMode==='all'&&!navigationNotice){
+      if(alive&&track===item&&serial===generation&&order===endOrder&&!moved&&loopMode==='all'&&!navigationNotice){
         audio.currentTime=0;void play(item,generation);
       }
-    }finally{if(serial===generation)endBusy=false;}
+    }finally{if(serial===generation&&order===endOrder)endBusy=false;}
   }
   function seek(event:Event){if(duration&&!failure)audio.currentTime=Number((event.currentTarget as HTMLInputElement).value);}
   function volumeChanged(event:Event){if(current(event)&&Math.round(audio.volume*100)!==volume)volumeFor('ost').set(Math.round(audio.volume*100));}
@@ -85,51 +97,51 @@
     }
   }
   onMount(()=>{
+    stopShuffle=musicShuffle.subscribe(value=>{if(value!==shuffle){shuffle=value;++endOrder;endBusy=false;}});
     stopLoop=loopModeFor('ost').subscribe(value=>loopMode=value);
     stopAuto=autoNextFor('ost').subscribe(value=>autoNext=value);
     stopVolume=volumeFor('ost').subscribe(value=>{volume=value;if(audio&&audio.volume!==value/100)audio.volume=value/100;});
     mounted=true;
   });
   onDestroy(()=>{
-    alive=false;++serial;stopLoop();stopAuto();stopVolume();
+    alive=false;++serial;stopLoop();stopAuto();stopVolume();stopShuffle();
     if(audio){audio.pause();audio.removeAttribute('src');audio.load();}
   });
 </script>
 
 <div class="audio-player" class:expanded>
-  {#key `${track.source_id}:${track.path}`}
-    <!-- svelte-ignore a11y_media_has_caption -->
-    <audio bind:this={audio} src={filesApi.fileUrl(track.source_id,track.path)} preload="metadata"
-      on:error={mediaError} on:ended={ended}
-      on:play={event=>{if(current(event))playing=true;}}
-      on:pause={event=>{if(current(event))playing=false;}}
-      on:timeupdate={event=>{if(current(event))position=audio.currentTime;}}
-      on:durationchange={event=>{if(current(event))duration=Number.isFinite(audio.duration)?audio.duration:0;}}
-      on:volumechange={volumeChanged}></audio>
-  {/key}
+  <!-- svelte-ignore a11y_media_has_caption -->
+  <audio bind:this={audio} preload="metadata" on:error={mediaError} on:ended={ended}
+    on:play={synchronize} on:playing={synchronize} on:pause={synchronize}
+    on:timeupdate={synchronize} on:loadedmetadata={synchronize} on:durationchange={synchronize}
+    on:volumechange={volumeChanged}></audio>
   {#if expanded}
     <!-- svelte-ignore a11y_no_noninteractive_tabindex a11y_no_noninteractive_element_interactions -->
-    <div class="cover-view" role="region" aria-label="OST player" tabindex="-1" bind:this={view} on:keydown={keys}>
+    <div class="cover-view" role="region" aria-label="Music player" tabindex="-1" bind:this={view} on:keydown={keys}>
       <button class="back" aria-label="Back to tracks" on:click={onBrowse}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 5-7 7 7 7"/></svg></button>
       <div class="album-art"><span aria-hidden="true">♫</span>{#if !artMissing}<img alt="" src={ostApi.coverUrl(track.source_id,track.path,track.cover_version,600)} on:error={()=>artMissing=true}/>{/if}</div>
-      <h2 title={track.name}>{track.name}</h2><p class="folder" title={folderLabel}>{folderLabel}</p>
+      <h2 title={displayTitle||track.name}>{displayTitle||track.name}</h2><p class="folder" title={folderLabel}>{folderLabel}</p>
     </div>
   {/if}
   <!-- svelte-ignore a11y_no_noninteractive_tabindex a11y_no_noninteractive_element_interactions -->
-  <section class="transport" aria-label="OST playback controls" tabindex="-1" on:keydown={keys}>
+  <section class="transport" aria-label="Music playback controls" tabindex="-1" on:keydown={keys}>
     {#if failure}<p role="alert">{failure} <button class="retry" on:click={retry}>Retry track</button></p>{/if}
     {#if notice||navigationNotice}<p role="status">{notice||navigationNotice}</p>{/if}
     <div class="track-line">
-      <button class="now-playing" aria-label={`Open player for ${track.name}`} title={track.name} on:click={onExpand}>
+      <button class="now-playing" aria-label={`Open player for ${displayTitle||track.name}`} title={displayTitle||track.name} on:click={onExpand}>
         <span class="small-art"><span aria-hidden="true">♫</span>{#if !artMissing}<img alt="" src={ostApi.coverUrl(track.source_id,track.path,track.cover_version)} on:error={()=>artMissing=true}/>{/if}</span>
-        <span class="track-name">{track.name}</span>
+        <span class="track-name">{displayTitle||track.name}</span>
       </button>
     </div>
     <div class="control-row">
       <div class="auto-next" title="Auto next: advance when the current song ends"><SettingsSwitch label="Auto next" checked={autoNext} on:click={()=>autoNextFor('ost').set(!autoNext)}/></div>
       <div class="center">
+        <div class="shuffle-control">
+          <button class="shuffle-button" class:active={shuffle} aria-label="Shuffle" aria-pressed={shuffle} aria-describedby="music-shuffle-tooltip" on:click={()=>musicShuffle.set(!shuffle)}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h3c5 0 7 12 12 12h3m-4-4 4 4-4 4M3 18h3c2 0 3-2 4-4m4-4c1-2 2-4 4-4h3m-4-4 4 4-4 4"/></svg></button>
+          <span id="music-shuffle-tooltip" role="tooltip">{shuffle?'Turn shuffle off':'Turn shuffle on'}</span>
+        </div>
         <div class="triplet">
-          <button aria-label="Previous song" disabled={navigating||!(hasPrevious||loopMode==='all'&&canWrap)} on:click={()=>navigate(-1)}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5v14M19 5 8 12l11 7Z"/></svg></button>
+          <button aria-label="Previous song" disabled={navigating||!(hasPrevious||!shuffle&&loopMode==='all'&&canWrap)} on:click={()=>navigate(-1)}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5v14M19 5 8 12l11 7Z"/></svg></button>
           <button aria-label={playing?'Pause':'Play'} disabled={!!failure} on:click={togglePlay}><svg viewBox="0 0 24 24" aria-hidden="true">{#if playing}<path d="M8 5v14M16 5v14"/>{:else}<path d="m7 4 14 8-14 8Z"/>{/if}</svg></button>
           <button aria-label="Next song" disabled={navigating||!(hasNext||loopMode==='all'&&canWrap)} on:click={()=>navigate(1)}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 5v14M5 5l11 7-11 7Z"/></svg></button>
         </div>
@@ -139,8 +151,8 @@
     </div>
     <div class="seek-row">
       <span class="time" aria-label="Current time">{stamp(position)}</span>
-      <input class="seek" aria-label="Seek" aria-valuetext={`${stamp(position)} of ${stamp(duration)}`} type="range" min="0" max={duration||0} step="0.1" value={position} disabled={!duration||!!failure} style={`--progress:${duration?position/duration*100:0}%`} on:input={seek}/>
-      <span class="time" aria-label="Track duration">{stamp(duration)}</span>
+      <input class="seek" aria-label="Seek" aria-valuetext={duration?`${stamp(position)} of ${stamp(duration)}`:'Duration unavailable'} type="range" min="0" max={duration||0} step="0.1" value={position} disabled={!duration||!!failure} style={`--progress:${duration?position/duration*100:0}%`} on:input={seek}/>
+      <span class="time" aria-label="Track duration">{duration?stamp(duration):'—:—'}</span>
     </div>
   </section>
 </div>
@@ -157,6 +169,12 @@
   .track-name{min-width:0;font-size:13px;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;line-clamp:2;overflow:hidden;overflow-wrap:anywhere}.time{flex:none;color:#a5a5b5;font-size:11px;font-variant-numeric:tabular-nums}
   .control-row{position:relative;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:12px;min-height:56px}.center{position:relative}.triplet{display:flex;align-items:center;gap:8px}.volume{justify-self:end}.auto-next{justify-self:start}
   .control-row button{display:grid;place-items:center;width:40px;height:40px;border:0;background:transparent;color:#eee;border-radius:50%;transition:background-color .15s ease}.control-row button:hover:not(:disabled){background:#ffffff20}button:disabled{opacity:.45;cursor:default}svg{width:24px;height:24px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+  .shuffle-control{position:absolute;right:calc(100% + 8px);top:0;width:40px;height:40px}
+  .control-row .shuffle-button{color:#8a8a92}.control-row .shuffle-button.active{color:var(--accent)}
+  #music-shuffle-tooltip{position:absolute;bottom:calc(100% + 8px);left:50%;transform:translateX(-50%);visibility:hidden;pointer-events:none;white-space:nowrap;padding:6px 8px;border-radius:6px;background:#282831;color:#eee;font-size:12px;line-height:1.3;box-shadow:0 2px 8px #0006;z-index:2;transition:visibility 0s}
+  .shuffle-control:hover #music-shuffle-tooltip{visibility:visible;transition-delay:.3s}.shuffle-control:focus-within #music-shuffle-tooltip{visibility:visible;transition-delay:0s}
+  :global(html[data-motion='reduced']) #music-shuffle-tooltip{transition:none}
+  @media(prefers-reduced-motion:reduce){#music-shuffle-tooltip{transition:none}}
   .control-row .loop-button{position:absolute;left:calc(100% + 8px);top:0}.loop-button.off{color:#8a8a92}.loop-one-mark{position:absolute;top:7px;left:8px;font-size:10px;font-weight:800;text-shadow:0 0 2px #111}
   .auto-next :global(.settings-switch){width:38px;height:22px}.auto-next :global(.settings-switch span){width:16px;height:16px}.auto-next :global(.settings-switch.checked span){transform:translateX(16px)}
   .seek-row{display:flex;align-items:center;gap:12px;min-width:0}.seek{display:block;flex:1;min-width:0;appearance:none;width:100%;height:20px;margin:0;padding:0;background:transparent;cursor:pointer}.seek::-webkit-slider-runnable-track{height:3px;background:linear-gradient(to right,var(--accent) var(--progress),#ffffff55 var(--progress))}.seek::-moz-range-track{height:3px;background:linear-gradient(to right,var(--accent) var(--progress),#ffffff55 var(--progress))}.seek::-webkit-slider-thumb{appearance:none;width:11px;height:11px;margin-top:-4px;border-radius:50%;background:var(--accent)}.seek::-moz-range-thumb{width:11px;height:11px;border:0;border-radius:50%;background:var(--accent)}

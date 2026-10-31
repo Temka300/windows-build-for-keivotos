@@ -21,9 +21,11 @@ case "$app_dir$data_home" in *'
 '*|*"$carriage_return"*) fail 'Desktop installation does not support line breaks in paths.' 64 ;; esac
 [ -f "$app_dir/$launcher" ] && [ -f "$app_dir/Keivotos.desktop.in" ] || fail 'Extract the entire application folder before installing its shortcut.' 66
 destination="$data_home/applications"
-mkdir -p -- "$destination" || fail "Cannot create $destination." 73
 target="$destination/$filename"
 [ ! -e "$target" ] && [ ! -L "$target" ] || fail "Shortcut already exists: $target. It was left unchanged." 73
+icon_file="$app_dir/_internal/assets/branding/keivotos/keivotos-icon-256.png"
+[ -f "$icon_file" ] || fail 'The Keivotos desktop icon is missing. Extract the entire application folder.' 66
+mkdir -p -- "$destination" || fail "Cannot create $destination." 73
 
 # Desktop entries first decode string escapes, then quoted Exec arguments.
 exec_path=$(printf '%s' "$app_dir/$launcher" | awk '
@@ -35,7 +37,7 @@ exec_path=$(printf '%s' "$app_dir/$launcher" | awk '
         else if(c=="%") printf "%%" "%%"
         else printf "%s",c
     }}')
-icon=$(printf '%s' "$app_dir/_internal/frontend/dist/favicon.svg" | sed 's/\\/\\\\/g')
+icon=$(printf '%s' "$icon_file" | sed 's/\\/\\\\/g')
 umask 022
 # noclobber closes the race with a newly created existing shortcut.
 set -C

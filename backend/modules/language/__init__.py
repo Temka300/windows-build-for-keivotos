@@ -2,6 +2,7 @@
 from pathlib import Path
 
 from module_descriptor import BackupComponent, ModuleDescriptor
+from modules.language.user_schema import SCHEMA, publish
 
 
 def _routers():
@@ -36,14 +37,27 @@ def release(source_id: str, forget: bool = False) -> dict:
 def descriptor(suite_home: Path, version: str) -> ModuleDescriptor:
     home = suite_home / "modules" / "language"
     return ModuleDescriptor(
+        portable_provider=_portable,
+        transfer_provider=_transfer,
         slug="language", name="Language", description="Write local Markdown notes in tabs.",
         home=home, database=suite_home / "base" / "files.sqlite",
         credentials=None, api_prefix="/api/language", log_prefix="language",
         user_agent=f"Keivotos/{version} (Language)", disableable=True,
         is_base=False, experimental=True, router_provider=_routers,
-        adopt_hook=adopt, release_hook=release,
+        adopt_hook=adopt, release_hook=release, shared_folder_relocation=True,
+        user_schema_provider=lambda: SCHEMA, publish_hook=publish,
         backup_components_provider=lambda: (
             BackupComponent("language_revisions", "language", "language_revisions",
-                            "tree", home / "revisions"),
+                            "tree", suite_home / "assets" / "language" / "revisions"),
         ),
     )
+
+
+def _portable():
+    from modules.language.portable import contribution
+    return contribution()
+
+
+def _transfer():
+    from modules.language.transfer import contribution
+    return contribution()

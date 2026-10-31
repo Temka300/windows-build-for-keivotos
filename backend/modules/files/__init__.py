@@ -22,6 +22,8 @@ def _backup_components() -> tuple[BackupComponent, ...]:
 def descriptor(suite_home: Path, version: str) -> ModuleDescriptor:
     home = suite_home / "base"
     return ModuleDescriptor(
+        portable_provider=_portable,
+        transfer_provider=_transfer,
         slug="files",
         name="Files",
         description="Browse and organize your local files.",
@@ -35,4 +37,23 @@ def descriptor(suite_home: Path, version: str) -> ModuleDescriptor:
         is_base=True,
         router_provider=_routers,
         backup_components_provider=_backup_components,
+        catalog_index_provider=_catalog_index,
     )
+
+
+def _catalog_index():
+    from files_base.index import rebuild_index
+    from files_base.schema import ensure_files_schema
+    from services.catalog_index import IndexOwner
+    return IndexOwner('files', ('files_index', 'files_audio_metadata'),
+                      ensure_files_schema, rebuild_index, legacy_tables=('ost_catalog',))
+
+
+def _portable():
+    from modules.files.portable import contribution
+    return contribution()
+
+
+def _transfer():
+    from modules.files.transfer import contribution
+    return contribution()

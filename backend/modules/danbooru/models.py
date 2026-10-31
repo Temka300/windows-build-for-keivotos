@@ -464,6 +464,7 @@ class ImportRunRequest(BaseModel):
     limit: int | None = Field(default=None, ge=1, le=1000000)
     confirm_network: bool = False
     fetch_metadata: bool = False
+    use_saved_credentials: bool = True
 
 
 class DanbooruCredentialStatus(BaseModel):

@@ -13,15 +13,33 @@ from database_connections import (
 )
 
 
+def _require_storage_ready():
+    import config
+    if any((config.SUITE_HOME / "state" / name).exists() for name in ("storage-install-pending.json","storage-restart-required.json")):
+        raise RuntimeError("Storage recovery is pending. Restart Keivotos before continuing.")
+
+
 @contextmanager
 def get_data_db() -> Generator[sqlite3.Connection, None, None]:
+    _require_storage_ready()
     with connect_database(DATA_DB_PATH) as conn:
         yield conn
 
 
 @contextmanager
 def get_user_db() -> Generator[sqlite3.Connection, None, None]:
+    _require_storage_ready()
     with connect_database(USER_DB_PATH) as conn:
+        yield conn
+
+
+@contextmanager
+def get_jobs_db() -> Generator[sqlite3.Connection, None, None]:
+    """Suite operational store, sharing the exclusive backup/restore gate."""
+    import config
+    _require_storage_ready()
+    config.JOBS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with connect_database(config.JOBS_DB_PATH) as conn:
         yield conn
 
 

@@ -1,5 +1,8 @@
 from __future__ import annotations
+from services.operation_diagnostics import worker_diagnostics
+from services.tool_diagnostics import ToolEvidence
 
+from services.operation_diagnostics import observed
 import argparse
 import base64
 import hashlib
@@ -10,6 +13,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+from services.process_launch import quiet_options
 import sys
 import tempfile
 import time
@@ -21,6 +25,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing, nullcontext
 from datetime import datetime, timezone
+from itertools import islice
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -36,7 +41,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 from modules.danbooru.schema import create_data_indexes, ensure_data_schema  # noqa: E402
-from modules.danbooru.network import failure_kind, read_json, retry_delay
+from modules.danbooru.network import failure_kind, http_failure_detail, read_json, retry_delay
 from modules.danbooru.configuration import get_api_base_url
 from runtime_logging import redact_log_text  # noqa: E402
 from storage_layout import (  # noqa: E402
@@ -175,7 +180,11 @@ def build_gallery_dl_config(args: argparse.Namespace, tag_query: str) -> Path:
         danbooru_config["username"] = username
         danbooru_config["password"] = api_key
 
+    from modules.danbooru.downloads import OUTPUT
     config = {
+        "output": {"mode": OUTPUT, "shorten": False, "stdout": {"line_buffering": True},
+                   "stderr": {"line_buffering": True}},
+        "downloader": {"http": {"progress": 0.2}},
         "extractor": {
             "base-directory": str(base_directory),
             "archive": str(args.archive or (work_dir / "danbooru.sqlite3")),
@@ -208,11 +217,22 @@ def danbooru_posts_url(tag_query: str) -> str:
     return f"{DANBOORU_ROOT}/posts?{query}"
 
 
+@observed('danbooru', 'download', exit_result=True)
 def run_download(args: argparse.Namespace) -> int:
     tag_query = " ".join(args.tags).strip()
     if not tag_query:
         raise SystemExit("No Danbooru tags were provided.")
 
+    managed=None
+    if os.environ.get('KEIVOTOS_DANBOORU_OPERATION') and not args.dry_run:
+        from modules.danbooru import portable
+        from copy import copy
+        operation=json.loads(os.environ['KEIVOTOS_DANBOORU_OPERATION'])
+        destination=(args.destination.expanduser().resolve(strict=False) if getattr(args,'destination',None)
+                     else args.root.resolve()/args.folder/(args.tag_folder or safe_segment(tag_query)))
+        stage=portable.staging(args,destination,operation)
+        managed=(destination,stage,operation,args)
+        args=copy(args);args.destination=stage
     config_path = build_gallery_dl_config(args, tag_query)
     command = ensure_gallery_dl_command()
     command.extend(["--config", str(config_path)])
@@ -233,41 +253,64 @@ def run_download(args: argparse.Namespace) -> int:
         config_path.unlink(missing_ok=True)
         return 0
 
-    print("STAGE:download", flush=True)
-    print(f"PROGRESS:0/{args.limit or 0}", flush=True)
-    completed_count = 0
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=args.root,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        assert process.stdout is not None
-        for line in process.stdout:
-            if line.startswith("GALLERY_PROGRESS:"):
-                completed_count += 1
-                print(f"PROGRESS:{completed_count}/{args.limit or completed_count}", flush=True)
-            else:
-                print(line, end="", flush=True)
-        process.wait()
-    finally:
-        config_path.unlink(missing_ok=True)
-    if process.returncode != 0 and command[:2] == [sys.executable, "-m"]:
-        print(
-            "\nCould not run gallery-dl as a Python module. Install it with:\n"
-            "  python -m pip install gallery-dl\n",
-            file=sys.stderr,
-        )
-    if process.returncode != 0:
-        return process.returncode
+    from modules.danbooru import downloads
+    with downloads.transfer(args,destination) as tracker:
+        print("STAGE:download", flush=True)
+        print(f"PROGRESS:0/{args.limit or 0}", flush=True)
+        completed_count = 0
+        evidence = ToolEvidence("danbooru", command, destination=destination,
+                                secrets=(os.environ.get("DANBOORU_API_KEY",""),), packages=("gallery-dl",))
+        process = None
+        try:
+            tracker.wait_allowed()
+            process = subprocess.Popen(
+                command,
+                cwd=args.root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                **quiet_options(),
+            )
+            tracker.register(process.pid)
+            assert process.stdout is not None
+            for line in process.stdout:
+                evidence.output(line, "combined")
+                if tracker.output(line):continue
+                if line.startswith("GALLERY_PROGRESS:"):
+                    completed_count += 1
+                    print(f"PROGRESS:{completed_count}/{args.limit or completed_count}", flush=True)
+                else:
+                    print(line, end="", flush=True)
+            process.wait()
+            tracker.code=process.returncode
+        finally:
+            tracker.unregister()
+            evidence.finish(process.returncode if process is not None else None)
+            config_path.unlink(missing_ok=True)
+        if process.returncode != 0 and command[:2] == [sys.executable, "-m"]:
+            print(
+                "\nCould not run gallery-dl as a Python module. Install it with:\n"
+                "  python -m pip install gallery-dl\n",
+                file=sys.stderr,
+            )
+        if process.returncode != 0:
+            return process.returncode
 
-    normalized, failed = normalize_gallery_dl_sidecars(destination, args)
-    print(f"Normalized {normalized} downloaded sidecars ({failed} failed)")
-    return 1 if failed else 0
-
+        if managed is not None:
+            final,stage,operation,original_args=managed
+            published=portable.publish_download(original_args,final,stage,operation)
+            args=original_args
+            counts=[normalize_gallery_dl_sidecars(item,args) for item in published]
+            normalized=sum(n for n,_ in counts);failed=sum(f for _,f in counts)
+            if not failed:
+                registered=portable.register_download(args,published,operation)
+                if registered<len(published):
+                    print('Complete portable items retained; register their folder and rescan to repair catalog registration.',flush=True)
+        else:
+            normalized, failed = normalize_gallery_dl_sidecars(destination, args)
+        print(f"Normalized {normalized} downloaded sidecars ({failed} failed)")
+        return 1 if failed else 0
 
 def normalize_gallery_dl_sidecars(destination: Path, args: argparse.Namespace) -> tuple[int, int]:
     """Convert gallery-dl's flat Danbooru JSON into canonical central sidecars."""
@@ -507,6 +550,7 @@ def media_files(paths: list[Path]) -> list[Path]:
             found.append(path)
         elif path.is_dir():
             for child in path.rglob("*"):
+                if '.keivotos' in child.relative_to(path).parts:continue
                 if child.is_file() and child.suffix.lower() in MEDIA_EXTENSIONS:
                     found.append(child)
     return sorted(found, key=lambda item: str(item).casefold())
@@ -551,7 +595,7 @@ def existing_metadata_path_for(media_path: Path, suffix: str, root: Path, sideca
     return None
 
 
-def media_path_for_sidecar(sidecar_path: Path, suffix: str, root: Path, sidecar_dir: Path) -> Path | None:
+def media_path_for_sidecar(sidecar_path: Path, suffix: str, root: Path, sidecar_dir: Path, *, library_roots=None) -> Path | None:
     media_name = sidecar_path.name.removesuffix(suffix)
     if not media_name or media_name == sidecar_path.name:
         return None
@@ -581,7 +625,7 @@ def media_path_for_sidecar(sidecar_path: Path, suffix: str, root: Path, sidecar_
         relative_parent = Path(*relative_sidecar.parts[2:-1]) if len(relative_sidecar.parts) > 3 else Path()
         if root_id == "portable-root":
             return root / relative_parent / media_name
-        library_root = next((item for item in _LIBRARY_ROOTS if item.root_id == root_id), None)
+        library_root = next((item for item in (_LIBRARY_ROOTS if library_roots is None else library_roots) if item.root_id == root_id), None)
         if library_root is not None:
             return library_root.path / relative_parent / media_name
         # Unregistered-root sidecars deliberately keep their absolute durable
@@ -637,6 +681,7 @@ def build_payload(
     matched_by: str,
     matched_md5: str,
     local_md5: str | None = None,
+    *, observe_missing_hashes: bool = True,
 ) -> dict[str, Any]:
     tags = split_tags(post)
     return {
@@ -648,7 +693,7 @@ def build_payload(
             "path": str(media_path),
             "name": media_path.name,
             "size": media_path.stat().st_size,
-            "md5": local_md5 or md5_file(media_path),
+            "md5": local_md5 or (md5_file(media_path) if observe_missing_hashes else None),
             "downloaded_at": local_downloaded_at(media_path),
         },
         "tags": tags,
@@ -744,6 +789,7 @@ def sidecar_files(
                     add(sidecar_path)
         elif path.is_dir():
             for child in path.rglob(f"*{suffix}"):
+                if '.keivotos' in child.relative_to(path).parts:continue
                 if child.is_file():
                     add(child)
             if root is not None and sidecar_dir is not None:
@@ -850,6 +896,9 @@ def emit_file_status(
     )
 
 
+from modules.danbooru.operational_state import attach_ingest, ingest_table
+
+
 def update_metadata_ingest_state(
     connection: sqlite3.Connection | None,
     media_path: Path,
@@ -861,8 +910,8 @@ def update_metadata_ingest_state(
     now = datetime.now(timezone.utc).isoformat()
     if status == "matched":
         connection.execute(
-            """
-            UPDATE ingest_state
+            f"""
+            UPDATE {ingest_table(connection)}
                SET phase='metadata', status='done', error=NULL, metadata_at=?
              WHERE media_path=?
             """,
@@ -870,15 +919,18 @@ def update_metadata_ingest_state(
         )
     else:
         connection.execute(
-            """
-            UPDATE ingest_state
+            f"""
+            UPDATE {ingest_table(connection)}
                SET phase='metadata', status=?, error=?
              WHERE media_path=?
             """,
             (status, (error or "")[:1000], str(media_path)),
         )
+    # FILE_STATUS may make the parent persist its own progress in jobs.sqlite.
+    connection.commit()
 
 
+@observed('danbooru', 'backfill', exit_result=True)
 def run_backfill(args: argparse.Namespace) -> int:
     username = args.username or os.environ.get("DANBOORU_USERNAME")
     api_key = args.api_key or os.environ.get("DANBOORU_API_KEY")
@@ -898,13 +950,14 @@ def run_backfill(args: argparse.Namespace) -> int:
                 }
             state_connection = connect_sqlite_live(database_path)
             init_sqlite(state_connection)
+            attach_ingest(state_connection,getattr(args,"jobs_db",None),getattr(args,"user_db",None))
 
     scan_paths = [path.resolve() for path in args.paths] if args.paths else default_backfill_paths(args.root)
     files = filter_media_files(media_files(scan_paths), args)
     states = {}
     if state_connection is not None:
         states = {os.path.normcase(row[0]): row[1] for row in state_connection.execute(
-            "SELECT media_path, status FROM ingest_state")}
+            f"SELECT media_path, status FROM {ingest_table(state_connection)}")}
     need_processing = []
     partial_payloads = {}
     skip_count = 0
@@ -1012,7 +1065,8 @@ def run_backfill(args: argparse.Namespace) -> int:
                 except Exception as exc:  # Keep local failures separate from connection outages.
                     failed += 1
                     network_error = exc if operation in {"matching post", "fetching extra metadata"} else None
-                    detail = redact_log_text(f"{operation}: {failure_kind(exc)}: {exc}", (api_key or "",))
+                    description = http_failure_detail(exc) if isinstance(exc, urllib.error.HTTPError) else str(exc)
+                    detail = redact_log_text(f"{operation}: {failure_kind(exc)}: {description}", (api_key or "",))
                     update_metadata_ingest_state(state_connection, media_path, "error", detail)
                     emit_file_status(media_path, "error", index, total, detail)
                     print(f"ERROR: {media_path.name}: {detail}", file=sys.stderr, flush=True)
@@ -1022,7 +1076,7 @@ def run_backfill(args: argparse.Namespace) -> int:
                     state_connection.commit()
                 print(f"PROGRESS:{index}/{total}", flush=True)
                 long_server_wait = kind == "server" and retry_delay(network_error, 0) is None
-                if kind in {"authentication", "certificate", "rate limit"} or long_server_wait or consecutive_failures >= 3:
+                if kind in {"authentication", "access denied", "site challenge", "certificate", "rate limit"} or long_server_wait or consecutive_failures >= 3:
                     stopped = True
                     print(f"WARNING: Stopped network work after {kind} failures. Successful work is saved; retry unfinished items later.", flush=True)
                     break
@@ -1036,6 +1090,7 @@ def run_backfill(args: argparse.Namespace) -> int:
     return 0
 
 
+@observed('danbooru', 'index', exit_result=True)
 def run_index(args: argparse.Namespace) -> int:
     sidecar_dir = resolve_sidecar_dir(args)
     scan_paths = [path.resolve() for path in args.paths] if args.paths else default_sidecar_scan_paths(args.root, sidecar_dir)
@@ -1119,13 +1174,17 @@ def init_sqlite(connection: sqlite3.Connection, create_indexes: bool = True) -> 
     ensure_data_schema(connection, create_indexes=create_indexes)
 
 
-def connect_sqlite(database_path: Path) -> sqlite3.Connection:
+def connect_sqlite(database_path: Path, *, safe: bool = False) -> sqlite3.Connection:
     database_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(database_path)
     # The database is a rebuildable index, so disable journaling. This also
     # avoids Windows disk/locking failures on some external or synced folders.
-    connection.execute("PRAGMA journal_mode = OFF")
-    connection.execute("PRAGMA synchronous = OFF")
+    from services.catalog_index import is_combined
+    if safe or is_combined(connection):
+        connection.execute("PRAGMA journal_mode = WAL")
+    else:
+        connection.execute("PRAGMA journal_mode = OFF")
+        connection.execute("PRAGMA synchronous = OFF")
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA temp_store = MEMORY")
     connection.execute("PRAGMA cache_size = -65536")
@@ -1198,6 +1257,9 @@ def import_payload_to_sqlite(
     tag_cache: dict[str, tuple[int, str]],
     store_raw_json: bool,
     extra_roots: dict[str, str] | None = None,
+    library_roots=None,
+    preserve_unknown_dates: bool = False,
+    minimum_file_id: int | None = None,
 ) -> None:
     post = payload.get("post") or {}
     local_file = payload.get("local_file") or {}
@@ -1207,12 +1269,18 @@ def import_payload_to_sqlite(
         raise ValueError("sidecar payload is missing local_file.path")
     file_path = Path(str(path_value))
     downloaded_at = local_file.get("downloaded_at")
-    if not downloaded_at and file_path.exists():
+    if not downloaded_at and not preserve_unknown_dates and file_path.exists():
         downloaded_at = local_downloaded_at(file_path)
 
     folder = folder_for_media(file_path, root, extra_roots)
-    root_id, relative_path = identity_for_media(file_path, root, _LIBRARY_ROOTS)
+    root_id, relative_path = identity_for_media(file_path, root, _LIBRARY_ROOTS if library_roots is None else library_roots)
 
+    if minimum_file_id is not None and not connection.execute('SELECT id FROM files WHERE path=?',(str(file_path),)).fetchone():
+        highest=connection.execute('SELECT coalesce(max(id),0) FROM files').fetchone()[0]
+        identity=max(highest,minimum_file_id)+1
+        if identity>9223372036854775807:
+            raise ValueError('No safe file identity remains; source evidence retained')
+        connection.execute('INSERT INTO files(id,path,name) VALUES(?,?,?)',(identity,str(file_path),file_path.name))
     row = connection.execute(
         """
         INSERT INTO files (
@@ -1379,6 +1447,7 @@ def record_manifest(
     )
 
 
+@observed('danbooru', 'sqlite', exit_result=True)
 def run_sqlite(args: argparse.Namespace) -> int:
     sidecar_dir = resolve_sidecar_dir(args)
     extra_roots = extra_roots_map(getattr(args, "extra_root", None) or [])
@@ -1388,8 +1457,11 @@ def run_sqlite(args: argparse.Namespace) -> int:
         sidecars = sidecars[: args.limit]
 
     database_path = resolve_database_path(args.root, args.output)
-    if args.replace and database_path.exists():
-        database_path.unlink()
+    replacement = None
+    if args.replace:
+        from modules.danbooru.catalog_index import prepare_replacement
+        replacement = prepare_replacement(database_path, getattr(args, 'user_db', None) if getattr(args, 'jobs_db', None) else None)
+        database_path = replacement.candidate
 
     total = len(sidecars)
     imported = 0
@@ -1398,8 +1470,9 @@ def run_sqlite(args: argparse.Namespace) -> int:
     tag_cache: dict[str, tuple[int, str]] = {}
     defer_indexes = args.replace
     print(f"PROGRESS:0/{total}", flush=True)
-    with connect_sqlite(database_path) as connection:
+    with closing(connect_sqlite(database_path, safe=replacement is not None)) as connection:
         init_sqlite(connection, create_indexes=not defer_indexes)
+        attach_ingest(connection,getattr(args,"jobs_db",None),getattr(args,"user_db",None))
         connection.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
             ("generated_at", datetime.now(timezone.utc).isoformat()),
@@ -1430,6 +1503,7 @@ def run_sqlite(args: argparse.Namespace) -> int:
                     tag_cache,
                     store_raw_json=not args.no_raw_json,
                     extra_roots=extra_roots,
+                    minimum_file_id=replacement.file_id_floor if replacement is not None else None,
                 )
                 record_manifest(connection, media_path, sidecar_path, media_stat)
                 imported += 1
@@ -1451,6 +1525,11 @@ def run_sqlite(args: argparse.Namespace) -> int:
             create_sqlite_indexes(connection)
             connection.commit()
 
+    if replacement is not None:
+        from modules.danbooru.catalog_index import install_replacement, attempt_guard
+        with attempt_guard():
+            install_replacement(replacement)
+        database_path = replacement.original
     print(f"Wrote {imported} records to {database_path}")
     if missing_media:
         print(f"Skipped {missing_media} sidecars whose media file is missing")
@@ -1621,6 +1700,14 @@ def _path_in_roots(path_text: str, roots: list[Path]) -> bool:
     return False
 
 
+def _ingest_batches(values, size):
+    # Consume slow filesystem/future results before entering a writer transaction.
+    values = iter(values)
+    while batch := list(islice(values, size)):
+        yield batch
+
+
+@observed('danbooru', 'discover', exit_result=True)
 def run_import_discover(args: argparse.Namespace) -> int:
     """Phase 1: make files browseable using directory metadata only."""
     roots = _import_scan_roots(args)
@@ -1636,70 +1723,76 @@ def run_import_discover(args: argparse.Namespace) -> int:
     print(f"PROGRESS:0/{total}", flush=True)
     database_path = resolve_database_path(args.root, args.output)
     extra_roots = extra_roots_map(roots)
-    with closing(connect_sqlite_live(database_path)) as connection:
-        init_sqlite(connection)
-        for index, (path_text, (mtime, size)) in enumerate(found.items(), 1):
+    def discovered_rows():
+        for path_text, (mtime, size) in found.items():
             media_path = Path(path_text)
             root_id, relative_path = identity_for_media(media_path, args.root, _LIBRARY_ROOTS)
-            folder = folder_for_media(media_path, args.root, extra_roots)
-            downloaded_at = local_downloaded_at(media_path)
-            row = connection.execute(
-                """
-                INSERT INTO files (
-                    path, folder, root_id, relative_path, name, ext, size,
-                    local_md5, downloaded_at, matched_md5, matched_by
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL)
-                ON CONFLICT(path) DO UPDATE SET
-                    folder=excluded.folder,
-                    root_id=excluded.root_id,
-                    relative_path=excluded.relative_path,
-                    name=excluded.name,
-                    ext=excluded.ext,
-                    size=excluded.size,
-                    downloaded_at=COALESCE(files.downloaded_at, excluded.downloaded_at)
-                RETURNING id
-                """,
-                (
-                    path_text, folder, root_id, str(relative_path), media_path.name,
-                    media_path.suffix.lower().lstrip("."), size, downloaded_at,
-                ),
-            ).fetchone()
-            file_id = int(row[0])
-            connection.execute(
-                """
-                INSERT INTO posts (
-                    file_id, rating, created_at, has_children, file_ext
-                ) VALUES (?, 'u', ?, 0, ?)
-                ON CONFLICT(file_id) DO UPDATE SET file_ext=excluded.file_ext
-                """,
-                (file_id, downloaded_at, media_path.suffix.lower().lstrip(".")),
-            )
-            connection.execute(
-                """
-                INSERT INTO ingest_state (
-                    media_path, root_id, relative_path, phase, status, discovered_at
-                ) VALUES (?, ?, ?, 'discovered', 'done', ?)
-                ON CONFLICT(media_path) DO UPDATE SET
-                    root_id=excluded.root_id,
-                    relative_path=excluded.relative_path,
-                    discovered_at=COALESCE(ingest_state.discovered_at, excluded.discovered_at)
-                """,
-                (path_text, root_id, str(relative_path), datetime.now(timezone.utc).isoformat()),
-            )
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO sync_manifest (
-                    media_path, sidecar_path, sidecar_mtime, sidecar_size,
-                    media_mtime, media_size, synced_at
-                ) VALUES (?, NULL, NULL, NULL, ?, ?, ?)
-                """,
-                (path_text, mtime, size, datetime.now(timezone.utc).isoformat()),
-            )
-            if index % 500 == 0:
-                connection.commit()
-            if index % 100 == 0 or index == total:
-                print(f"PROGRESS:{index}/{total}", flush=True)
-        connection.commit()
+            yield (path_text, root_id, str(relative_path),
+                   folder_for_media(media_path, args.root, extra_roots), media_path.name,
+                   media_path.suffix.lower().lstrip("."), size,
+                   local_downloaded_at(media_path), mtime)
+
+    processed = 0
+    with closing(connect_sqlite_live(database_path)) as connection:
+        init_sqlite(connection)
+        attach_ingest(connection,getattr(args,"jobs_db",None),getattr(args,"user_db",None))
+        for batch in _ingest_batches(discovered_rows(), 100):
+            with connection:
+                for path_text, root_id, relative_path, folder, name, extension, size, downloaded_at, mtime in batch:
+                    row = connection.execute(
+                        """
+                        INSERT INTO files (
+                            path, folder, root_id, relative_path, name, ext, size,
+                            local_md5, downloaded_at, matched_md5, matched_by
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, NULL)
+                        ON CONFLICT(path) DO UPDATE SET
+                            folder=excluded.folder,
+                            root_id=excluded.root_id,
+                            relative_path=excluded.relative_path,
+                            name=excluded.name,
+                            ext=excluded.ext,
+                            size=excluded.size,
+                            downloaded_at=COALESCE(files.downloaded_at, excluded.downloaded_at)
+                        RETURNING id
+                        """,
+                        (
+                            path_text, folder, root_id, relative_path, name,
+                            extension, size, downloaded_at,
+                        ),
+                    ).fetchone()
+                    file_id = int(row[0])
+                    connection.execute(
+                        """
+                        INSERT INTO posts (
+                            file_id, rating, created_at, has_children, file_ext
+                        ) VALUES (?, 'u', ?, 0, ?)
+                        ON CONFLICT(file_id) DO UPDATE SET file_ext=excluded.file_ext
+                        """,
+                        (file_id, downloaded_at, extension),
+                    )
+                    connection.execute(
+                        f"""
+                        INSERT INTO {ingest_table(connection)} (
+                            media_path, root_id, relative_path, phase, status, discovered_at
+                        ) VALUES (?, ?, ?, 'discovered', 'done', ?)
+                        ON CONFLICT(media_path) DO UPDATE SET
+                            root_id=excluded.root_id,
+                            relative_path=excluded.relative_path,
+                            discovered_at=COALESCE(ingest_state.discovered_at, excluded.discovered_at)
+                        """,
+                        (path_text, root_id, relative_path, datetime.now(timezone.utc).isoformat()),
+                    )
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO sync_manifest (
+                            media_path, sidecar_path, sidecar_mtime, sidecar_size,
+                            media_mtime, media_size, synced_at
+                        ) VALUES (?, NULL, NULL, NULL, ?, ?, ?)
+                        """,
+                        (path_text, mtime, size, datetime.now(timezone.utc).isoformat()),
+                    )
+            processed += len(batch)
+            print(f"PROGRESS:{processed}/{total}", flush=True)
     print(f"Discovered {total} media files without opening their contents.")
     return 0
 
@@ -1716,6 +1809,7 @@ def _enrich_file(path_text: str) -> tuple[str, str, int | None, int | None, str 
         return path_text, "", None, None, str(exc)
 
 
+@observed('danbooru', 'enrich', exit_result=True)
 def run_import_enrich(args: argparse.Namespace) -> int:
     """Phase 2: hash and inspect discovered files once with bounded workers."""
     roots = _import_scan_roots(args)
@@ -1725,13 +1819,14 @@ def run_import_enrich(args: argparse.Namespace) -> int:
     database_path = resolve_database_path(args.root, args.output)
     with closing(connect_sqlite_live(database_path)) as connection:
         init_sqlite(connection)
+        attach_ingest(connection,getattr(args,"jobs_db",None),getattr(args,"user_db",None))
         candidates = [
             row[0]
             for row in connection.execute(
-                """
+                f"""
                 SELECT f.path
                 FROM files f
-                LEFT JOIN ingest_state state ON state.media_path=f.path
+                LEFT JOIN {ingest_table(connection)} state ON state.media_path=f.path
                 WHERE state.enriched_at IS NULL
                 ORDER BY f.path
                 """
@@ -1744,42 +1839,44 @@ def run_import_enrich(args: argparse.Namespace) -> int:
     failed = 0
     with closing(connect_sqlite_live(database_path)) as connection:
         init_sqlite(connection)
+        attach_ingest(connection,getattr(args,"jobs_db",None),getattr(args,"user_db",None))
         with ThreadPoolExecutor(max_workers=max(1, min(8, args.workers))) as executor:
             futures = [executor.submit(_enrich_file, path) for path in candidates]
-            for index, future in enumerate(as_completed(futures), 1):
-                path_text, local_md5, width, height, error = future.result()
-                now = datetime.now(timezone.utc).isoformat()
-                if error:
-                    failed += 1
-                    connection.execute(
-                        "UPDATE ingest_state SET phase='enrich', status='error', error=? WHERE media_path=?",
-                        (error[:1000], path_text),
-                    )
-                else:
-                    connection.execute("UPDATE files SET local_md5=? WHERE path=?", (local_md5, path_text))
-                    connection.execute(
-                        "UPDATE posts SET width=?, height=? WHERE file_id=(SELECT id FROM files WHERE path=?)",
-                        (width, height, path_text),
-                    )
-                    connection.execute(
-                        """
-                        UPDATE ingest_state
-                           SET phase='enriched', status='done', error=NULL, enriched_at=?
-                         WHERE media_path=?
-                        """,
-                        (now, path_text),
-                    )
-                if index % 250 == 0:
-                    connection.commit()
-                if index % 50 == 0 or index == total:
-                    print(f"PROGRESS:{index}/{total}", flush=True)
-            connection.commit()
+            processed = 0
+            results = (future.result() for future in as_completed(futures))
+            for batch in _ingest_batches(results, 50):
+                with connection:
+                    for path_text, local_md5, width, height, error in batch:
+                        now = datetime.now(timezone.utc).isoformat()
+                        if error:
+                            failed += 1
+                            connection.execute(
+                                f"UPDATE {ingest_table(connection)} SET phase='enrich', status='error', error=? WHERE media_path=?",
+                                (error[:1000], path_text),
+                            )
+                        else:
+                            connection.execute("UPDATE files SET local_md5=? WHERE path=?", (local_md5, path_text))
+                            connection.execute(
+                                "UPDATE posts SET width=?, height=? WHERE file_id=(SELECT id FROM files WHERE path=?)",
+                                (width, height, path_text),
+                            )
+                            connection.execute(
+                                f"""
+                                UPDATE {ingest_table(connection)}
+                                   SET phase='enriched', status='done', error=NULL, enriched_at=?
+                                 WHERE media_path=?
+                                """,
+                                (now, path_text),
+                            )
+                processed += len(batch)
+                print(f"PROGRESS:{processed}/{total}", flush=True)
     print(f"Enriched {total - failed} media files; {failed} failed.")
     # A damaged file is recorded as resumable per-item state. It must not stop
     # an all-phases import from finalizing every healthy file.
     return 0
 
 
+@observed('danbooru', 'finalize', exit_result=True)
 def run_import_finalize(args: argparse.Namespace) -> int:
     """Phase 4: reuse incremental sync, then mark the resumable phase ledger."""
     result = run_sync(args)
@@ -1791,25 +1888,42 @@ def run_import_finalize(args: argparse.Namespace) -> int:
     now = datetime.now(timezone.utc).isoformat()
     incomplete = 0
     with closing(connect_sqlite_live(database_path)) as connection:
-        for row in connection.execute("SELECT media_path, status FROM ingest_state"):
-            if not _path_in_roots(row[0], roots):
-                continue
-            incomplete += row[1] in {"error", "partial"}
-            media_path = Path(row[0])
-            has_sidecar = existing_metadata_path_for(media_path, ".danbooru.json", args.root, sidecar_dir) is not None
-            connection.execute(
-                """
-                UPDATE ingest_state
-                   SET phase=CASE WHEN status IN ('error', 'no_match', 'partial') THEN phase ELSE 'finalized' END,
-                       status=CASE WHEN status IN ('error', 'no_match', 'partial') THEN status ELSE 'done' END,
-                       error=CASE WHEN status IN ('error', 'no_match', 'partial') THEN error ELSE NULL END,
-                       metadata_at=CASE WHEN ? THEN COALESCE(metadata_at, ?) ELSE metadata_at END,
-                       finalized_at=?
-                 WHERE media_path=?
-                """,
-                (1 if has_sidecar else 0, now, now, row[0]),
-            )
-        connection.commit()
+        attach_ingest(connection,getattr(args,"jobs_db",None),getattr(args,"user_db",None))
+        ledger = ingest_table(connection)
+        after = None
+        while True:
+            # Close the read cursor before commits; a retained WAL snapshot can
+            # otherwise block upgrading the next batch after another writer.
+            where = "" if after is None else " WHERE media_path>?"
+            parameters = () if after is None else (after,)
+            with closing(connection.execute(
+                f"SELECT media_path, status FROM {ledger}{where} ORDER BY media_path LIMIT 100",
+                parameters,
+            )) as cursor:
+                rows = cursor.fetchall()
+            if not rows:
+                break
+            after = rows[-1][0]
+            updates = []
+            for path_text, status in rows:
+                if not _path_in_roots(path_text, roots):
+                    continue
+                incomplete += status in {"error", "partial"}
+                has_sidecar = existing_metadata_path_for(Path(path_text), ".danbooru.json", args.root, sidecar_dir) is not None
+                updates.append((1 if has_sidecar else 0, now, now, path_text))
+            with connection:
+                connection.executemany(
+                    f"""
+                    UPDATE {ledger}
+                       SET phase=CASE WHEN status IN ('error', 'no_match', 'partial') THEN phase ELSE 'finalized' END,
+                           status=CASE WHEN status IN ('error', 'no_match', 'partial') THEN status ELSE 'done' END,
+                           error=CASE WHEN status IN ('error', 'no_match', 'partial') THEN error ELSE NULL END,
+                           metadata_at=CASE WHEN ? THEN COALESCE(metadata_at, ?) ELSE metadata_at END,
+                           finalized_at=?
+                     WHERE media_path=?
+                    """,
+                    updates,
+                )
     return 3 if incomplete and getattr(args, "report_incomplete", False) else 0
 
 
@@ -1909,6 +2023,7 @@ def run_sync(args: argparse.Namespace) -> int:
 
     with closing(connect_sqlite_live(database_path)) as connection:
         init_sqlite(connection)
+        attach_ingest(connection,getattr(args,"jobs_db",None),getattr(args,"user_db",None))
 
         manifest: dict[str, tuple[str, str | None, int | None, int | None, int | None, int | None]] = {}
         for row in connection.execute(
@@ -2305,6 +2420,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=project_root() / "data" / "sidecars",
         help="Central sidecar folder. Relative paths use the project root.",
     )
+    parser.add_argument("--jobs-db", type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--user-db",
         type=path_arg,
@@ -2539,7 +2655,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+@worker_diagnostics
 def main() -> int:
+    # The app durably records the process identity before allowing acquisition.
+    if os.environ.pop("KEIVOTOS_PIPELINE_START_GATE",None)=="1":
+        if sys.stdin.readline().strip()!="start":
+            return 1
     global _LIBRARY_ROOTS
     parser = build_parser()
     args = parser.parse_args()

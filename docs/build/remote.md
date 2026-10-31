@@ -36,9 +36,14 @@ python scripts/release/build_remote.py
 Both targets are the default. Use `--target linux` or `--target windows` to
 request only one. The helper selects local HEAD, checks that GitHub can access
 that exact commit, starts the workflow from the default branch, waits for its
-specific request, and downloads ZIPs/checksums into `artifacts/github-<run-id>/`.
+specific request, and downloads archives/checksums into `artifacts/github-<run-id>/`.
 It verifies each platform's recorded commit and SHA-256 before exposing the
 completed output folder. Existing output folders are never replaced.
+
+Linux supplies tar.gz and its checksum; Windows supplies ZIP and its checksum.
+The manifest declares the formats, and each archive's checksum is verified.
+Resuming older ZIP-only or dual-format Linux runs remains supported without
+changing their original manifests. See [Linux builds](linux.md).
 
 The working tree must be clean: commit your intended changes first. Ignored
 application data is not uploaded by this tool. GitHub builds only the selected

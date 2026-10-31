@@ -77,6 +77,9 @@ def change(connection, identity, expected, request_id, *, title=None, count=None
 
 
 def video(connection, job_id):
+    migrated=connection.execute("SELECT 1 FROM sqlite_master WHERE name='kv_operational_migrations'").fetchone()
+    if migrated and connection.execute("SELECT 1 FROM kv_operational_migrations WHERE owner='youtube'").fetchone():
+        return catalog_video(connection,job_id)
     row=connection.execute('SELECT * FROM youtube_downloads WHERE id=?', (job_id,)).fetchone()
     if not row:
         return None,'Download record is unavailable.'
@@ -100,20 +103,63 @@ def video(connection, job_id):
     return job,''
 
 
-def require_video(connection, job_id):
-    job,reason=video(connection,job_id)
+def catalog_video(connection, job_id):
+    """Resolve a preserved playlist alias without consulting operational jobs.
+
+    Explicit compatibility mode only. Complete/progress defaults describe a
+    preserved completed item, not reconstructed operational download history.
+    """
+    from modules.youtube import metadata
+    from services import item_catalog
+    try:
+        captured = metadata.preserved_capture(connection, job_id)
+    except ValueError:
+        return None, 'Saved video metadata is unavailable.'
+    if captured is None:
+        return None, 'Saved video record is unavailable.'
+    record = captured['payload']['record']
+    if any(not isinstance(record.get(name), str) for name in
+           ('url', 'source_id', 'path', 'video', 'audio', 'title', 'thumbnail', 'created_at')):
+        return None, 'Saved video metadata is unavailable.'
+    job = {name: '' for name in metadata.COLUMNS}
+    job.update(metadata_version=0, duration_seconds=None, layout_version=0, bundle_path='', manifest_sha256='', retry_of='')
+    job.update(record)
+    job.update(status='complete', progress=100, error='', failure_phase='', superseded_by='')
+    job.pop('root', None)
+    if job['video'] == 'audio' or Path(job['path']).suffix.lower() not in ('.mp4', '.webm', '.m4v'):
+        return job, 'This item cannot play as a local video.'
+    source = sources.get_source(connection, job['source_id'])
+    if source is None or not source.visible or source.role not in ('files', 'video', 'youtube'):
+        return job, 'The registered video folder is unavailable.'
+    try:
+        library = item_catalog.library_for_legacy(connection, namespace='files.source', legacy_key=source.source_id)
+        if library is None:
+            return job, 'The saved library record is unavailable.'
+        forbidden = [config.SUITE_HOME, *(Path(child.path) for child in
+                     sources.descendant_sources(source, sources.list_sources(connection)))]
+        metadata.preserved_media(connection, job_id, source_id=source.source_id,
+                                 source_root=source.path, forbidden_roots=forbidden, hash_assets=False)
+    except (serving.ServeDenied, OSError, ValueError):
+        return job, 'The local video file is unavailable.'
+    return job, ''
+
+
+def require_video(connection, job_id, *, use_catalog=False):
+    resolver=catalog_video if use_catalog else video
+    job,reason=resolver(connection,job_id)
     if reason:
         raise HTTPException(409 if job else 404,reason)
     return job
 
 
-def items(connection, identity, offset, limit):
+def items(connection, identity, offset, limit, *, use_catalog=False):
     owner=playlist(connection,identity)
     rows=connection.execute("""SELECT job_id,position FROM youtube_playlist_items
         WHERE playlist_id=? ORDER BY position LIMIT ? OFFSET ?""", (identity,limit,offset)).fetchall()
     result=[]
     for row in rows:
-        job,reason=video(connection,row['job_id'])
+        resolver=catalog_video if use_catalog else video
+        job,reason=resolver(connection,row['job_id'])
         result.append({'job_id':row['job_id'],'position':row['position'],'available':not reason,
                        'unavailable_reason':reason,'job':{k:v for k,v in job.items() if k!='root'} if job else None})
     return {'playlist':owner,'items':result,'total':owner['item_count']}
@@ -127,10 +173,13 @@ def membership(connection, job_id):
                 WHERE i.job_id=? AND p.deleted_at='' ORDER BY i.playlist_id""", (job_id,))]}
 
 
-def set_membership(connection, job_id, selected, expected):
+def set_membership(connection, job_id, selected, expected, *, use_catalog=False):
     selected=sorted(set(selected))
     connection.execute('BEGIN IMMEDIATE')
-    require_video(connection,job_id)
+    if use_catalog:
+        require_video(connection,job_id,use_catalog=True)
+    else:
+        require_video(connection,job_id)
     for identity in selected:
         playlist(connection,identity)  # reject archived owners even on a repeated payload
     current=membership(connection,job_id)

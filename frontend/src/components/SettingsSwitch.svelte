@@ -2,8 +2,9 @@
   export let label: string;
   export let checked = false;
   export let disabled = false;
+  export let describedBy: string | undefined = undefined;
 </script>
-<button type="button" role="switch" aria-label={label} aria-checked={checked} {disabled} on:click class="settings-switch" class:checked>
+<button type="button" role="switch" aria-label={label} aria-describedby={describedBy} aria-checked={checked} {disabled} on:click class="settings-switch" class:checked>
   <span></span>
 </button>
 <style>

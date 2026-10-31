@@ -7,11 +7,11 @@ import suite_modules
 import lifecycle
 from maintenance import module_operation
 from app_factory import app
-from routers import backups, cache, recovery, storage, suite, user_settings
+from routers import backups, cache, recovery, storage, suite, user_settings, diagnostics, downloads
 
 # Suite-shell routers: the module registry itself and suite-level user settings.
 # They belong to no module and are always mounted.
-for shell_router in (suite.router, user_settings.router, backups.router, recovery.router, storage.router, cache.router):
+for shell_router in (suite.router, user_settings.router, backups.router, recovery.router, storage.router, cache.router, diagnostics.router, downloads.router):
     app.include_router(shell_router)
 
 # Every registered surface contributes its own routers — the Files base and each

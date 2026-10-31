@@ -1,7 +1,16 @@
 <script lang="ts">
-  import { formatReleaseDate, RELEASED_AT, SUITE_NAME, VERSION } from '../lib/product';
+  import { onMount } from 'svelte';
+  import { formatReleaseDate, SUITE_NAME, VERSION } from '../lib/product';
+  import { suiteApi } from '../lib/suiteApi';
 
-  const releaseDate = formatReleaseDate(RELEASED_AT);
+  let releaseDate: string | null = null;
+  onMount(() => {
+    let active = true;
+    void suiteApi.installedRelease().then(release => {
+      if (active) releaseDate = formatReleaseDate(release?.published_at ?? '');
+    });
+    return () => { active = false; };
+  });
 </script>
 
 <section class="mx-auto flex min-h-full max-w-3xl flex-col" aria-label={`About ${SUITE_NAME}`}>
@@ -11,6 +20,6 @@
   </div>
   <div class="mt-6 border-t border-[#292938]" aria-hidden="true"></div>
   <p id="setting-about" class="mt-auto pt-8 text-center text-sm text-gray-400">
-    Version {VERSION} ({releaseDate ?? 'Release date unavailable'})
+    Version {VERSION}{releaseDate ? ` (${releaseDate})` : ''}
   </p>
 </section>

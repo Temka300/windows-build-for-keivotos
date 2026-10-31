@@ -1,7 +1,7 @@
 <script lang="ts">
   import { createEventDispatcher, onDestroy, onMount } from 'svelte';
   import { SUITE_NAME, VERSION } from '../lib/product';
-  import { activeModule, enabledModules, suiteModules, settingsOpen, settingsInitialSection } from '../lib/suiteStores';
+  import { activeModule, suiteView, enabledModules, suiteModules, settingsOpen, settingsInitialSection } from '../lib/suiteStores';
   import { suiteApi, type SuiteModule } from '../lib/suiteApi';
   import { activateModule, moduleUi } from '../modules/registry';
 
@@ -11,6 +11,7 @@
   let closing = false;
   let closeTimer: ReturnType<typeof setTimeout> | null = null;
   let modules: SuiteModule[] = [];
+  let afterClose: (() => void) | null = null;
 
   $: enabledList = $suiteModules.filter((mod) => mod.enabled);
   $: footerActions = enabledList.flatMap((mod) => moduleUi(mod.slug).drawerActions);
@@ -30,7 +31,12 @@
   function close() {
     if ($settingsOpen || closing) return;
     closing = true;
-    closeTimer = setTimeout(() => dispatch('close'), DRAWER_EXIT_MS);
+    closeTimer = setTimeout(() => {
+      const action = afterClose;
+      afterClose = null;
+      dispatch('close');
+      action?.();
+    }, DRAWER_EXIT_MS);
   }
 
   function openSettings(section = 'appearance') {
@@ -41,6 +47,12 @@
   async function openModule(mod: SuiteModule) {
     if (beforeNavigate && !await beforeNavigate(mod.slug)) return;
     activateModule(mod.slug);
+    close();
+  }
+
+  async function openDownloads() {
+    if (beforeNavigate && !await beforeNavigate('@downloads')) return;
+    afterClose = () => suiteView.set('downloads');
     close();
   }
 
@@ -120,6 +132,11 @@
     </nav>
 
     <footer class="border-t border-[#292937] p-3">
+      <button type="button" class="drawer-downloads mb-2 flex w-full items-center gap-3 rounded-md px-3 py-2 text-left text-[13px] font-medium text-gray-400 transition-colors hover:bg-white/5 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-purple-400"
+        class:downloads-active={$suiteView === 'downloads'} on:click={openDownloads}>
+        <svg class="h-[18px] w-[18px]" viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.7" d="M12 3v12m-4-4 4 4 4-4M4 16v4h16v-4"/></svg>
+        <span>Downloads</span>
+      </button>
       <div class="flex items-center gap-1">
         {#each footerActions as action (action.id)}
           <button
@@ -152,6 +169,8 @@
 </div>
 
 <style>
+  .downloads-active { color: var(--accent, #c4b5fd); background: rgba(168, 139, 250, .07); }
+
   .app-drawer {
     animation: drawer-in 220ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
     will-change: transform, opacity;

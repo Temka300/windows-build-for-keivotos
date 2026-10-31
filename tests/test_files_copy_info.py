@@ -102,6 +102,29 @@ class CopyOriginInfoTests(unittest.TestCase):
 
     # --- tests -----------------------------------------------------------
 
+    def test_details_copy_is_additive_and_preserves_target_values(self) -> None:
+        files = self.files
+        source = files.put_info(files.AnnotationRequest(source_id=self._sid(), path='iroha_ver1_0.zip',
+            details=[{'label':'Album','value':'source'}, {'label':'Date','value':'2026'}], metadata_applied=True))
+        files.put_info(files.AnnotationRequest(source_id=self._sid(), path='iroha_ver1_0',
+            details=[{'label':'album','value':'manual target'}]))
+        for _ in range(2):
+            result = self._copy('iroha_ver1_0.zip', 'iroha_ver1_0')
+            self.assertEqual([item.model_dump() for item in result.details],
+                [{'label':'album','value':'manual target'}, {'label':'Date','value':'2026'}])
+        self.assertEqual(files.get_info(source_id=self._sid(), path='iroha_ver1_0.zip'), source)
+
+    def test_detail_limit_refuses_copy_before_changing_target(self) -> None:
+        files = self.files
+        files.put_info(files.AnnotationRequest(source_id=self._sid(), path='iroha_ver1_0.zip', author='source',
+            details=[{'label':'New','value':'source'}]))
+        target = files.put_info(files.AnnotationRequest(source_id=self._sid(), path='iroha_ver1_0', author='target',
+            details=[{'label':str(i),'value':'manual'} for i in range(32)]))
+        with self.assertRaises(HTTPException) as caught:
+            self._copy('iroha_ver1_0.zip', 'iroha_ver1_0')
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertEqual(files.get_info(source_id=self._sid(), path='iroha_ver1_0'), target)
+
     def test_description_and_links_carry_to_the_extracted_folder(self) -> None:
         self._write_note(
             "iroha_ver1_0.zip",

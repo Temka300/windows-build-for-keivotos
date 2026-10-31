@@ -71,12 +71,18 @@ def artist_profile_asset_file(asset_id: int):
         raise HTTPException(404, "Archived artist profile image not found")
     archive_root = ARTIST_PROFILE_ARCHIVE_DIR.resolve(strict=False)
     path = Path(row["file_path"]).resolve(strict=False)
-    try:
-        path.relative_to(archive_root)
-    except ValueError as exc:
-        raise HTTPException(403, "Archived profile image is outside the archive") from exc
-    if not path.is_file():
-        raise HTTPException(404, "Archived artist profile image file is missing")
+    permitted=path.is_relative_to(archive_root)
+    if not permitted or not path.is_file():
+        import config
+        from services.asset_preservation import resolve
+        with get_user_db() as conn:
+            preserved=resolve(conn,config.SUITE_HOME,'danbooru','profile:'+str(asset_id),
+                              expected_source=row['file_path'])
+        if preserved is None:
+            if not permitted:
+                raise HTTPException(403, "Archived profile image is outside the archive")
+            raise HTTPException(404, "Archived artist profile image file is missing")
+        path=preserved
     return FileResponse(path, headers={"Cache-Control": "private, max-age=31536000, immutable"})
 
 

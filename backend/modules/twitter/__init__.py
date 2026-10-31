@@ -11,13 +11,20 @@ def _routers():
 
 
 def _startup():
-    from modules.twitter.jobs import recover
+    from modules.twitter.jobs import recover,get_jobs_db
+    from services.download_controls import recover_workers
+    with get_jobs_db() as db:recover_workers(db,'twitter')
     recover()
 
 
 def _tasks():
     from modules.twitter.jobs import run_queue
     return [('twitter-downloads', run_queue())]
+
+
+def _file_metadata(context):
+    from modules.twitter.metadata import file_metadata
+    return file_metadata(context)
 
 
 def adopt(source_id: str) -> dict:
@@ -46,6 +53,10 @@ def release(source_id: str, forget: bool = False) -> dict:
 
 def descriptor(suite_home: Path, version: str) -> ModuleDescriptor:
     return ModuleDescriptor(
+        portable_provider=_portable,
+        download_history_provider=_download_history,
+        download_control_provider=_download_controls,
+        transfer_provider=_transfer,
         slug='twitter', name='Twitter', description='Locally preserved posts.',
         home=suite_home / 'modules/twitter', database=suite_home / 'base/files.sqlite',
         credentials=None, api_prefix='/api/twitter', log_prefix='twitter',
@@ -53,4 +64,25 @@ def descriptor(suite_home: Path, version: str) -> ModuleDescriptor:
         experimental=True, router_provider=_routers, adopt_hook=adopt, release_hook=release, shared_folder_relocation=True,
         user_schema_provider=lambda: SCHEMA, publish_hook=publish,
         startup_hook=_startup, background_tasks_hook=_tasks,
+        file_metadata_provider=_file_metadata,
     )
+
+
+def _portable():
+    from modules.twitter.portable import contribution
+    return contribution()
+
+
+def _transfer():
+    from modules.twitter.transfer import contribution
+    return contribution()
+
+
+def _download_history(context):
+    from modules.twitter.downloads import contribute
+    return contribute(context)
+
+
+def _download_controls():
+    from modules.twitter.downloads import controls
+    return controls()

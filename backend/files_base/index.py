@@ -15,8 +15,10 @@ Design constraints (SUITE_MODULE_CONTRACT.md):
 """
 from __future__ import annotations
 
+from services.operation_diagnostics import observed
 import os
 import sqlite3
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,11 +26,24 @@ from pathlib import Path
 from typing import Generator, Iterable
 
 from files_base.schema import ensure_files_schema
+from services.search_text import literal_contains
 
 
 # Keivotos-generated directories that live inside a user's folder but must never
 # be indexed as browsable content (currently the attachment byte store).
 EXCLUDED_DIR_NAMES = {".keivotos"}
+_source_work_lock = threading.RLock()
+
+
+@contextmanager
+def source_work(*, wait: bool = True):
+    """Serialize source snapshots, scans and path changes in this process."""
+    if not _source_work_lock.acquire(blocking=wait):
+        raise RuntimeError('Wait for folder work to finish before editing folders')
+    try:
+        yield
+    finally:
+        _source_work_lock.release()
 
 
 @dataclass(frozen=True)
@@ -76,24 +91,35 @@ def _escape_like(term: str) -> str:
 @contextmanager
 def open_index(db_path: Path) -> Generator[sqlite3.Connection, None, None]:
     """Open the file index at ``db_path``, ensuring its schema and WAL mode."""
-    db_path = Path(db_path)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(db_path)
-    connection.row_factory = sqlite3.Row
-    try:
-        connection.execute("PRAGMA journal_mode = WAL")
-        ensure_files_schema(connection)
-        yield connection
-    finally:
-        connection.close()
+    from database_connections import _database_access_gate
+    from services.catalog_index import is_combined
+    with _database_access_gate.read():
+        from database_connections import require_storage_ready
+        require_storage_ready(db_path)
+        db_path = Path(db_path)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(db_path)
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA journal_mode = WAL")
+            if is_combined(connection) and not connection.execute(
+                    "SELECT 1 FROM kv_index_owners WHERE owner='files'").fetchone():
+                raise ValueError("Files is not registered in this combined index")
+            ensure_files_schema(connection)
+            yield connection
+        finally:
+            connection.close()
 
 
+@observed('suite', 'files.scan', library='source_id')
 def scan_source(
     connection: sqlite3.Connection,
     source_id: str,
     root: Path,
     *,
     excluded_roots: Iterable[Path] = (),
+    commit: bool = True,
+    cancelled=None,
 ) -> dict[str, int]:
     """Index every file and directory beneath ``root`` for ``source_id``.
 
@@ -110,6 +136,7 @@ def scan_source(
         if Path(path).expanduser().resolve(strict=False) != root
     }
     # Reset availability inside the scan transaction, then mark observed rows.
+    connection.execute('DELETE FROM files_audio_metadata WHERE source_id=?', (source_id,))
     # Wall clocks can repeat or move backwards, so timestamps cannot identify
     # which rows this scan visited. Keep their last-seen timestamps intact.
     connection.execute(
@@ -120,9 +147,13 @@ def scan_source(
 
     def upsert(path: Path, is_dir: bool) -> None:
         nonlocal added, updated, directories, files
+        if cancelled is not None and cancelled():
+            raise InterruptedError('Index discovery cancelled')
         try:
             stat_result = path.stat()
         except OSError:
+            from services.operation_diagnostics import count
+            count("skipped", reason="unreadable_stat")
             return
         relative = path.relative_to(root).as_posix()
         parent = os.path.dirname(relative)
@@ -181,7 +212,8 @@ def scan_source(
         "SELECT COUNT(*) FROM files_index WHERE source_id = ? AND available = 0",
         (source_id,),
     ).fetchone()[0]
-    connection.commit()
+    if commit:
+        connection.commit()
     return {
         "added": added,
         "updated": updated,
@@ -233,6 +265,8 @@ def refresh_file(connection: sqlite3.Connection, source_id: str, root: Path,
                  name: str, previous_name: str | None = None) -> None:
     """Refresh one root-level file after an owner mutation, without scanning media."""
     root = Path(root).expanduser().resolve(strict=False)
+    connection.execute('DELETE FROM files_audio_metadata WHERE source_id=? AND relative_path IN (?,?)',
+                       (source_id, name, previous_name or name))
     if previous_name and previous_name != name:
         connection.execute(
             "UPDATE files_index SET available=0 WHERE source_id=? AND path=?",
@@ -266,6 +300,7 @@ def refresh_file(connection: sqlite3.Connection, source_id: str, root: Path,
 
 def drop_source(connection: sqlite3.Connection, source_id: str) -> int:
     """Remove all index rows for a source (un-index only; disk is untouched)."""
+    connection.execute('DELETE FROM files_audio_metadata WHERE source_id=?', (source_id,))
     removed = connection.execute(
         "DELETE FROM files_index WHERE source_id = ?", (source_id,)
     ).rowcount
@@ -295,6 +330,46 @@ def list_directory(
     return [_row_to_entry(row) for row in connection.execute(query, params)]
 
 
+def source_search_scope(connection: sqlite3.Connection, registered, *, source_ids=None,
+                        forbidden_paths=()) -> tuple[str, list[object]]:
+    """Fence current owners before filtering/counting/paging retained index rows.
+
+    Source resolution and child ownership use the same boundaries as serving.
+    This only filters a read: offline/hidden/previous-owner records stay intact.
+    """
+    from files_base import sources, serving
+
+    registered = list(registered)
+    forbidden_paths = tuple(forbidden_paths)
+    selected = set(source_ids) if source_ids is not None else None
+    connection.create_function('keivotos_path_key', 1, os.path.normcase, deterministic=True)
+    choices = []
+    parameters: list[object] = []
+    for source in registered:
+        if not source.visible or selected is not None and source.source_id not in selected:
+            continue
+        try:
+            root = serving.resolve_within_source(source.path, '', list(forbidden_paths))
+            if not root.is_dir():
+                continue
+            excluded = [Path(child.path) for child in sources.descendant_sources(source, registered)]
+            excluded.extend(forbidden_paths)
+            clauses = ['source_id=?', 'instr(keivotos_path_key(path),?)=1']
+            values: list[object] = [source.source_id, os.path.normcase(str(root) + os.sep)]
+            for child in excluded:
+                resolved = Path(child).expanduser().resolve(strict=False)
+                if not resolved.is_relative_to(root) or resolved == root:
+                    continue
+                relative = resolved.relative_to(root).as_posix()
+                clauses.append('(keivotos_path_key(relative_path)!=? AND instr(keivotos_path_key(relative_path),?)!=1)')
+                values.extend([os.path.normcase(relative), os.path.normcase(relative + '/')])
+            choices.append('(' + ' AND '.join(clauses) + ')')
+            parameters.extend(values)
+        except (OSError, ValueError, RuntimeError, serving.ServeDenied):
+            continue
+    return '(' + ' OR '.join(choices) + ')' if choices else '0', parameters
+
+
 def search_by_name(
     connection: sqlite3.Connection,
     term: str,
@@ -302,10 +377,17 @@ def search_by_name(
     source_ids: Iterable[str] | None = None,
     limit: int = 200,
     include_unavailable: bool = False,
+    *,
+    offset: int = 0,
+    source_scope: tuple[str, list[object]] | None = None,
 ) -> list[FileEntry]:
-    """Find entries whose name contains ``term`` (case-insensitive substring)."""
-    clauses = ["name LIKE ? ESCAPE '\\'"]
-    params: list[object] = [f"%{_escape_like(term)}%"]
+    """Find literal Unicode case-insensitive name matches in a stable page."""
+    predicate, folded = literal_contains(connection, 'name', term)
+    clauses = [predicate]
+    params: list[object] = [folded]
+    if source_scope is not None:
+        clauses.append(source_scope[0])
+        params.extend(source_scope[1])
     if source_id is not None and source_ids is not None:
         raise ValueError("Pass source_id or source_ids, not both")
     if source_id is not None:
@@ -322,7 +404,32 @@ def search_by_name(
     query = (
         "SELECT * FROM files_index WHERE "
         + " AND ".join(clauses)
-        + " ORDER BY is_dir DESC, name COLLATE NOCASE ASC LIMIT ?"
+        + " ORDER BY is_dir DESC, name COLLATE NOCASE ASC, relative_path, source_id LIMIT ? OFFSET ?"
     )
-    params.append(int(limit))
+    params.extend([int(limit), int(offset)])
     return [_row_to_entry(row) for row in connection.execute(query, params)]
+
+
+def rebuild_index(build):
+    """Explicit candidate discovery; never runs from index open or startup."""
+    from files_base import sources, serving
+    connection = build.connection
+    connection.execute('UPDATE files_index SET available=0')
+    connection.commit()
+    for source in build.sources:
+        build.check()
+        if not source.visible:
+            continue
+        forbidden = [build.suite_home, *(Path(child.path) for child in
+                     sources.descendant_sources(source, build.sources))]
+        try:
+            root = serving.resolve_within_source(source.path, '', [build.suite_home])
+            if not root.is_dir():
+                continue
+            scan_source(connection, source.source_id, root, excluded_roots=forbidden,
+                        cancelled=build.cancelled)
+        except InterruptedError:
+            raise
+        except (OSError, serving.ServeDenied):
+            # An offline/hidden source does not erase historical references.
+            continue

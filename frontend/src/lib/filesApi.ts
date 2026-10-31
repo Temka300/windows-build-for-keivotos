@@ -1,9 +1,34 @@
+import {diagnosticFetch} from './diagnostics';
+import {folderRescanChanges} from './suiteStores';
 // Files base API client (V1.1.0).
 //
 // Deliberately isolated from the Danbooru `api.ts` client, mirroring the
 // backend's `files_base` isolation. Talks only to `/api/files/*`.
 
 const BASE = '/api/files';
+
+export interface AudioMetadata {
+  status: 'pending' | 'ready' | 'busy' | 'limited' | 'invalid' | 'unavailable' | 'unsupported';
+  tags: Record<string, string[]>;
+  display_title: string;
+  duration: number | null;
+  channels: number | null;
+  bitrate: number | null;
+  bitdepth: number | null;
+  samplerate: number | null;
+  mime_type: string | null;
+  is_lossless: boolean | null;
+}
+
+export interface ModuleMetadataSection {
+  owner: string;
+  name: string;
+  status: 'ready' | 'unavailable';
+  fields: {label: string; value: string | null; href: string | null; placement: 'origin' | 'properties'}[];
+  related: {label: string; path: string; available: boolean}[];
+  artwork: boolean;
+  artwork_version: string;
+}
 
 export interface FileNode {
   source_id: string;
@@ -80,6 +105,11 @@ export interface AnnotationLink {
   kind: string;
 }
 
+export interface AnnotationDetail {
+  label: string;
+  value: string;
+}
+
 export interface AnnotationAttachment {
   id: number;
   content_hash: string;
@@ -102,6 +132,8 @@ export interface Annotation {
   description: string;
   author: string;
   extra_info: string;
+  details: AnnotationDetail[];
+  metadata_applied: boolean;
   created_at: string | null;
   updated_at: string | null;
   links: AnnotationLink[];
@@ -114,6 +146,8 @@ export interface AnnotationRequest {
   description: string;
   author: string;
   extra_info: string;
+  details?: AnnotationDetail[];
+  metadata_applied?: boolean;
   links: AnnotationLink[];
 }
 
@@ -151,20 +185,20 @@ async function apiError(res: Response): Promise<ApiError> {
   return error;
 }
 
-async function getJson<T>(path: string, params?: Record<string, string | number | undefined>): Promise<T> {
+async function getJson<T>(path: string, params?: Record<string, string | number | undefined>, signal?: AbortSignal): Promise<T> {
   const url = new URL(BASE + path, window.location.origin);
   if (params) {
     for (const [key, value] of Object.entries(params)) {
       if (value !== undefined && value !== null && value !== '') url.searchParams.set(key, String(value));
     }
   }
-  const res = await fetch(url.toString());
+  const res = await diagnosticFetch(url.toString(), {signal});
   if (!res.ok) throw await apiError(res);
   return res.json();
 }
 
 async function send<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const res = await fetch(BASE + path, {
+  const res = await diagnosticFetch(BASE + path, {
     method,
     headers: body ? { 'Content-Type': 'application/json' } : undefined,
     body: body ? JSON.stringify(body) : undefined,
@@ -174,13 +208,22 @@ async function send<T>(method: string, path: string, body?: unknown): Promise<T>
 }
 
 export const filesApi = {
+  moduleMetadata: (sourceId: string, path: string) =>
+    getJson<{sections: ModuleMetadataSection[]}>('/module-metadata', {source_id: sourceId, path}),
+  moduleArtworkUrl: (sourceId: string, path: string, owner: string, version: string) =>
+    `${BASE}/module-artwork?${new URLSearchParams({source_id: sourceId, path, owner, v: version})}`,
+  audioMetadata: (sourceId: string, path: string) =>
+    getJson<AudioMetadata>('/audio-metadata', { source_id: sourceId, path }),
   listSources: () => getJson<SourceInfo[]>('/sources'),
-  scanSource: (sourceId: string) =>
-    send<ScanSummary>('POST', `/sources/${encodeURIComponent(sourceId)}/scan`),
-  browse: (sourceId: string, parent = '') =>
-    getJson<FileNode[]>('/browse', { source_id: sourceId, parent }),
-  search: (q: string, sourceId?: string) =>
-    getJson<FileNode[]>('/search', { q, source_id: sourceId }),
+  scanSource: async (sourceId: string) => {
+    const result = await send<ScanSummary>('POST', `/sources/${encodeURIComponent(sourceId)}/scan`);
+    folderRescanChanges.update(value => value + 1);
+    return result;
+  },
+  browse: (sourceId: string, parent = '', signal?: AbortSignal) =>
+    getJson<FileNode[]>('/browse', { source_id: sourceId, parent }, signal),
+  search: (q: string, sourceId?: string, offset = 0, limit = 200, signal?: AbortSignal) =>
+    getJson<FileNode[]>('/search', { q, source_id: sourceId, offset, limit }, signal),
   computeHashes: (limit = 2000) => send<HashProgress>('POST', `/hash?limit=${limit}`),
   listDuplicates: () => getJson<DuplicateGroup[]>('/duplicates'),
   browseFs: (path = '') => getJson<FsListing>('/fs', { path }),
@@ -248,7 +291,7 @@ export const filesApi = {
       path,
       file_name: file.name,
     });
-    const res = await fetch(`${BASE}/attachment?${params.toString()}`, {
+    const res = await diagnosticFetch(`${BASE}/attachment?${params.toString()}`, {
       method: 'POST',
       headers: { 'Content-Type': file.type || 'application/octet-stream' },
       body: file,

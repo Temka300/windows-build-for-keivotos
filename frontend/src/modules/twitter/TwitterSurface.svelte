@@ -13,11 +13,12 @@
   import {twitterApi,postUrl,captureKey,type Capture,type Download,type Preferences} from './api';
 
   type Screen={section:'posts'|'authors';author:Capture|null;mode:'feed'|'detail';detail:Capture|null};
-  type Frame={screen:Screen;items:Capture[];cursor:number|null;query:string;scroll:number;focus:{post:string;author:string;label:string};error:string;version:number};
+  type Frame={screen:Screen;items:Capture[];cursor:number|null;query:string;search:string;scroll:number;focus:{post:string;author:string;label:string};error:string;version:number};
   type Submission={url:string;source_id:string;request_id:string};
   let screen:Screen={section:'posts',author:null,mode:'feed',detail:null};
   let history:Frame[]=[],items:Capture[]=[],cursor:number|null=0,query='',error='',loading=false,detailLoading=false;
   let main:HTMLElement,drawer=false,alive=true,epoch=0,dataVersion=0;
+  let search='',searchComposing=false,searchPending=false;
   let preferences:Preferences|null=null,preferenceLoading=true,preferenceError='';
   let activeJobs=new Set<string>(),notifiedJobs=new Set<string>(),jobRevision=0,jobPolling=false,statusUnavailable=false;
   let submission:Submission|null=null,submitting=false,submitError='';
@@ -26,7 +27,6 @@
   const receiptKey=persistentStorageKey('twitter-pending-request');
   const activeKey=persistentStorageKey('twitter-active-downloads');
   $: url=postUrl(query);
-  $: search=url?'':query.trim();
   $: ready=!!preferences?.available&&!!preferences.dependencies.ready&&!preferenceLoading;
   $: setupError=preferenceError||(!preferences?.available?'Choose a save folder in Twitter settings.':!preferences.dependencies.ready?'Missing capture dependencies: '+preferences.dependencies.missing.join(', '):'');
   $: title=screen.mode==='detail'?'Post':screen.author?screen.author.author.name:screen.section==='authors'?'Authors':'Saved posts';
@@ -39,17 +39,17 @@
   function remember(){
     const active=document.activeElement as HTMLElement|null;
     const focus={post:active?.closest<HTMLElement>('[data-twitter-post]')?.dataset.twitterPost??'',author:active?.closest<HTMLElement>('[data-twitter-author]')?.dataset.twitterAuthor??'',label:active?.getAttribute('aria-label')??''};
-    history=[...history,{screen:{...screen},items,cursor,query,scroll:main?.scrollTop??0,focus,error,version:dataVersion}];
+    history=[...history,{screen:{...screen},items,cursor,query,search,scroll:main?.scrollTop??0,focus,error,version:dataVersion}];
   }
   async function focusMain(serial=epoch){await tick();if(alive&&serial===epoch){main?.focus({preventScroll:true});main.scrollTop=0;}}
   function selectSection(section:'posts'|'authors'){
-    stopReads();history=[];screen={section,author:null,mode:'feed',detail:null};items=[];cursor=0;error='';
+    stopReads();settleSearch();history=[];screen={section,author:null,mode:'feed',detail:null};items=[];cursor=0;error='';
     if(window.matchMedia('(max-width:700px)').matches)moduleSidebarPreferences('twitter').open.set(false);
     void load();void focusMain();
   }
   async function back(){
     const previous=history.at(-1);if(!previous)return;
-    stopReads();const serial=epoch;history=history.slice(0,-1);screen=previous.screen;items=previous.items;cursor=previous.cursor;if(!submission)query=previous.query;error=previous.error;
+    stopReads();const serial=epoch;history=history.slice(0,-1);screen=previous.screen;items=previous.items;cursor=previous.cursor;if(!submission)query=previous.query;search=previous.search;searchPending=false;error=previous.error;
     if(previous.version!==dataVersion){
       items=[];
       if(screen.mode==='feed'){
@@ -65,16 +65,27 @@
     const anchor=previous.focus.author?[...main.querySelectorAll<HTMLElement>('[data-twitter-author]')].find(node=>node.dataset.twitterAuthor===previous.focus.author):post?[...post.querySelectorAll<HTMLElement>('button')].find(node=>node.getAttribute('aria-label')===previous.focus.label):null;
     (anchor??main).focus({preventScroll:true});
   }
-  function input(event:Event){
-    query=(event.currentTarget as HTMLInputElement).value;
-    clearTimeout(debounce);
-    // Entering URL mode keeps the saved feed in place; it never requests X.
-    if(postUrl(query)){stopReads();return;}
-    stopReads();history=[];screen={section:screen.section,author:null,mode:'feed',detail:null};loading=true;
-    debounce=setTimeout(()=>{void load();},180);
+  function settleSearch(){
+    if(!searchComposing&&!postUrl(query))search=query.trim();
+    searchPending=false;
   }
+  function input(event?:Event){
+    if(event)query=(event.currentTarget as HTMLInputElement).value;
+    stopReads();
+    // A URL keeps the saved feed in place and never requests X while typing.
+    if(postUrl(query)){searchPending=false;return;}
+    searchPending=true;loading=true;
+    if(searchComposing)return;
+    debounce=setTimeout(()=>{
+      if(!alive||searchComposing)return;
+      settleSearch();if(!screen.author)history=[];
+      screen={...screen,mode:'feed',detail:null};void load();
+    },180);
+  }
+  function beginSearchComposition(){searchComposing=true;input();}
+  function endSearchComposition(){searchComposing=false;input();}
   async function load(more=false,refresh=false){
-    if(screen.mode!=='feed')return;
+    if(screen.mode!=='feed'||searchComposing||searchPending)return;
     if(search.length>256){loading=false;error='Search accepts up to 256 characters.';return;}
     archiveRequest?.abort();const request=new AbortController();archiveRequest=request;
     const serial=epoch,filter=search,author=screen.author?.author_key??'';
@@ -103,7 +114,7 @@
     catch(e){if(alive&&!request.signal.aborted&&serial===epoch)error=e instanceof Error?e.message:'Saved post is unavailable.';}
     finally{if(detailRequest===request)detailLoading=false;}
   }
-  function openAuthor(item:Capture,event:MouseEvent){remember();stopReads();screen={section:'posts',mode:'feed',author:item,detail:null};items=[];cursor=0;error='';void load();void focusMain();}
+  function openAuthor(item:Capture,event:MouseEvent){remember();stopReads();settleSearch();screen={section:'posts',mode:'feed',author:item,detail:null};items=[];cursor=0;error='';void load();void focusMain();}
   function rememberActive(){
     try{if(activeJobs.size)sessionStorage.setItem(activeKey,JSON.stringify([...activeJobs]));else sessionStorage.removeItem(activeKey);}catch{/* Current-page tracking remains available. */}
   }
@@ -111,14 +122,14 @@
     const id='twitter-job-'+job.id;
     if(['queued','running'].includes(job.status)){
       activeJobs.add(job.id);
-      if(!notifiedJobs.has(job.id)){notify('Saving post '+job.post_id+'…',{id,progress:job.progress});notifiedJobs.add(job.id);}
-      else updateNotification(id,{message:'Saving post '+job.post_id+'…',tone:'info',progress:job.progress});
+      if(!notifiedJobs.has(job.id)){notify('Saving post '+job.post_id+'…',{id,progress:job.progress,destination:'downloads'});notifiedJobs.add(job.id);}
+      else updateNotification(id,{message:'Saving post '+job.post_id+'…',tone:'info',progress:job.progress,destination:'downloads'});
     }else{
       activeJobs.delete(job.id);notifiedJobs.delete(job.id);
       if(job.status==='complete'){
-        notify('Post saved: '+job.post_id+'.',{id,tone:'success'});dataVersion++;
+        notify('Post saved: '+job.post_id+'.',{id,tone:'success',destination:'downloads'});dataVersion++;
         if(screen.mode==='feed'&&screen.section==='posts'&&!screen.author)void load(false,true);
-      }else notify('Could not save post '+job.post_id+'. '+(job.error||'Download '+job.status+'.'),{id,tone:'error'});
+      }else notify('Could not save post '+job.post_id+'. '+(job.error||'Download '+job.status+'.'),{id,tone:'error',destination:'downloads'});
     }
     rememberActive();
   }
@@ -145,10 +156,10 @@
         if(result.status==='fulfilled')observe(result.value);
         else if(result.reason instanceof ApiError&&result.reason.status===404){
           activeJobs.delete(ids[index]);rememberActive();
-          notify('The saved download status is unavailable.',{id:'twitter-job-'+ids[index],tone:'error'});
+          notify('The saved download status is unavailable.',{id:'twitter-job-'+ids[index],tone:'error',destination:'downloads'});
         }else unavailable=true;
       }
-      if(unavailable&&!statusUnavailable)notify('Could not check download status. Retrying…',{id:'twitter-status-read',tone:'error'});
+      if(unavailable&&!statusUnavailable)notify('Could not check download status. Retrying…',{id:'twitter-status-read',tone:'error',destination:'downloads'});
       statusUnavailable=unavailable;
     }finally{if(jobRequest===request)jobPolling=false;}
   }
@@ -166,7 +177,7 @@
     rememberSubmission(body);submitting=true;submitError='';
     try{
       const job=await twitterApi.download(body.url,body.source_id,body.request_id);acceptJob(job);rememberSubmission(null);
-      if(alive)query='';
+      if(alive){query='';search='';searchPending=false;}
     }catch(e){
       if(e instanceof ApiError&&[400,409,422].includes(e.status))rememberSubmission(null);
       if(alive)submitError=(e instanceof Error?e.message:'Could not confirm the request.')+(submission?' Retry request uses the same saved token.':'');
@@ -192,7 +203,7 @@
 
 <div class="twitter-surface">
   <header><button class="menu" aria-label="Open Keivotos menu" on:click={()=>drawer=true}>☰</button><span class="module-title">Twitter</span>
-    <div class="search-controls"><input aria-label="Search saved posts or paste a Twitter URL" placeholder="Search or paste a post link…" maxlength="2048" bind:value={query} disabled={submitting||!!submission} on:input={input} on:keydown={searchKey}/><div class="download-reveal" class:visible={!!url} inert={!url}><button class="download" aria-hidden={!url} tabindex={url?0:-1} disabled={submitting||!url||!submission&&!ready} on:click={start}>{submitting?'Starting…':submission?'Retry request':'Download'}</button></div></div>
+    <div class="search-controls"><input aria-label="Search saved posts or paste a Twitter URL" placeholder="Search or paste a post link…" maxlength="2048" bind:value={query} disabled={submitting||!!submission} on:input={input} on:compositionstart={beginSearchComposition} on:compositionend={endSearchComposition} on:keydown={searchKey}/><div class="download-reveal" class:visible={!!url} inert={!url}><button class="download" aria-hidden={!url} tabindex={url?0:-1} disabled={submitting||!url||!submission&&!ready} on:click={start}>{submitting?'Starting…':submission?'Retry request':'Download'}</button></div></div>
   </header>
   {#if submitError}<p class="submit-error" role="alert">{submitError}</p>{/if}
   {#if url&&!submission&&!preferenceLoading&&setupError}<p class="submit-error" role="status">{setupError} <button on:click={twitterSettings}>Twitter settings</button></p>{/if}

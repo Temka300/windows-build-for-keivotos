@@ -1,7 +1,7 @@
 """Suite-owned product identity exposed by the application."""
 
 SUITE_NAME = "Keivotos"
-VERSION = "1.2.3"
+VERSION = "1.2.5"
 # Set from an explicit, timezone-aware release record when an artifact is prepared.
 # An empty value means this version has no recorded release date yet.
 RELEASED_AT = ""

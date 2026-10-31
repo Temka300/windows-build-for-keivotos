@@ -53,7 +53,46 @@ async def add_server_timing_header(request: Request, call_next):
 
 @app.exception_handler(HTTPException)
 async def log_http_error(request: Request, exception):
-    logging.getLogger("keivotos.requests").warning(
-        "%s %s: HTTP %s: %s", request.method, request.url.path,
-        exception.status_code, exception.detail)
+    level = logging.ERROR if exception.status_code >= 500 else logging.WARNING
+    logging.getLogger("keivotos.requests").log(
+        level, "%s %s: HTTP %s", request.method, request.url.path, exception.status_code,
+        extra={"event_code": "http.request_rejected",
+               "event_details": {"method": request.method, "status_code": exception.status_code}})
     return await http_exception_handler(request, exception)
+
+
+class _DiagnosticRequestContext:
+    """Keep correlation through streamed response sending and Uvicorn access logs."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        from uuid import UUID, uuid4
+        from services.diagnostic_events import diagnostic_context
+        from services.operation_diagnostics import emit
+        supplied = next((value for key, value in scope.get("headers", ())
+                         if key.lower() == b"x-keivotos-operation-id"), b"")
+        try:
+            identity = str(UUID(supplied.decode("ascii"))) if len(supplied) <= 36 else uuid4().hex
+        except (ValueError, UnicodeError):
+            identity = uuid4().hex
+        with diagnostic_context(operation_owner="suite", operation_id=identity):
+            async def correlated_send(message):
+                if message["type"] == "http.response.start":
+                    message = dict(message)
+                    headers = [(key, value) for key, value in message.get("headers", ())
+                               if key.lower() != b"x-keivotos-operation-id"]
+                    headers.append((b"x-keivotos-operation-id", identity.encode("ascii")))
+                    message["headers"] = headers
+                await send(message)
+            try:
+                await self.app(scope, receive, correlated_send)
+            except Exception as error:
+                emit("requests", "http.request_failed", "HTTP request failed",
+                     level=logging.ERROR, details={"method": scope.get("method", "")}, exception=error)
+                raise
+
+
+app.add_middleware(_DiagnosticRequestContext)

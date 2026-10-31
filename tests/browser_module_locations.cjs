@@ -9,6 +9,8 @@ const config = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
   const page = await context.newPage();
   page.setDefaultTimeout(15000);
   const errors = [];
+  const checks = [];
+  const check = text => { checks.push(text); console.log('PASS: '+text); };
   page.on('pageerror', error => errors.push(error.message));
   async function api(url, method = 'GET', body) {
     return page.evaluate(async ({ url, method, body }) => {
@@ -44,30 +46,47 @@ const config = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
     await show(outer.data.source_id, 'Deep/子/same.txt');
     await selected('Deep/子/same.txt');
     assert.equal(await page.getByRole('navigation', { name: 'Current folder' }).getByRole('button', { name: '子' }).count(), 1);
-    console.log('PASS: mounted Files opens a deep Unicode parent and focuses the exact file');
+    check('mounted Files opens a deep Unicode parent and focuses the exact file');
 
     await show(inner.data.source_id, 'same.txt');
     await selected('same.txt');
     assert.equal(await page.getByRole('navigation', { name: 'Current folder' }).getByRole('button', { name: 'Inner' }).count(), 1);
-    console.log('PASS: duplicate name resolves through the requested nested source');
+    check('duplicate name resolves through the requested nested source');
 
     await show(outer.data.source_id, 'Deep/子');
     await page.getByRole('navigation', { name: 'Current folder' }).getByRole('button', { name: '子' }).waitFor();
     assert.equal(await page.getByRole('navigation', { name: 'Current folder' }).getByRole('button', { name: '子' }).evaluate(node => node === document.activeElement), true);
-    console.log('PASS: folder destination opens itself and focuses its breadcrumb');
+    check('folder destination opens itself and focuses its breadcrumb');
 
     await show(outer.data.source_id, 'missing.txt');
     await page.getByText('This item is no longer available in its Files folder.').waitFor();
     assert.equal(await page.getByRole('navigation', { name: 'Current folder' }).getByRole('button', { name: '子' }).count(), 1);
-    console.log('PASS: missing target is rejected without a fallback jump');
+    check('missing target is rejected without a fallback jump');
 
     assert.equal((await api('/api/suite/modules/video/enable', 'POST')).status, 200);
     await page.reload();
     await page.getByRole('button', { name: 'Open Keivotos menu' }).click();
     await page.locator('.app-drawer').getByRole('button', { name: 'Video', exact: true }).click();
+    const localVideoListing=route=>route.fulfill({json:{items:[{source_id:inner.data.source_id,path:'same.txt',name:'Location-only fixture',ext:'txt',size:5,mtime:1,kind:'video',episode_count:1,cover:{source_id:inner.data.source_id,path:'same.txt',name:'same.txt',ext:'txt',size:5,mtime:1}}],total:1}});
+    await page.route('**/api/video/catalog?*',localVideoListing);
+    await page.reload();await page.getByRole('button',{name:'Open Keivotos menu'}).click();
+    await page.locator('.app-drawer').getByRole('button',{name:'Video',exact:true}).click();
+    const locationTile=page.locator('.video-tile');await locationTile.waitFor();await locationTile.focus();await page.keyboard.press('Shift+F10');
+    const locationMenu=page.getByRole('menu');
+    await page.waitForFunction(()=>document.querySelector('[role="menuitem"]')===document.activeElement);
+    assert.deepEqual(await locationMenu.getByRole('menuitem').allTextContents(),['Show in Files','Open in Explorer','Add to categories']);
+    await locationMenu.focus();await page.keyboard.press('ArrowUp');assert(await locationMenu.getByRole('menuitem',{name:'Add to categories'}).evaluate(n=>n===document.activeElement));
+    await page.keyboard.press('End');assert(await locationMenu.getByRole('menuitem',{name:'Add to categories'}).evaluate(n=>n===document.activeElement));
+    await page.keyboard.press('ArrowDown');assert(await locationMenu.getByRole('menuitem',{name:'Show in Files'}).evaluate(n=>n===document.activeElement));
+    await page.keyboard.press('ArrowUp');assert(await locationMenu.getByRole('menuitem',{name:'Add to categories'}).evaluate(n=>n===document.activeElement));
+    await page.keyboard.press('Home');await page.keyboard.press('Escape');await locationMenu.waitFor({state:'detached'});
+    assert(await locationTile.evaluate(n=>n===document.activeElement));
+    await locationTile.click({button:'right'});await page.getByRole('menuitem',{name:'Show in Files'}).click();await selected('same.txt');
+    await page.unroute('**/api/video/catalog?*',localVideoListing);
+    check('existing owner keeps its guarded location actions and Categories action, wraps arrows/Home/End and restores focus');
     await show(inner.data.source_id, 'same.txt');
     await selected('same.txt');
-    console.log('PASS: unmounted Files consumes a one-use request after sources load');
+    check('unmounted Files consumes a one-use request after sources load');
 
     const hide = await api('/api/suite/folders/apply', 'POST', { folders: [{
       source_id: inner.data.source_id, path: config.media + '/Nested',
@@ -79,10 +98,11 @@ const config = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
     await show('no-such-source', 'same.txt');
     await page.getByText('This item’s folder is no longer visible in Files.').waitFor();
     assert.equal(await page.getByRole('navigation', { name: 'Current folder' }).getByRole('button', { name: 'Inner' }).count(), 1);
-    console.log('PASS: hidden or removed source is rejected without selecting another source');
+    check('hidden or removed source is rejected without selecting another source');
 
     assert.deepEqual(errors, []);
   } finally {
+    fs.writeFileSync(require('node:path').join(config.output,'report.json'),JSON.stringify({checks,errors},null,2));
     await browser.close();
   }
 })().catch(error => { console.error(error); process.exitCode = 1; });

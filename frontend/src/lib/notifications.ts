@@ -4,7 +4,7 @@ import { persistentStorageKey } from './product';
 
 export type NotificationPosition = 'bottom-right' | 'bottom-left' | 'top-right' | 'top-left';
 export type NotificationTone = 'info' | 'success' | 'error';
-export interface ActionNotification { id: string; message: string; tone: NotificationTone; progress?: number; }
+export interface ActionNotification { id: string; message: string; tone: NotificationTone; progress?: number; destination?: 'downloads'; pending?: boolean; }
 export const notificationPosition = persistedWritable<NotificationPosition>(persistentStorageKey('notification-position'), 'bottom-right',
   value => ['bottom-right', 'bottom-left', 'top-right', 'top-left'].includes(value as string) ? value as NotificationPosition : 'bottom-right');
 
@@ -17,7 +17,7 @@ function progress(value?: number) { return value !== undefined && Number.isFinit
 function schedule(id: string) {
   const clock = clocks.get(id); if (!clock) return;
   clearTimeout(clock.timer);
-  if (clock.holds.size) return;
+  if (clock.holds.size || get(queue).find(item => item.id === id)?.pending) return;
   clock.started = Date.now();
   clock.timer = setTimeout(() => dismissNotification(id), clock.remaining);
 }
@@ -25,9 +25,9 @@ export function dismissNotification(id: string) {
   clearTimeout(clocks.get(id)?.timer); clocks.delete(id);
   queue.update(items => items.filter(item => item.id !== id));
 }
-export function notify(message: string, options: { id?: string; tone?: NotificationTone; progress?: number } = {}) {
+export function notify(message: string, options: { id?: string; tone?: NotificationTone; progress?: number; destination?: 'downloads'; pending?: boolean } = {}) {
   const id = options.id ?? 'notice-' + ++sequence;
-  const item = { id, message, tone: options.tone ?? 'info', progress: progress(options.progress) };
+  const item = { id, message, pending: options.pending, tone: options.tone ?? 'info', progress: progress(options.progress), destination: options.destination === 'downloads' ? 'downloads' as const : undefined };
   if (get(queue).some(existing => existing.id === id)) {
     queue.update(items => items.map(existing => existing.id === id ? item : existing));
     const clock = clocks.get(id)!; clock.remaining = duration; schedule(id);
@@ -41,7 +41,8 @@ export function notify(message: string, options: { id?: string; tone?: Notificat
 // Progress updates preserve the original expiry and never revive a dismissed notice.
 export function updateNotification(id: string, values: Omit<ActionNotification, 'id'>) {
   if (!clocks.has(id)) return;
-  queue.update(items => items.map(item => item.id === id ? { id, ...values, progress: progress(values.progress) } : item));
+  if (values.pending) { const clock = clocks.get(id)!; clearTimeout(clock.timer); clock.timer = undefined; }
+  queue.update(items => items.map(item => item.id === id ? { id, ...values, progress: progress(values.progress), destination: (values.destination ?? item.destination) === 'downloads' ? 'downloads' as const : undefined } : item));
 }
 export function pauseNotification(id: string, reason: 'pointer' | 'focus') {
   const clock = clocks.get(id); if (!clock || clock.holds.has(reason)) return;

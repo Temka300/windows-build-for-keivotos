@@ -13,8 +13,16 @@ const report = { checks: [], timings: {}, errors: [], requests: [] };
   await context.tracing.start({ screenshots: true, snapshots: true });
   const page = await context.newPage();
   page.setDefaultTimeout(10000);
-  page.on('pageerror', e => report.errors.push(e.message));
-  page.on('console', m => { if (m.type() === 'error') report.errors.push(m.text()); });
+  report.errorDetails = [];
+  report.failedRequests = [];
+  page.on('requestfailed', r => report.failedRequests.push({url:r.url(),failure:r.failure()}));
+  page.on('pageerror', e => { report.errors.push(e.message); report.errorDetails.push({stack:e.stack}); });
+  page.on('console', m => {
+    if (m.type() === 'error') {
+      report.errors.push(m.text());
+      report.errorDetails.push({message:m.text(),location:m.location()});
+    }
+  });
   page.on('response', r => { if (r.status() >= 400) report.errors.push(`${r.status()} ${r.url()}`); });
   await page.route('**/*', route => {
     const url = new URL(route.request().url());

@@ -1129,7 +1129,9 @@
     },
     {
       "name": "setDanbooruHost",
-      "args": ["betabooru"],
+      "args": [
+        "betabooru"
+      ],
       "request": {
         "url": "/api/danbooru/host",
         "method": "PUT",
@@ -1229,7 +1231,7 @@
         "headers": {
           "Content-Type": "application/json"
         },
-        "body": "{\"phase\":\"metadata\",\"folder\":\"a /?#한\",\"limit\":12,\"confirm_network\":true}",
+        "body": "{\"phase\":\"metadata\",\"folder\":\"a /?#한\",\"limit\":12,\"confirm_network\":true,\"fetch_metadata\":false,\"use_saved_credentials\":true}",
         "signal": false
       }
     },
@@ -1253,30 +1255,6 @@
         "url": "http://fixture.invalid/api/backups",
         "method": "GET",
         "headers": null,
-        "body": null,
-        "signal": false
-      }
-    },
-    {
-      "name": "getLocalRecovery",
-      "args": [],
-      "request": {
-        "url": "http://fixture.invalid/api/local-recovery",
-        "method": "GET",
-        "headers": null,
-        "body": null,
-        "signal": false
-      }
-    },
-    {
-      "name": "createLocalRecoveryCheckpoint",
-      "args": [],
-      "request": {
-        "url": "/api/local-recovery/checkpoint",
-        "method": "POST",
-        "headers": {
-          "Content-Type": "application/json"
-        },
         "body": null,
         "signal": false
       }
@@ -1446,7 +1424,7 @@
         "headers": {
           "Content-Type": "application/json"
         },
-        "body": "{\"phase\":\"discover\",\"folder\":null,\"limit\":null,\"confirm_network\":false}",
+        "body": "{\"phase\":\"discover\",\"folder\":null,\"limit\":null,\"confirm_network\":false,\"fetch_metadata\":false,\"use_saved_credentials\":true}",
         "signal": false
       }
     },
@@ -1535,6 +1513,45 @@
           "Content-Type": "application/json"
         },
         "body": "{\"name\":\"name\",\"description\":\"\"}",
+        "signal": false
+      }
+    },
+    {
+      "name": "runImport",
+      "args": [
+        "update",
+        "",
+        0,
+        true,
+        true
+      ],
+      "request": {
+        "url": "/api/import-pipeline/run",
+        "method": "POST",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"phase\":\"update\",\"folder\":null,\"limit\":null,\"confirm_network\":true,\"fetch_metadata\":true,\"use_saved_credentials\":true}",
+        "signal": false
+      }
+    },
+    {
+      "name": "runImport",
+      "args": [
+        "retry",
+        "a /?#한",
+        12,
+        true,
+        true,
+        false
+      ],
+      "request": {
+        "url": "/api/import-pipeline/run",
+        "method": "POST",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": "{\"phase\":\"retry\",\"folder\":\"a /?#한\",\"limit\":12,\"confirm_network\":true,\"fetch_metadata\":true,\"use_saved_credentials\":false}",
         "signal": false
       }
     }

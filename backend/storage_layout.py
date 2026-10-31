@@ -225,3 +225,46 @@ def migrate_existing_sidecars(
                 except (OSError, UnboundLocalError):
                     pass
     return {"copied": copied, "skipped": skipped, "failed": failed}
+
+
+def portable_relative(value: str) -> str:
+    """Cross-platform metadata syntax; actual authority still comes from Files."""
+    import re
+    from pathlib import PurePosixPath
+    if (not isinstance(value,str) or not value or len(value)>4096 or
+            any(ord(char)<32 or ord(char)==127 or char in '<>\"|?*' for char in value) or '\\' in value or ':' in value or value.startswith('/')):
+        raise ValueError('Invalid portable relative path')
+    parts=value.split('/')
+    if any(part in ('','.', '..') or part.endswith((' ','.')) or
+           re.fullmatch(r'(?i)(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?',part)
+           for part in parts):
+        raise ValueError('Invalid portable path component')
+    return PurePosixPath(*parts).as_posix()
+
+
+def portable_path(root: Path, relative: str, forbidden=(), *, must_exist=True) -> Path:
+    """Reuse Files containment and reject linked metadata/asset components."""
+    from files_base import serving
+    relative=portable_relative(relative)
+    root=Path(root).absolute()
+    if root.resolve()!=root:
+        raise serving.ServeDenied(403,'Portable root contains a symbolic link')
+    result=serving.resolve_within_source(root,relative,list(forbidden),must_exist=must_exist)
+    current=root
+    for part in relative.split('/'):
+        if current.is_dir() and any(p.name!=part and p.name.casefold()==part.casefold() for p in current.iterdir()):
+            raise serving.ServeDenied(403,'Portable path has a conflicting case alias')
+        current=current/part
+        if current.is_symlink():
+            raise serving.ServeDenied(403,'Portable path contains a symbolic link')
+    return result
+
+
+def preserved_item_path(home: Path, library_id: str, item_id: str) -> Path:
+    """Only portable opaque IDs select create-only per-item preservation folders."""
+    import re
+    for value in (library_id,item_id):
+        if not isinstance(value,str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}',value):
+            raise ValueError('Invalid preservation identity')
+        portable_relative(value)
+    return portable_path(Path(home),'preserved/'+library_id+'/'+item_id,(),must_exist=False)

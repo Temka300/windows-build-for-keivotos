@@ -2,6 +2,7 @@
 from io import BytesIO
 from pathlib import Path
 import zipfile
+import json
 from PIL import Image, ImageDraw, ImageFont
 
 
@@ -54,7 +55,8 @@ def seed_manga(media):
                 (folder/'00-cover.png').write_bytes(cover(title,bg,accent))
                 for n in range(1,13):(folder/f'{n}.png').write_bytes(page(n))
             else:
-                with zipfile.ZipFile(series/f'Chapter {chapter}.cbz','w',compression=zipfile.ZIP_DEFLATED) as z:
+                suffix='zip' if title=='After The Rain' and chapter==2 else 'cbz'
+                with zipfile.ZipFile(series/f'Chapter {chapter}.{suffix}','w',compression=zipfile.ZIP_DEFLATED) as z:
                     z.writestr('00-cover.png',cover(title,bg,accent))
                     for n in [1,2,10]:z.writestr(f'{n}.png',page(n))
     # Reader compatibility cases stay inside an existing final chapter so the
@@ -65,3 +67,12 @@ def seed_manga(media):
         converted=BytesIO();image.save(converted,'BMP');z.writestr('21-fallback.bmp',converted.getvalue())
         animated=BytesIO();image.save(animated,'GIF',save_all=True,append_images=[Image.new('RGB',(120,60),'red')],duration=100,loop=0)
         z.writestr('22-animated.gif',animated.getvalue())
+    # A long chapter list exercises dialog containment and progress pagination
+    # while preserving the eight-series fixture and existing ordinary chapters.
+    raw=page(1)
+    for n in range(11,142):
+        chapter=media/'Blue Hour'/f'Chapter {n}';chapter.mkdir()
+        (chapter/'1.png').write_bytes(raw)
+
+    (media/'Blue Hour/ComicInfo.xml').write_text('<ComicInfo><Summary>고요한 동네 산책 이야기</Summary><Tags>동네산책, Local</Tags><Series>Unsupported replacement title</Series><Future>preserved</Future></ComicInfo>',encoding='utf-8')
+    (media/'Paper Moon/details.json').write_text(json.dumps({'description':'긴 한국어 설명과 한 줄씩 이어지는 이야기. <img src="missing" onerror="alert(1)">\n'*60,'genre':['Local','달빛','일상','친구','한국어 공부','A very long local tag name']+[f'태그 {number}' for number in range(18)]},ensure_ascii=False),encoding='utf-8')

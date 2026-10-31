@@ -303,8 +303,13 @@ def clear_credentials() -> dict[str, Any]:
         return _status(*_effective(saved), saved)
 
 
-def credential_environment() -> dict[str, str]:
+def credential_environment(*, use_saved_credentials: bool = True) -> dict[str, str]:
     environment = dict(os.environ)
+    if not use_saved_credentials:
+        # Public reads must not open the vault or inherit an environment override.
+        environment.pop("DANBOORU_USERNAME", None)
+        environment.pop("DANBOORU_API_KEY", None)
+        return environment
     username, api_key, _ = effective_credentials()
     if username:
         environment["DANBOORU_USERNAME"] = username

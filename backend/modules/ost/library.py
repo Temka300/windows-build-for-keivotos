@@ -6,12 +6,25 @@ from pathlib import Path, PurePosixPath
 import re
 
 from files_base import index, serving, sources
+from services import audio_metadata
 
 # Consume Files' closed audio MIME allowlist, rather than inventing codec support.
 AUDIO_EXTENSIONS = tuple(serving._INLINE_AUDIO)
 COVER_NAMES = ('cover', 'folder', 'front')
 COVER_EXTENSIONS = ('jpg', 'jpeg', 'png', 'webp')
 COVER_FILES = tuple(f'{name}.{ext}' for name in COVER_NAMES for ext in COVER_EXTENSIONS)
+
+
+def file_metadata(context):
+    """Contribute local artwork only; Files already owns read-only audio tags."""
+    if not context.path.is_file() or context.path.suffix.lower().lstrip('.') not in AUDIO_EXTENSIONS:
+        return None
+    parent = str(PurePosixPath(context.relative_path).parent)
+    with index.open_index(context.index_path) as connection:
+        covers = named_covers(connection, context.source, '' if parent == '.' else parent,
+                              forbidden_roots(context.source, context.registered, context.suite_home))
+    root = Path(context.source.path).resolve()
+    return {'cover_paths': [context.relative_path, *(path.relative_to(root).as_posix() for path in covers)]}
 
 
 def _natural(value: str):
@@ -27,7 +40,7 @@ def forbidden_roots(source, all_sources, suite_home):
 def directory_path(source, parent, forbidden):
     target = serving.resolve_within_source(source.path, parent, forbidden)
     if not target.is_dir():
-        raise serving.ServeDenied(404, "OST folder is unavailable")
+        raise serving.ServeDenied(404, "Music folder is unavailable")
     return target
 
 
@@ -92,7 +105,7 @@ def cover_file(db, source, all_sources, suite_home, path, size):
     target = serving.resolve_within_source(source.path, path, forbidden)
     is_dir = target.is_dir()
     if not is_dir and (not target.is_file() or target.suffix.lower().lstrip('.') not in AUDIO_EXTENSIONS):
-        raise serving.ServeDenied(404, 'OST cover is unavailable')
+        raise serving.ServeDenied(404, 'Music cover is unavailable')
     relative = target.relative_to(Path(source.path).resolve()).as_posix()
     parent = relative if is_dir else str(PurePosixPath(relative).parent)
     parent = '' if parent == '.' else parent
@@ -105,7 +118,7 @@ def cover_file(db, source, all_sources, suite_home, path, size):
         thumb = ensure_thumbnail(str(candidate), size, key)
         if thumb is not None and thumb.is_file():
             return thumb
-    raise serving.ServeDenied(404, 'OST cover is unavailable')
+    raise serving.ServeDenied(404, 'Music cover is unavailable')
 
 
 def directory(db, source, all_sources, suite_home, parent, offset, limit):
@@ -144,6 +157,76 @@ def directory(db, source, all_sources, suite_home, parent, offset, limit):
                   'size': row['size'], 'mtime': row['mtime'],
                   'available': available(source, row['relative_path'], bool(row['is_dir']), forbidden),
                   'cover_version': cover_version(connection, source, row['relative_path'],
-                                                 bool(row['is_dir']), forbidden, folders)}
+                                                 bool(row['is_dir']), forbidden, folders),
+                  'audio_metadata': None if row['is_dir'] else audio_metadata.cached(
+                      connection, source, row['relative_path'], forbidden)}
                  for row in rows]
     return {'source_id': source.source_id, 'parent': relative, 'items': items, 'total': total}
+
+
+def track_item(connection, source, row, forbidden, folders):
+    from modules.ost import albums
+    path = row['relative_path']
+    return {'source_id': source.source_id, 'source_name': source.display_name,
+            'path': path, 'parent': row['parent'], 'name': row['name'], 'ext': row['ext'],
+            'is_dir': False, 'size': row['size'], 'mtime': row['mtime'],
+            'available': available(source, path, False, forbidden),
+            'cover_version': cover_version(connection, source, path, False, forbidden, folders),
+            'audio_metadata': audio_metadata.cached(connection, source, path, forbidden),
+            'music': albums.facts(connection, source, path, forbidden)}
+
+
+def tracks(db, all_sources, suite_home, offset, limit, query=''):
+    """One paginated audio collection; the Files index owns recursive facts."""
+    owners = {source.source_id: source for source in all_sources
+              if source.role == 'ost' and source.visible}
+    if not owners:
+        return {'items': [], 'total': 0}
+    forbidden = {key: forbidden_roots(source, all_sources, suite_home)
+                 for key, source in owners.items()}
+    excluded = {
+        key: [os.path.normcase(Path(os.path.relpath(path, source.path)).as_posix())
+              for path in forbidden[key]
+              if sources.is_strict_descendant_path(path, source.path)]
+        for key, source in owners.items()
+    }
+
+    def owned(source_id, path):
+        if source_id not in excluded:
+            return False
+        normalized = os.path.normcase(path)
+        return not any(normalized == child or normalized.startswith(child + os.path.normcase('/'))
+                       for child in excluded[source_id])
+
+    def compare(left, right):
+        a, b = _natural(left), _natural(right)
+        return (a > b) - (a < b)
+
+    owner_marks = ','.join('?' for _ in owners)
+    audio_marks = ','.join('?' for _ in AUDIO_EXTENSIONS)
+    where = (f'source_id IN ({owner_marks}) AND available=1 AND is_dir=0 '
+             f'AND ext IN ({audio_marks}) AND ost_track_owned(source_id,relative_path)')
+    parameters = [*owners, *AUDIO_EXTENSIONS]
+    with index.open_index(db) as connection:
+        from modules.ost import albums
+        albums.synchronize(connection, owners.values())
+        connection.create_collation('ost_natural', compare)
+        connection.create_function('ost_track_owned', 2, owned)
+        connection.create_function('ost_source_name', 1, lambda key: owners[key].display_name)
+        if query:
+            where += ' AND EXISTS (SELECT 1 FROM ost_catalog c WHERE c.source_id=files_index.source_id AND c.path=files_index.relative_path AND instr(c.search_text,?)>0)'
+            parameters.append(query.casefold())
+        total = connection.execute(f'SELECT count(*) FROM files_index WHERE {where}', parameters).fetchone()[0]
+        rows = connection.execute(
+            f'SELECT source_id,relative_path,parent,name,ext,size,mtime FROM files_index WHERE {where} '
+            'ORDER BY ost_source_name(source_id) COLLATE ost_natural, '
+            'relative_path COLLATE ost_natural,source_id LIMIT ? OFFSET ?',
+            [*parameters, limit, offset]).fetchall()
+        folders = {key: {} for key in owners}
+        items = []
+        for row in rows:
+            key = row['source_id']
+            source = owners[key]
+            items.append(track_item(connection, source, row, forbidden[key], folders[key]))
+        connection.commit()
+    return {'items': items, 'total': total}

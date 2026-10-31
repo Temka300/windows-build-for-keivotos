@@ -41,8 +41,10 @@ def update_diagnostics(preferences: DiagnosticsPreferences):
 @router.post("/api/diagnostics/open/{target}")
 def open_diagnostics(target: Literal["data", "logs", "runtime", "access", "backups"]):
     # Fixed destinations only: never accept a caller-supplied filesystem path.
+    from runtime_logging import current_log_paths, known_log_path
+    runtime_path,access_path=current_log_paths((config.RUNTIME_LOG_FILE,config.ACCESS_LOG_FILE))
     paths = {"data": config.SUITE_HOME, "logs": config.LOG_DIR,
-             "runtime": config.RUNTIME_LOG_FILE, "access": config.ACCESS_LOG_FILE}
+             "runtime": runtime_path, "access": access_path}
     if target == "backups":
         try:
             path = config.validate_backup_destination(config.get_backup_config()["destination"])
@@ -54,7 +56,7 @@ def open_diagnostics(target: Literal["data", "logs", "runtime", "access", "backu
         path = paths[target]
     if not path.exists():
         raise HTTPException(404, "This location is not available yet")
-    if target in {"runtime", "access"} and not path.resolve().is_relative_to(config.LOG_DIR.resolve()):
+    if target in {"runtime", "access"} and (path.is_symlink() or not path.resolve().is_relative_to(config.LOG_DIR.resolve()) and not known_log_path(path)):
         raise HTTPException(409, "The log file points outside the logs folder")
     try:
         if sys.platform == "win32":

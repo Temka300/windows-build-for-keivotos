@@ -1,4 +1,7 @@
+import {diagnosticFetch} from './diagnostics';
 import { apiError } from './http';
+import { VERSION } from './product';
+import {folderRescanChanges} from './suiteStores';
 // Suite module registry client (V1.1.0). Isolated, like filesApi.ts.
 
 const BASE = '/api/suite';
@@ -71,25 +74,27 @@ export function displayNameForPath(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
-/** Compare two paths the way the backend does: separator- and case-insensitive. */
+/** Compare absolute paths using their native Windows or POSIX case rules. */
 export function normalizedPath(path: string): string {
-  return path.replace(/[\\/]+/g, '/').replace(/\/+$/, '').toLocaleLowerCase();
+  const normalized = path.replace(/[\\/]+/g, '/').replace(/\/+$/, '');
+  const windowsPath = /^(?:[a-z]:[\\/]|[\\/]{2})/i.test(path);
+  return windowsPath ? normalized.toLowerCase() : normalized;
 }
 
 async function getJson<T>(path: string): Promise<T> {
-  const res = await fetch(BASE + path);
+  const res = await diagnosticFetch(BASE + path);
   if (!res.ok) throw await apiError(res);
   return res.json();
 }
 
 async function post<T>(path: string): Promise<T> {
-  const res = await fetch(BASE + path, { method: 'POST' });
+  const res = await diagnosticFetch(BASE + path, { method: 'POST' });
   if (!res.ok) throw await apiError(res);
   return res.json();
 }
 
 async function postJson<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(BASE + path, {
+  const res = await diagnosticFetch(BASE + path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -99,7 +104,7 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
 }
 
 async function putJson<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(BASE + path, {
+  const res = await diagnosticFetch(BASE + path, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -108,7 +113,21 @@ async function putJson<T>(path: string, body: unknown): Promise<T> {
   return res.json();
 }
 
+export interface ReleasePublication {
+  version: string;
+  tag_name: string;
+  published_at: string | null;
+}
+
+let releaseRead: Promise<ReleasePublication | null> | undefined;
+function installedRelease(): Promise<ReleasePublication | null> {
+  return releaseRead ??= getJson<ReleasePublication>('/release').then(value =>
+    value.version === VERSION && value.tag_name === `v${VERSION}` ? value : null,
+  ).catch(() => null);
+}
+
 export const suiteApi = {
+  installedRelease,
   moduleStatus: (id: string) => getJson<ModuleStatus>(`/modules/${encodeURIComponent(id)}/status`),
   retryModule: (id: string) => post<ModuleStatus>(`/modules/${encodeURIComponent(id)}/retry`),
   plannedModules: () => getJson<{id:string; name:string; experimental:boolean}[]>('/modules/planned'),
@@ -119,8 +138,11 @@ export const suiteApi = {
     postJson<FolderBatchResult>('/folders/apply', { folders }),
   previewFolderForget: (sourceId: string) =>
     getJson<FolderForgetPreview>(`/folders/${encodeURIComponent(sourceId)}/forget-preview`),
-  rescanFolder: (sourceId: string) =>
-    post<FolderRescanResult>(`/folders/${encodeURIComponent(sourceId)}/rescan`),
+  rescanFolder: async (sourceId: string) => {
+    const result = await post<FolderRescanResult>(`/folders/${encodeURIComponent(sourceId)}/rescan`);
+    folderRescanChanges.update(value => value + 1);
+    return result;
+  },
   relocateFolder: (sourceId: string, path: string) =>
     putJson<FolderRelocateResult>(`/folders/${encodeURIComponent(sourceId)}/path`, { path }),
 };

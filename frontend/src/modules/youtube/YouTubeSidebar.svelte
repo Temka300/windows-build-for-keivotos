@@ -4,7 +4,7 @@
   const dispatch=createEventDispatcher<{select:'videos'|'playlists'}>();
 </script>
 <nav class="youtube-sidebar" aria-label="YouTube sections">
-  <button class:active={section==='videos'} aria-current={section==='videos'?'page':undefined} on:click={()=>dispatch('select','videos')}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="m10 9 5 3-5 3Z"/></svg>All videos</button>
+  <button class:active={section==='videos'} aria-current={section==='videos'?'page':undefined} on:click={()=>dispatch('select','videos')}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 22v-3a8 8 0 0 1 16 0v3"/></svg>Channels</button>
   <button class:active={section==='playlists'} aria-current={section==='playlists'?'page':undefined} on:click={()=>dispatch('select','playlists')}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M3 6h13M3 11h13M3 16h8m5-3 5 3-5 3Z"/></svg>Playlists</button>
 </nav>
 <style>

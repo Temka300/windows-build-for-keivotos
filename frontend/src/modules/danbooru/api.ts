@@ -58,11 +58,11 @@ removeUserImageTag: (postId: number, name: string, category: string) =>
 openImageLocation: (postId: number) =>
     post<{ status: string; path: string }>(`/images/${postId}/open-location`),
 
-getHomeTags: (params?: { rating?: string; featured_limit?: number; group_limit?: number }) =>
-    get<HomeTags>('/home/tags', params as Record<string, string | number>),
+getHomeTags: (params?: { rating?: string; featured_limit?: number; group_limit?: number }, signal?: AbortSignal) =>
+    get<HomeTags>('/home/tags', params as Record<string, string | number>, signal),
 
-getHomeImageRails: (params?: { rating?: string; per_rail?: number }) =>
-    get<HomeImageRails>('/home/image-rails', params as Record<string, string | number>),
+getHomeImageRails: (params?: { rating?: string; per_rail?: number }, signal?: AbortSignal) =>
+    get<HomeImageRails>('/home/image-rails', params as Record<string, string | number>, signal),
 
 getDailyChallenge: (params?: { rating?: string }) =>
     get<DailyChallenge>('/challenges/daily', params as Record<string, string>),
@@ -79,7 +79,7 @@ getTagWiki: (tagName: string, params?: { refresh?: boolean; category?: string })
 getRandomTag: (params?: { category?: string; min_count?: number }) =>
     get<TagInfo>('/tags/random', params as Record<string, string | number>),
 
-suggestTags: (q: string, category?: string) => get<TagInfo[]>('/tags/suggest', { q, category }),
+suggestTags: (q: string, category?: string, signal?: AbortSignal) => get<TagInfo[]>('/tags/suggest', { q, category }, signal),
 
 getRelatedTags: (tags: string[], limit = 30) =>
     get<Record<string, TagInfo[]>>('/tags/related', { tags: tags.join(','), limit }),
@@ -270,13 +270,14 @@ getImportPipeline: () => get<ImportPipelineStatus>('/import-pipeline'),
 getImportTask: (afterIndex?: number) =>
     get<ToolStatus>('/import-pipeline/task', { after_index: afterIndex }),
 
-runImport: (phase: ImportPhase, folder?: string, limit?: number, confirmNetwork = false, fetchMetadata = false) =>
+runImport: (phase: ImportPhase, folder?: string, limit?: number, confirmNetwork = false, fetchMetadata = false, useSavedCredentials = true) =>
     post<ToolRunResult>('/import-pipeline/run', {
       phase,
       folder: folder || null,
       limit: limit && limit > 0 ? limit : null,
       confirm_network: confirmNetwork,
       fetch_metadata: fetchMetadata,
+      use_saved_credentials: useSavedCredentials,
     }),
 
 cancelImport: () => post<ToolRunResult>('/import-pipeline/cancel'),

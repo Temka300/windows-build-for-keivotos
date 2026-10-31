@@ -1,4 +1,4 @@
-// Captured pre-extraction Settings catalog + cross-owner dialog coordination.
+// Approved Settings catalog + cross-owner dialog coordination.
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -10,7 +10,8 @@ const frontend=path.join(root,'frontend');
 const temporary=await fs.mkdtemp(path.join(os.tmpdir(),'keivotos-settings-contract-'));
 const entry=path.join(frontend,'__settings_contract__.ts');
 const code=`export { settingsContributions } from './src/modules/settings';
-export { createSettingsSession } from './src/lib/settingsSession';`;
+export { createSettingsSession } from './src/lib/settingsSession';
+export { VERSION } from './src/lib/product';`;
 try {
  const result=await build({root:frontend,configFile:false,logLevel:'silent',plugins:[{
   name:'settings-contract',resolveId:id=>id===entry?id:null,
@@ -18,13 +19,13 @@ try {
  }],build:{write:false,minify:false,lib:{entry,formats:['es']}}});
  const chunk=(Array.isArray(result)?result[0]:result).output.find(x=>x.type==='chunk');
  const file=path.join(temporary,'settings.mjs');await fs.writeFile(file,chunk.code);
- const {settingsContributions:owners,createSettingsSession}=await import(pathToFileURL(file).href);
+ const {settingsContributions:owners,createSettingsSession,VERSION}=await import(pathToFileURL(file).href);
  const baseline=JSON.parse(await fs.readFile(path.join(root,'tests/snapshots/settings_catalog.json'),'utf8'));
+ const about=baseline.searchItems.find(item=>item.id==='about');
+ about.description=about.description.replace('<version>',VERSION);
+ about.keywords=about.keywords.map(value=>value==='<version>'?VERSION:value);
  assert.deepEqual(owners.map(x=>x.group),baseline.groups);
  assert.deepEqual(owners.flatMap(x=>x.sections),baseline.sections);
- // The only deliberate copy change removes a hardcoded optional owner from Files.
- baseline.searchItems.find(x=>x.id==='folder-roles').description=
-   baseline.searchItems.find(x=>x.id==='folder-roles').description.replace('Files or Danbooru','Files or a module');
  const sorted=rows=>rows.toSorted((a,b)=>a.id.localeCompare(b.id));
  assert.deepEqual(sorted(owners.flatMap(x=>x.searchItems)),sorted(baseline.searchItems));
  const session=createSettingsSession(async path=>path+'/chosen');

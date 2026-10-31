@@ -20,6 +20,7 @@
   let folders: ToolFolder[] = [];
   let folder = '';
   let fetchMetadata = false;
+  let useSavedCredentials = true;
   let destroyed = false;
   let busy = false;
   let message = '';
@@ -117,7 +118,7 @@
     error = '';
     message = '';
     try {
-      const result = await danbooruApi.runImport(retry ? 'retry' : 'update', folder, metadataLimit || undefined, needsNetwork, needsNetwork);
+      const result = await danbooruApi.runImport(retry ? 'retry' : 'update', folder, metadataLimit || undefined, needsNetwork, needsNetwork, useSavedCredentials);
       if (result.status === 'busy') {
         error = 'Another task is running. Wait for it to finish before updating the library.';
         return;
@@ -192,7 +193,7 @@
         <div class="mt-1 break-all font-mono text-[11px] text-gray-400">{storage?.access_log_file ?? 'Loading…'}</div>
       </div>
       <div class="border-t border-white/5 px-3 py-2 text-[10px] text-gray-600">
-        Dated per launch · {storage?.log_retention_files ?? 30} recent files kept per type
+        Dated per launch · Set log limits in Settings → Advanced
       </div>
     </div>
   </section>
@@ -218,6 +219,12 @@
           <input type="checkbox" class="mt-1 accent-purple-500" bind:checked={fetchMetadata} disabled={busy || importRunning} />
           <span>Fetch missing Danbooru tags<span class="mt-1 block text-xs text-gray-500">Uses the network. Original images stay unchanged; existing complete metadata is kept.</span></span>
         </label>
+        {#if fetchMetadata || pipeline.phases.errors || ['partial', 'error', 'cancelled'].includes(pipeline.task.status)}
+          <label class="flex items-start gap-3 text-xs text-gray-300">
+            <input type="checkbox" aria-label="Use saved credentials" class="mt-0.5 accent-purple-500" bind:checked={useSavedCredentials} disabled={busy || importRunning} />
+            <span>Use saved credentials<span class="mt-1 block text-xs text-gray-500">Turn off to fetch public tags without a username or API key.</span></span>
+          </label>
+        {/if}
         {#if fetchMetadata}
           <label class="flex items-center justify-between gap-3 text-xs text-gray-400"><span>Maximum files to fetch (0 = all unfinished)</span><input aria-label="Maximum files to fetch" class="w-24 rounded-lg border border-[#303040] bg-[#0d0d13] px-2 py-1.5 text-gray-200" type="number" min="0" max="1000000" bind:value={metadataLimit} disabled={busy || importRunning} /></label>
         {/if}

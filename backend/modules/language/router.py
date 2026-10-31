@@ -1,14 +1,17 @@
 """Guarded HTTP operations for local Language Markdown files."""
 from __future__ import annotations
+import logging
+import sqlite3
+from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
 import config
 import lifecycle
 from database import get_user_db
 from files_base import sources
-from modules.language import documents
+from modules.language import documents, index_refresh, study, vocabulary
 from suite_modules import require_enabled
 
 
@@ -20,6 +23,77 @@ def _enabled() -> None:
 
 
 router = APIRouter(prefix="/api/language", dependencies=[Depends(_enabled)])
+logger = logging.getLogger('keivotos.language')
+
+
+def _study_call(operation, *args):
+    try:
+        with get_user_db() as connection:
+            return operation(connection, *args)
+    except (sqlite3.Error, OSError, ValueError) as error:
+        logger.warning('Language practice settings unavailable: %s', error)
+        raise HTTPException(503, 'Practice settings could not be loaded or saved. Retry when user data is available.') from error
+
+
+@router.get('/study/preferences', response_model=study.StudyPreferences)
+def study_preferences(response: Response):
+    response.headers['Cache-Control'] = 'no-store'
+    return _study_call(study.read)
+
+
+@router.put('/study/preferences', response_model=study.StudyPreferences)
+def save_study_preferences(payload: study.StudyPreferences):
+    with lifecycle.module_change_lock:
+        _enabled()
+        return _study_call(study.save, payload)
+
+
+def _vocabulary_call(operation, *args):
+    try:
+        with get_user_db() as connection:
+            return operation(connection, *args)
+    except vocabulary.EntryMissing as error:
+        raise HTTPException(404, str(error)) from error
+    except vocabulary.RequestConflict as error:
+        raise HTTPException(409, str(error)) from error
+    except (sqlite3.Error, OSError, ValueError) as error:
+        # Invalid stored rows are preserved; do not log their authored contents.
+        detail = str(error) if isinstance(error, (sqlite3.Error, OSError)) else 'Invalid stored vocabulary record'
+        logger.warning('Language vocabulary unavailable: %s', detail)
+        raise HTTPException(503, 'Vocabulary is unavailable. Keep your entry and retry when user data is available.') from error
+
+
+@router.get('/vocabulary', response_model=vocabulary.VocabularyPage)
+def list_vocabulary(response: Response, offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=100)):
+    response.headers['Cache-Control'] = 'no-store'
+    return _vocabulary_call(vocabulary.listing, offset, limit)
+
+
+@router.post('/vocabulary', response_model=vocabulary.VocabularyEntry)
+def create_vocabulary(payload: vocabulary.VocabularyCreate):
+    with lifecycle.module_change_lock:
+        _enabled()
+        return _vocabulary_call(vocabulary.create, payload)
+
+
+@router.get('/vocabulary/{entry_id}', response_model=vocabulary.VocabularyVersion)
+def read_vocabulary(entry_id: UUID, response: Response):
+    response.headers['Cache-Control']='no-store'
+    return _vocabulary_call(vocabulary.read, entry_id)
+
+
+@router.put('/vocabulary/{entry_id}', response_model=vocabulary.VocabularyVersion)
+def edit_vocabulary(entry_id: UUID, payload: vocabulary.VocabularyEdit):
+    with lifecycle.module_change_lock:
+        _enabled()
+        return _vocabulary_call(vocabulary.edit, entry_id, payload)
+
+
+@router.post('/vocabulary/{entry_id}/archive', response_model=vocabulary.VocabularyVersion)
+def archive_vocabulary(entry_id: UUID, payload: vocabulary.VocabularyMutation):
+    with lifecycle.module_change_lock:
+        _enabled()
+        return _vocabulary_call(vocabulary.archive, entry_id, payload)
 
 
 def _source(connection, source_id: str) -> sources.Source:
@@ -38,6 +112,11 @@ def _document_call(operation, *args):
 
 class CreateRequest(BaseModel):
     source_id: str = Field(min_length=1, max_length=256)
+
+
+class IndexRefreshRequest(CreateRequest):
+    name: str = Field(min_length=1, max_length=256)
+    previous_names: list[str] = Field(default_factory=list, max_length=64)
 
 
 class RenameRequest(CreateRequest):
@@ -81,7 +160,7 @@ def create_document(payload: CreateRequest):
         with get_user_db() as connection:
             source = _source(connection, payload.source_id)
             result = _document_call(documents.create_document, source, config.SUITE_HOME)
-            documents.refresh_index(source, config.FILES_DB_PATH, result["name"])
+            result["index_refresh"] = index_refresh.attempt(source, config.FILES_DB_PATH, result["name"])
             return result
 
 
@@ -93,7 +172,8 @@ def rename_document(payload: RenameRequest):
             source = _source(connection, payload.source_id)
             result = _document_call(documents.rename_document, source, config.SUITE_HOME,
                                     payload.name, payload.new_name, payload.revision)
-            documents.refresh_index(source, config.FILES_DB_PATH, result["name"], payload.name)
+            result["index_refresh"] = index_refresh.attempt(
+                source, config.FILES_DB_PATH, result["name"], [payload.name])
             return result
 
 
@@ -104,8 +184,21 @@ def save_document(payload: SaveRequest):
         with get_user_db() as connection:
             source = _source(connection, payload.source_id)
             result = _document_call(documents.save_document, source, config.SUITE_HOME,
-                                    config.MODULE_REGISTRY.require("language").home,
+                                    config.ASSETS_DIR / "language",
                                     payload.name, payload.content, payload.revision,
                                     payload.session_id)
-            documents.refresh_index(source, config.FILES_DB_PATH, result["name"])
+            result["index_refresh"] = index_refresh.attempt(source, config.FILES_DB_PATH, result["name"])
             return result
+
+
+@router.post("/document/index")
+def refresh_document_index(payload: IndexRefreshRequest):
+    with lifecycle.module_change_lock:
+        _enabled()
+        with get_user_db() as connection:
+            source = _source(connection, payload.source_id)
+            # Read and validate the current original, without replacing editor text.
+            _document_call(documents.read_document, source, config.SUITE_HOME, payload.name)
+            for name in payload.previous_names:
+                _document_call(documents.valid_name, name)
+            return index_refresh.attempt(source, config.FILES_DB_PATH, payload.name, payload.previous_names)

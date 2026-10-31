@@ -5,7 +5,7 @@
   import { danbooruApi as api, thumbnailUrl } from '../api';
   import { type HomeCoverCandidate, type HomeImageRail, type HomeImageRailItem, type HomeTagInfo, type HomeTags } from '../apiTypes';
   import { persistentStorageKey } from '../../../lib/product';
-  import { activeCollectionId, activeFolder, activeRating, browseTagSelection, homeLayout, selectedImageId, viewMode } from '../stores';
+  import { activeCollectionId, activeFolder, activeRating, browseTagSelection, homeLayout, imageRefreshToken, tagRefreshToken, selectedImageId, viewMode } from '../stores';
 
   type StreamItem = HomeImageRailItem & {
     rail_key: string;
@@ -65,6 +65,10 @@
   let mounted = false;
   let loadedRatingKey: string | null = null;
   let homeRequestSerial = 0;
+  let homeRequest: AbortController | null = null;
+  let loadedRefreshToken = -1;
+  let loadedTagRefreshToken = -1;
+  let spotlightStartTimer: number | null = null;
   let railRequestSerial = 0;
   let railTimer: number | null = null;
   let dailyTimer: number | null = null;
@@ -77,9 +81,14 @@
   });
 
   onDestroy(() => {
-    if (railTimer !== null) window.clearTimeout(railTimer);
-    if (spotlightTimer !== null) window.clearTimeout(spotlightTimer);
+    mounted = false;
+    ++homeRequestSerial;
+    ++railRequestSerial;
+    homeRequest?.abort();
+    homeRequest = null;
+    clearLoadTimers();
     if (dailyTimer !== null) window.clearTimeout(dailyTimer);
+    dailyTimer = null;
   });
 
   function displayTag(name: string) {
@@ -337,100 +346,96 @@
     return persistentStorageKey(`home:${homeCacheVersion}:${kind}:${ratingKey || 'all'}`);
   }
 
-  function loadCachedHome(ratingKey: string) {
-    if (typeof localStorage === 'undefined') return false;
-    let restored = false;
-    const rawTags = localStorage.getItem(homeStorageKey(ratingKey, 'tags'));
-    if (rawTags) {
-      try {
-        const parsed = JSON.parse(rawTags) as HomeTags;
-        if (Array.isArray(parsed.featured) && parsed.groups) {
-          homeTags = parsed;
-          restored = true;
-        }
-      } catch {
-        localStorage.removeItem(homeStorageKey(ratingKey, 'tags'));
-      }
-    }
-
-    const rawRails = localStorage.getItem(homeStorageKey(ratingKey, 'rails'));
-    if (rawRails) {
-      try {
-        const parsed = JSON.parse(rawRails) as { rails: HomeImageRail[] };
-        if (Array.isArray(parsed.rails)) {
-          imageRails = parsed.rails;
-        }
-      } catch {
-        localStorage.removeItem(homeStorageKey(ratingKey, 'rails'));
-      }
-    }
-    return restored;
+  // Browser storage is only a reusable payload after the current response
+  // confirms it. A previous library/profile must never supply visible cards.
+  function confirmedHomeCache<T>(ratingKey: string, kind: 'tags' | 'rails', value: T): T {
+    try {
+      const key = homeStorageKey(ratingKey, kind);
+      const serialized = JSON.stringify(value);
+      const cached = localStorage.getItem(key);
+      if (cached === serialized) return JSON.parse(cached) as T;
+      localStorage.setItem(key, serialized);
+    } catch { /* Storage can be unavailable or full; fresh Home still works. */ }
+    return value;
   }
 
-  function saveCachedHomeTags(ratingKey: string, tags: HomeTags) {
-    if (typeof localStorage === 'undefined') return;
-    localStorage.setItem(homeStorageKey(ratingKey, 'tags'), JSON.stringify(tags));
+  function ownsHome(requestId: number, request: AbortController) {
+    return mounted && requestId === homeRequestSerial && homeRequest === request && !request.signal.aborted;
   }
 
-  function saveCachedImageRails(ratingKey: string, rails: HomeImageRail[]) {
-    if (typeof localStorage === 'undefined') return;
-    localStorage.setItem(homeStorageKey(ratingKey, 'rails'), JSON.stringify({ rails }));
+  function clearLoadTimers() {
+    if (railTimer !== null) window.clearTimeout(railTimer);
+    if (spotlightStartTimer !== null) window.clearTimeout(spotlightStartTimer);
+    if (spotlightTimer !== null) window.clearTimeout(spotlightTimer);
+    railTimer = spotlightStartTimer = spotlightTimer = null;
   }
 
-  function scheduleRails(ratingKey: string, requestId: number) {
+  function scheduleRails(ratingKey: string, requestId: number, request: AbortController) {
     if (railTimer !== null) window.clearTimeout(railTimer);
     railTimer = window.setTimeout(() => {
-      loadImageRails(ratingKey, requestId);
+      railTimer = null;
+      if (ownsHome(requestId, request)) void loadImageRails(ratingKey, requestId, request);
     }, 120);
   }
 
   async function loadHome() {
     const ratingKey = $activeRating ?? '';
     loadedRatingKey = ratingKey;
+    loadedRefreshToken = $imageRefreshToken;
+    loadedTagRefreshToken = $tagRefreshToken;
+    homeRequest?.abort();
+    clearLoadTimers();
+    const request = new AbortController();
+    homeRequest = request;
     const requestId = ++homeRequestSerial;
-    const restored = loadCachedHome(ratingKey);
-    loadingTags = !restored;
+    ++railRequestSerial;
+    homeTags = { featured: [], groups: {} };
+    imageRails = [];
+    loadingTags = true;
     loadingRails = false;
     error = '';
-    if (!restored) imageRails = [];
     try {
       const tags = await api.getHomeTags({
-        rating: $activeRating || undefined,
+        rating: ratingKey || undefined,
         featured_limit: 16,
         group_limit: 10,
-      });
-      if (requestId !== homeRequestSerial) return;
-      homeTags = tags;
-      saveCachedHomeTags(ratingKey, tags);
+      }, request.signal);
+      if (!ownsHome(requestId, request)) return;
+      homeTags = confirmedHomeCache(ratingKey, 'tags', tags);
+      // Rails are confirmed separately. Empty tags must not revive yesterday's
+      // rail-derived neighborhood covers while that request is still pending.
+      imageRails = [];
       loadingTags = false;
-      window.setTimeout(scheduleSpotlightAdvance, 0);
-      scheduleRails(ratingKey, requestId);
-    } catch (e) {
-      console.error('Failed to load home tags:', e);
-      if (requestId === homeRequestSerial) {
-        error = 'Failed to load home';
-        loadingTags = false;
-      }
+      spotlightStartTimer = window.setTimeout(() => {
+        spotlightStartTimer = null;
+        if (ownsHome(requestId, request)) scheduleSpotlightAdvance();
+      }, 0);
+      scheduleRails(ratingKey, requestId, request);
+    } catch (caught) {
+      if (!ownsHome(requestId, request)) return;
+      console.error('Failed to load home tags:', caught);
+      error = 'Failed to load home';
+      loadingTags = false;
     }
   }
 
-  async function loadImageRails(ratingKey: string, homeRequestId: number) {
+  async function loadImageRails(ratingKey: string, homeRequestId: number, request: AbortController) {
     const requestId = ++railRequestSerial;
     loadingRails = true;
     try {
-      const rails = (await api.getHomeImageRails({
+      const result = await api.getHomeImageRails({
         rating: ratingKey || undefined,
         per_rail: 24,
-      })).rails;
-      if (requestId === railRequestSerial && homeRequestId === homeRequestSerial) {
-        imageRails = rails;
-        saveCachedImageRails(ratingKey, rails);
+      }, request.signal);
+      if (requestId === railRequestSerial && ownsHome(homeRequestId, request)) {
+        imageRails = confirmedHomeCache(ratingKey, 'rails', result).rails;
       }
     } catch (railError) {
+      if (requestId !== railRequestSerial || !ownsHome(homeRequestId, request)) return;
       console.error('Failed to load home image rails:', railError);
-      if (requestId === railRequestSerial) imageRails = [];
+      imageRails = [];
     } finally {
-      if (requestId === railRequestSerial) loadingRails = false;
+      if (requestId === railRequestSerial && ownsHome(homeRequestId, request)) loadingRails = false;
     }
   }
 
@@ -569,7 +574,7 @@
     307,
     18,
   );
-  $: if (mounted && loadedRatingKey !== ($activeRating ?? '')) {
+  $: if (mounted && (loadedRatingKey !== ($activeRating ?? '') || loadedRefreshToken !== $imageRefreshToken || loadedTagRefreshToken !== $tagRefreshToken)) {
     loadHome();
   }
 </script>

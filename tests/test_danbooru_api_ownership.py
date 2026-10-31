@@ -17,7 +17,7 @@ class DanbooruApiOwnershipTests(unittest.TestCase):
         classes = {node.name for node in ast.parse((ROOT / "backend/models.py").read_text()).body
                    if isinstance(node, ast.ClassDef)}
         self.assertEqual(classes, {"UserSetting", "UserSettingUpdate", "BackupOptions", "BackupConfigurationUpdate",
-                                   "BackupCreateRequest", "BackupRestoreRequest", "ThumbnailCacheLimitUpdate"})
+                                   "BackupCreateRequest", "BackupRestoreRequest", "ThumbnailCacheLimitUpdate","CollectionExportRequest","CollectionImportRequest"})
         self.assertFalse(hasattr(models, "ImageSummary"))
 
     def test_every_model_caller_uses_the_owning_class(self):

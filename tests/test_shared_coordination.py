@@ -94,3 +94,17 @@ class SharedCoordinationTests(unittest.TestCase):
             time.sleep(.01)
         self.assertIsNone(tools.active_tool_id())
         tools._running_tasks.pop("coordination-fixture", None)
+
+
+def test_storage_reservation_rejects_other_threads_without_holding_shutdown_lock():
+    import threading,maintenance
+    errors=[]
+    def pending():
+        for operation in (maintenance.module_operation,lambda:maintenance.exclusive_tool_operation('background',wait=False)):
+            try:
+                with operation():raise AssertionError('Another request entered storage maintenance')
+            except RuntimeError as error:errors.append(str(error))
+    with maintenance.storage_operation():
+        worker=threading.Thread(target=pending);worker.start();worker.join(2)
+        assert not worker.is_alive() and len(errors)==2
+    with maintenance.module_operation():pass

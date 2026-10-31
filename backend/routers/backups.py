@@ -70,8 +70,19 @@ def inspect_metadata_backup(backup_name: str):
 @router.post("/api/backups/restore")
 def restore_metadata_backup(request: BackupRestoreRequest):
     try:
-        with exclusive_tool_operation("restoring"):
-            return restore_backup_bundle(request.name)
+        from lifecycle import module_runtime
+        from maintenance import storage_operation
+        with storage_operation():
+            paused=module_runtime.suspend_storage_from_request() if module_runtime else ()
+            try:
+                with exclusive_tool_operation("restoring",wait=False):
+                    result=restore_backup_bundle(request.name)
+            except BaseException:
+                import config
+                if module_runtime and not any((config.SUITE_HOME/'state'/name).exists() for name in ('storage-install-pending.json','storage-restart-required.json')):
+                    module_runtime.resume_storage_from_request(paused)
+                raise
+            return result
     except (ValueError, FileNotFoundError, KeyError, json.JSONDecodeError, zipfile.BadZipFile) as exc:
         raise HTTPException(400, str(exc)) from exc
     except RuntimeError as exc:

@@ -26,6 +26,7 @@ def backup_home(tmp_path, monkeypatch):
     with sqlite3.connect(user) as connection:
         connection.execute('create table marker(value text)')
         connection.execute("insert into marker values('preserve me')")
+    connection.close()
     options = {'enabled': True, 'location':'default', 'custom_location':'', 'retention':2, 'frequency_minutes':15}
     destination = home / 'backups'
     monkeypatch.setattr(config, '_cfg', {'backup_options':options, 'backup_components':{'user_database':True, 'file_attachments':False}})
@@ -34,6 +35,7 @@ def backup_home(tmp_path, monkeypatch):
     monkeypatch.setattr(automatic, 'AUTOMATIC_BACKUP_STATE_FILE', home / 'automatic-backups.json')
     monkeypatch.setattr(bundles, 'COMPONENTS', {'user_database':('databases/user.sqlite',user)})
     monkeypatch.setattr(bundles, 'USER_DB_PATH', user)
+    monkeypatch.setattr(config,'JOBS_DB_PATH',home/'state/jobs.sqlite')
     return home, destination, options
 
 

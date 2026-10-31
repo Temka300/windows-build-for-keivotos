@@ -1,3 +1,4 @@
+import {diagnosticFetch} from './diagnostics';
 // Existing /api JSON transport; preserve request and error semantics.
 export const BASE = '/api';
 
@@ -12,7 +13,7 @@ export async function get<T>(
       if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
     }
   }
-  const res = await fetch(url.toString(), { signal });
+  const res = await diagnosticFetch(url.toString(), { signal });
   if (!res.ok) throw await apiError(res);
   return res.json();
 }
@@ -37,11 +38,13 @@ export async function apiError(res: Response): Promise<Error> {
   } catch {
     // Non-JSON error body; fall back to the status line.
   }
-  return new ApiError(res.status, detail || `API ${res.status}: ${res.statusText}`);
+  const error = new ApiError(res.status, detail || `API ${res.status}: ${res.statusText}`);
+  Object.assign(error, {operationId: res.headers.get('X-Keivotos-Operation-ID')});
+  return error;
 }
 
 export async function post<T>(path: string, body?: unknown): Promise<T> {
-  const res = await fetch(BASE + path, {
+  const res = await diagnosticFetch(BASE + path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: body ? JSON.stringify(body) : undefined,
@@ -51,7 +54,7 @@ export async function post<T>(path: string, body?: unknown): Promise<T> {
 }
 
 export async function put<T>(path: string, body?: unknown): Promise<T> {
-  const res = await fetch(BASE + path, {
+  const res = await diagnosticFetch(BASE + path, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: body ? JSON.stringify(body) : undefined,
@@ -67,7 +70,7 @@ export async function del<T>(path: string, params?: Record<string, string | numb
       if (value !== undefined && value !== null && value !== '') url.searchParams.set(key, String(value));
     }
   }
-  const res = await fetch(url.toString(), { method: 'DELETE' });
+  const res = await diagnosticFetch(url.toString(), { method: 'DELETE' });
   if (!res.ok) throw await apiError(res);
   return res.json();
 }

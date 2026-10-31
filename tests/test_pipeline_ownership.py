@@ -108,5 +108,35 @@ class PipelineOwnershipTests(unittest.TestCase):
             self.assertEqual(media.read_bytes(), original)
 
 
+    def test_application_cli_finalizes_split_jobs_with_a_combined_index(self):
+        from modules.danbooru.catalog_index import index_owner
+        from services.catalog_index import INDEX_SCHEMA, _json
+        for helper in (False, True):
+            with self.subTest(helper=helper), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary); library = base / 'media'; library.mkdir()
+                media = library / 'sample.png'; Image.new('RGB', (40, 30), (10, 20, 30)).save(media)
+                original = media.read_bytes(); index = base / 'index.sqlite'; jobs = base / 'jobs.sqlite'
+                owner = index_owner()
+                with closing(sqlite3.connect(index)) as db, db:
+                    owner.initialize(db); db.executescript(INDEX_SCHEMA)
+                    db.execute('INSERT INTO kv_index_meta VALUES(1,1,?,?)', ('a' * 32, '[]'))
+                    db.execute('INSERT INTO kv_index_owners VALUES(?,?,?)', (owner.slug, 1, _json(owner.tables)))
+                command = [sys.executable]
+                command += ([str(ROOT / 'app.py'), '--pipeline'] if helper
+                            else [str(ROOT / 'scripts/danbooru_gallery_dl.py')])
+                command += ['--root', str(base), '--sidecar-dir', str(base / 'sidecars'),
+                            '--user-db', str(base / 'user.sqlite'), '--jobs-db', str(jobs)]
+                for phase in ('import-discover', 'import-enrich', 'import-finalize', 'import-finalize'):
+                    result = subprocess.run(command + [phase, str(library), '--output', str(index)],
+                        cwd=base, env={**os.environ, 'KEIVOTOS_HOME':str(base / 'home')},
+                        capture_output=True, text=True, timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                with closing(sqlite3.connect(index)) as db, closing(sqlite3.connect(jobs)) as state:
+                    self.assertIsNone(db.execute("SELECT name FROM sqlite_master WHERE name='ingest_state'").fetchone())
+                    self.assertEqual(state.execute('SELECT phase,status FROM ingest_state').fetchone(), ('finalized','done'))
+                    self.assertEqual(db.execute('SELECT COUNT(*) FROM files').fetchone()[0], 1)
+                self.assertEqual(media.read_bytes(), original)
+
+
 if __name__ == '__main__':
     unittest.main()

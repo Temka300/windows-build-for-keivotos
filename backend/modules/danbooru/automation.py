@@ -1,6 +1,7 @@
 """Low-frequency, local-only watcher for new or changed external media."""
 from __future__ import annotations
 
+from services.operation_diagnostics import observed
 import asyncio
 import logging
 import os
@@ -95,6 +96,7 @@ def set_automation_enabled(enabled: bool, interval_minutes: int | None = None) -
     return automation_status()
 
 
+@observed('danbooru', 'automation.tick')
 def run_automation_tick() -> dict:
     """Scan once and launch a local-only incremental import when needed."""
     config = get_automation_config()

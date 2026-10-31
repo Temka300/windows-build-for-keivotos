@@ -7,7 +7,7 @@ from importlib import metadata
 from pathlib import Path
 
 
-DISTRIBUTIONS = ("aiosqlite", "fastapi", "gallery-dl", "imageio-ffmpeg", "pillow", "uvicorn")
+DISTRIBUTIONS = ("aiosqlite", "defusedxml", "fastapi", "gallery-dl", "imageio-ffmpeg", "pillow", "psutil", "uvicorn")
 
 
 def main() -> int:

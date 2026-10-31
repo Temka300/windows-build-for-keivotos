@@ -27,6 +27,22 @@ BackgroundTasksHook = Callable[[], "list[Any]"]
 
 
 @dataclass(frozen=True, slots=True)
+class FileMetadataContext:
+    """Fresh Files-owned subject; passive hooks never start module runtimes."""
+
+    source: Any
+    registered: tuple[Any, ...]
+    relative_path: str
+    path: Path
+    suite_home: Path
+    index_path: Path
+    user_connection: sqlite3.Connection
+
+
+FileMetadataProvider = Callable[[FileMetadataContext], dict[str, Any] | None]
+
+
+@dataclass(frozen=True, slots=True)
 class BackupComponent:
     """Owner-declared backup artifact with a stable legacy archive identity."""
 
@@ -64,17 +80,26 @@ class ModuleDescriptor:
     folder_preview_hook: FolderPreviewHook | None = None
     folder_update_hook: FolderUpdateHook | None = None
     rescan_hook: RescanHook | None = None
+    index_rescan_hook: RescanHook | None = None
     relocate_hook: RelocateHook | None = None
+    shared_folder_relocation: bool = False
     router_provider: RouterProvider | None = None
     startup_hook: StartupHook | None = None
+    shutdown_hook: Callable[[], Any] | None = None
     background_tasks_hook: BackgroundTasksHook | None = None
 
     backup_components_provider: Callable[[], tuple[BackupComponent, ...]] | None = None
     storage_migration_hook: StartupHook | None = None
     config_defaults: dict[str, Any] = field(default_factory=dict)
     index_initializer: IndexInitializer | None = None
+    catalog_index_provider: Callable[[], Any] | None = None
+    portable_provider: Callable[[], Any] | None = None
+    transfer_provider: Callable[[], Any] | None = None
     user_schema_provider: Callable[[], str] | None = None
     user_migrator: Callable[[sqlite3.Connection, Path, Path], None] | None = None
+    file_metadata_provider: FileMetadataProvider | None = None
+    download_history_provider: Callable[[Any], list[dict[str, Any]]] | None = None
+    download_control_provider: Callable[[], Any] | None = None
 
     def backup_components(self) -> tuple[BackupComponent, ...]:
         """Preservation eligibility is independent of operational enablement."""
@@ -86,6 +111,13 @@ class ModuleDescriptor:
         """Synchronous once-at-startup work, run only when the module is active."""
         if self.startup_hook is not None:
             self.startup_hook()
+
+    async def run_shutdown(self) -> None:
+        if self.shutdown_hook is not None:
+            import inspect
+            result=self.shutdown_hook()
+            if inspect.isawaitable(result):
+                await result
 
     def background_tasks(self) -> "list[Any]":
         """``(name, coroutine)`` pairs to run for the module's lifetime.

@@ -4,6 +4,6 @@ from delivery_contract import DeliveryContribution
 
 def contribution(target):
     return DeliveryContribution(
-        hidden_imports=('modules.youtube.worker',),
+        hidden_imports=('modules.youtube.worker','modules.youtube.details','modules.youtube.channels'),
         collect_packages=('yt_dlp',),
         metadata_packages=('yt-dlp',))

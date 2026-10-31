@@ -4,8 +4,8 @@
   // note). The Origin tab is a progressive editor — an empty note is a single
   // "Add info" button; picking a field type from its menu reveals that field
   // inline, and each field saves on blur. There is no in-app file preview.
-  import { createEventDispatcher } from 'svelte';
-  import { filesApi, type Annotation, type AnnotationLink } from '../lib/filesApi';
+  import { createEventDispatcher, onDestroy } from 'svelte';
+  import { filesApi, type Annotation, type AnnotationLink, type AnnotationDetail, type AudioMetadata, type ModuleMetadataSection } from '../lib/filesApi';
   import { fileGlyph, linkKindLabel, type Subject } from '../lib/filePreview';
 
   export let subject: Subject;
@@ -15,7 +15,7 @@
   const dispatch = createEventDispatcher<{ close: void; changed: void; browse: void }>();
   const LINK_KINDS = ['source', 'discussion', 'mirror', 'author', 'other'];
 
-  type FieldKey = 'description' | 'links' | 'author' | 'extra';
+  type FieldKey = 'description' | 'links' | 'author' | 'extra' | 'details';
 
   let activeTab: 'properties' | 'origin' = 'properties';
 
@@ -26,9 +26,16 @@
   let loadedKey = '';
   let uploading = false;
   let fileInput: HTMLInputElement;
+  let audio: AudioMetadata | null = null, audioLoading = false, audioError = '';
+  let audioSerial = 0, alive = true;
+  let metadata: ModuleMetadataSection[] = [], metadataLoading = false, metadataError = '';
+  let metadataSerial = 0, originSerial = 0, missingCover = false;
+  const audioExtensions = new Set(['mp3', 'flac', 'wav', 'ogg', 'oga', 'm4a']);
+  onDestroy(() => { alive = false; audioSerial++; metadataSerial++; originSerial++; });
 
   // One working copy of the editable fields; every field commits the whole draft.
-  let draft = { description: '', author: '', extra_info: '', links: [] as AnnotationLink[] };
+  let draft = { description: '', author: '', extra_info: '', links: [] as AnnotationLink[], details: [] as AnnotationDetail[] };
+  let userEdited = false, defaultsUsed = false;
   let lastSaved = '';
   // Empty fields the user has chosen to add but not yet filled — kept visible.
   let added = new Set<FieldKey>();
@@ -38,12 +45,117 @@
   $: if (key !== loadedKey) {
     loadedKey = key;
     void load(subject);
+    void loadAudio(subject);
+    void loadMetadata(subject);
   }
   $: typeLabel = subject.isDir ? 'Folder' : subject.ext ? `${subject.ext.toUpperCase()} file` : 'File';
+  $: musicCover = metadata.find(section => section.owner === 'ost' && section.artwork);
+  $: metadataNotice = metadataError || audioError || (audio?.status === 'busy' ? 'Audio metadata is busy.' :
+    audio && audio.status !== 'ready' ? 'Audio metadata is unavailable for this file.' :
+    metadata.some(section => section.status === 'unavailable') ? 'Saved metadata is unavailable.' : '');
+  $: technicalFacts = fileFacts(metadata, audio);
+  $: if (!loading && !error && !metadataLoading && !audioLoading && !userEdited && !annotation?.metadata_applied) {
+    fillEmptyFields(metadata, audio);
+  }
+
+  function fileFacts(sections: ModuleMetadataSection[], sound: AudioMetadata | null): AnnotationDetail[] {
+    const facts = new Map<string, string>();
+    for (const section of sections) for (const field of section.fields) {
+      if (['Duration', 'Video codec', 'Audio codec'].includes(field.label) && field.value && field.value !== 'none') facts.set(field.label, field.value);
+    }
+    if (sound) {
+      if (sound.duration !== null) facts.set('Duration', audioDuration(sound.duration));
+      if (sound.samplerate !== null) facts.set('Sample rate', `${sound.samplerate} Hz`);
+      if (sound.bitrate !== null) facts.set('Bitrate', `${Math.round(sound.bitrate)} kbps`);
+      if (sound.bitdepth !== null) facts.set('Bit depth', `${sound.bitdepth} bit`);
+      if (sound.channels !== null) facts.set('Channels', String(sound.channels));
+    }
+    return [...facts].map(([label, value]) => ({label, value}));
+  }
+
+  function fillEmptyFields(sections: ModuleMetadataSection[], sound: AudioMetadata | null) {
+    let description = '', author = '', extra = '';
+    const links: AnnotationLink[] = [], details: AnnotationDetail[] = [];
+    for (const section of sections) {
+      const value = (label: string) => section.fields.find(field => field.label === label)?.value ?? '';
+      if (section.owner === 'youtube') {
+        author ||= value('Channel');
+        for (const label of ['Title', 'Uploaded', 'Downloaded']) if (value(label)) details.push({label, value: value(label)});
+      } else if (section.owner === 'twitter') {
+        description ||= value('Post text');
+        author ||= [value('Author'), value('Handle')].filter(Boolean).join(' ');
+        for (const label of ['Posted', 'Captured']) if (value(label)) details.push({label, value: value(label)});
+      }
+      for (const field of section.fields) if (field.href) {
+        links.push({url: field.href, label: field.label === 'Channel URL' ? 'Channel' : field.label === 'Author URL' ? 'Profile' : '',
+          kind: ['Channel URL', 'Author URL'].includes(field.label) ? 'author' : 'source'});
+      }
+    }
+    if (sound) {
+      author ||= (sound.tags.artist ?? []).join('; ');
+      extra ||= (sound.tags.comment ?? []).join('\n');
+      for (const name of ['title', 'album', 'albumartist', 'year', 'genre', 'composer', 'track', 'disc']) {
+        let value = (sound.tags[name] ?? []).join('; ');
+        const total = sound.tags[`${name}_total`]?.join('; ');
+        if (['track', 'disc'].includes(name) && total) value = value ? `${value} / ${total}` : `of ${total}`;
+        if (value) details.push({label: tagLabel(name), value});
+      }
+    }
+    defaultsUsed ||= Boolean(description || author || extra || links.length || details.length);
+    const heldLinks = new Set(draft.links.map(link => link.url.trim()));
+    const heldDetails = new Set(draft.details.map(item => item.label.trim().toLocaleLowerCase()));
+    draft = {...draft, description: draft.description || description, author: draft.author || author, extra_info: draft.extra_info || extra,
+      links: [...draft.links, ...links.filter(link => {if (heldLinks.has(link.url)) return false; heldLinks.add(link.url); return true;})],
+      details: [...draft.details, ...details.filter(item => {const label = item.label.toLocaleLowerCase(); if (heldDetails.has(label)) return false; heldDetails.add(label); return true;})].slice(0, 32)};
+    // Reading and focus/blur are passive. Only an actual edit saves defaults.
+    lastSaved = serialize();
+  }
+
+  async function loadMetadata(current: Subject) {
+    const serial = ++metadataSerial;
+    metadata = []; metadataLoading = true; metadataError = ''; missingCover = false;
+    try {
+      const result = await filesApi.moduleMetadata(current.sourceId, current.path);
+      if (alive && serial === metadataSerial) metadata = result.sections;
+    } catch (caught) {
+      if (alive && serial === metadataSerial) metadataError = (caught as Error).message;
+    } finally {
+      if (alive && serial === metadataSerial) metadataLoading = false;
+    }
+  }
+
+  async function loadAudio(current: Subject) {
+    const serial = ++audioSerial;
+    audio = null; audioError = ''; audioLoading = false;
+    if (current.isDir || !audioExtensions.has(current.ext?.toLowerCase() ?? '')) return;
+    audioLoading = true;
+    try {
+      const result = await filesApi.audioMetadata(current.sourceId, current.path);
+      if (alive && serial === audioSerial) audio = result;
+    } catch (caught) {
+      if (alive && serial === audioSerial) audioError = (caught as Error).message;
+    } finally {
+      if (alive && serial === audioSerial) audioLoading = false;
+    }
+  }
+
+  function audioDuration(value: number | null): string {
+    if (value === null || !Number.isFinite(value)) return '—';
+    const seconds = Math.floor(value);
+    return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+  }
+
+  function tagLabel(name: string): string {
+    const labels: Record<string, string> = { title: 'Title', artist: 'Artist', album: 'Album',
+      albumartist: 'Album artist', composer: 'Composer', genre: 'Genre', year: 'Year',
+      track: 'Track', track_total: 'Total tracks', disc: 'Disc', disc_total: 'Total discs', comment: 'Comment' };
+    return labels[name] ?? name;
+  }
 
   $: showDescription = draft.description.trim() !== '' || added.has('description');
   $: showAuthor = draft.author.trim() !== '' || added.has('author');
   $: showExtra = draft.extra_info.trim() !== '' || added.has('extra');
+  $: showDetails = draft.details.length > 0 || added.has('details');
   $: showLinks = draft.links.length > 0 || added.has('links');
   $: attachments = annotation?.attachments ?? [];
   $: addOptions = [
@@ -52,22 +164,28 @@
     !showAuthor ? { key: 'author', label: 'Author' } : null,
     { key: 'image', label: 'Image / video' },
     !showExtra ? { key: 'extra', label: 'Extra info' } : null,
+    !showDetails ? { key: 'details', label: 'Details' } : null,
   ].filter((option): option is { key: string; label: string } => option !== null);
 
   async function load(current: Subject) {
+    const serial = ++originSerial;
     loading = true;
     error = '';
     actionError = '';
     annotation = null;
+    userEdited = false; defaultsUsed = false;
+    draft = {description: '', author: '', extra_info: '', links: [], details: []};
     closeMenus();
     try {
-      annotation = await filesApi.getInfo(current.sourceId, current.path);
+      const result = await filesApi.getInfo(current.sourceId, current.path);
+      if (!alive || serial !== originSerial) return;
+      annotation = result;
     } catch (e) {
-      error = (e as Error).message;
+      if (alive && serial === originSerial) error = (e as Error).message;
     } finally {
-      loading = false;
+      if (alive && serial === originSerial) loading = false;
     }
-    syncDraft();
+    if (alive && serial === originSerial) syncDraft();
   }
 
   function syncDraft() {
@@ -76,6 +194,7 @@
       author: annotation?.author ?? '',
       extra_info: annotation?.extra_info ?? '',
       links: (annotation?.links ?? []).map((link) => ({ ...link })),
+      details: (annotation?.details ?? []).map(item => ({...item})),
     };
     added = new Set();
     lastSaved = serialize();
@@ -86,6 +205,7 @@
       d: draft.description.trim(),
       a: draft.author.trim(),
       e: draft.extra_info.trim(),
+      details: draft.details.map(item => ({label: item.label.trim(), value: item.value.trim()})).filter(item => item.label || item.value),
       l: draft.links
         .map((link) => ({ u: link.url.trim(), b: link.label.trim(), k: link.kind }))
         .filter((link) => link.u),
@@ -106,6 +226,7 @@
   }
 
   function addField(fieldKey: string) {
+    userEdited = true;
     closeMenus();
     if (fieldKey === 'image') {
       fileInput.click();
@@ -114,22 +235,38 @@
     added.add(fieldKey as FieldKey);
     added = added;
     if (fieldKey === 'links' && draft.links.length === 0) addLink();
+    if (fieldKey === 'details' && draft.details.length === 0) addDetail();
+  }
+
+  function addDetail() {
+    userEdited = true;
+    draft.details = [...draft.details, {label: '', value: ''}];
+  }
+
+  function removeDetail(index: number) {
+    userEdited = true;
+    draft.details = draft.details.filter((_, i) => i !== index);
+    void persist();
   }
 
   function addLink() {
+    userEdited = true;
     draft.links = [...draft.links, { url: '', label: '', kind: 'source' }];
   }
 
   function removeLink(index: number) {
+    userEdited = true;
     draft.links = draft.links.filter((_, i) => i !== index);
     void persist();
   }
 
   function removeField(fieldKey: FieldKey) {
+    userEdited = true;
     if (fieldKey === 'description') draft.description = '';
     else if (fieldKey === 'author') draft.author = '';
     else if (fieldKey === 'extra') draft.extra_info = '';
     else if (fieldKey === 'links') draft.links = [];
+    else if (fieldKey === 'details') draft.details = [];
     added.delete(fieldKey);
     added = added;
     void persist();
@@ -150,20 +287,27 @@
       actionError = '';
       return;
     }
+    userEdited = true;
+    const details = draft.details.map(item => ({label: item.label.trim(), value: item.value.trim()})).filter(item => item.label || item.value);
+    if (details.some(item => !item.label || !item.value)) { actionError = 'Give each detail a name and a value.'; return; }
+    if (new Set(details.map(item => item.label.toLocaleLowerCase())).size !== details.length) { actionError = 'Each detail needs a different name.'; return; }
+    const serial = originSerial;
     actionError = '';
     try {
-      annotation = await filesApi.saveInfo({
+      const saved = await filesApi.saveInfo({
         source_id: subject.sourceId,
         path: subject.path,
         description: draft.description.trim(),
         author: draft.author.trim(),
         extra_info: draft.extra_info.trim(),
-        links,
+        links, details, metadata_applied: annotation?.metadata_applied || defaultsUsed,
       });
+      if (!alive || serial !== originSerial) return;
+      annotation = saved;
       lastSaved = snapshot;
       dispatch('changed');
     } catch (e) {
-      actionError = (e as Error).message;
+      if (alive && serial === originSerial) actionError = (e as Error).message;
     }
   }
 
@@ -309,6 +453,9 @@
             <dt class="shrink-0 font-medium text-gray-400">Size</dt>
             <dd class="text-gray-200">{subject.isDir ? '—' : formatSize(subject.size)}</dd>
           </div>
+          {#each technicalFacts as fact (fact.label)}
+            <div class="flex justify-between gap-4"><dt class="shrink-0 font-medium text-gray-400">{fact.label}</dt><dd class="min-w-0 break-words text-right text-gray-200">{fact.value}</dd></div>
+          {/each}
           <div class="flex justify-between gap-4">
             <dt class="shrink-0 font-medium text-gray-400">Modified</dt>
             <dd class="text-gray-200">{formatDate(subject.mtime)}</dd>
@@ -341,7 +488,7 @@
         <p class="px-4 py-3 text-xs text-red-300">{error}</p>
       {:else}
         <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-        <div class="px-4 py-3" on:click={closeMenus}>
+        <div class="px-4 py-3" on:click={closeMenus} on:input={() => userEdited = true}>
           {#if showDescription}
             <div class="mb-3">
               <div class="mb-1 flex items-center justify-between">
@@ -411,10 +558,25 @@
             </div>
           {/if}
 
-          {#if attachments.length}
+          {#if showDetails}
+            <div class="mb-3">
+              <div class="mb-1 flex items-center justify-between"><span class="text-[10px] uppercase tracking-wide text-gray-500">Details</span><button type="button" class="text-gray-600 hover:text-red-300" aria-label="Remove all details" on:click={() => removeField('details')}>✕</button></div>
+              {#each draft.details as detail, index (index)}
+                <div class="mb-2 flex items-start gap-1.5">
+                  <input aria-label="Detail name" placeholder="Name" maxlength="128" bind:value={detail.label} on:blur={persist} class="w-1/3 min-w-0 rounded border border-[#2a2a3a] bg-[#1e1e2e] px-2 py-1.5 text-xs text-gray-300 outline-none focus:border-purple-500" />
+                  <textarea aria-label={detail.label || 'Detail value'} placeholder="Value" rows="1" maxlength="262144" bind:value={detail.value} on:blur={persist} class="min-w-0 flex-1 resize-y rounded border border-[#2a2a3a] bg-[#1e1e2e] px-2 py-1.5 text-xs text-gray-200 outline-none focus:border-purple-500"></textarea>
+                  <button type="button" class="px-1 py-1 text-gray-500 hover:text-red-300" aria-label="Remove detail" on:click={() => removeDetail(index)}>✕</button>
+                </div>
+              {/each}
+              {#if draft.details.length < 32}<button type="button" class="text-[11px] text-purple-300 hover:text-purple-200" on:click={addDetail}>＋ Add detail</button>{/if}
+            </div>
+          {/if}
+
+          {#if attachments.length || (musicCover && !missingCover)}
             <div class="mb-3">
               <div class="mb-1 text-[10px] uppercase tracking-wide text-gray-500">Images / videos</div>
               <div class="grid grid-cols-3 gap-1.5">
+                {#if !attachments.length && musicCover && !missingCover}{#key `${key}:${musicCover.artwork_version}`}<img class="h-16 w-full rounded border border-white/5 object-cover" alt="Local music cover" src={filesApi.moduleArtworkUrl(subject.sourceId, subject.path, musicCover.owner, musicCover.artwork_version)} on:error={() => missingCover = true}/>{/key}{/if}
                 {#each attachments as attachment (attachment.id)}
                   <div class="group relative overflow-hidden rounded border border-white/5 bg-black/30">
                     {#if attachment.media_type.startsWith('video/')}
@@ -474,6 +636,9 @@
           {/if}
         </div>
       {/if}
+      {#if metadataLoading || audioLoading}<p role="status" class="px-4 pb-3 text-xs text-gray-500">Reading metadata…</p>
+      {:else if metadataNotice}<div class="px-4 pb-3 text-xs text-gray-400"><p role="status">{metadataNotice}</p><button class="mt-2 text-purple-300" on:click={() => { void loadMetadata(subject); void loadAudio(subject); }}>Retry metadata</button></div>{/if}
+
     </div>
 
     <input bind:this={fileInput} type="file" accept="image/*,video/*" class="hidden" on:change={onUploadChange} />

@@ -85,12 +85,122 @@ class MetadataBackupBundleTests(unittest.TestCase):
             },
         }
         backup_bundle._estimate_cache.clear()
+        self.jobs_patch=patch("config.JOBS_DB_PATH",self.temp/"state/jobs.sqlite")
+        self.jobs_patch.start()
+        self.addCleanup(self.jobs_patch.stop)
 
     def tearDown(self) -> None:
         for name, value in self.originals.items():
             setattr(backup_bundle, name, value)
         backup_bundle._estimate_cache.clear()
         shutil.rmtree(self.temp, ignore_errors=True)
+
+    def test_portable_preservation_uses_user_data_selection_and_keeps_later_captures(self):
+        preserved=self.temp/'preserved'
+        original=preserved/'library/item/originals/hash/source.json'
+        original.parent.mkdir(parents=True);original.write_bytes(b'original source')
+        with patch.object(backup_bundle,'_preserved_path',lambda:preserved):
+            created=backup_bundle.create_backup_bundle()
+            with zipfile.ZipFile(created['path']) as bundle:
+                manifest=json.loads(bundle.read('manifest.json'))
+                self.assertTrue(manifest['preserved_items'])
+                self.assertNotIn('preserved_items',manifest['components'])
+                self.assertEqual(bundle.read('preserved/library/item/originals/hash/source.json'),b'original source')
+            later=preserved/'library/item/captures/later.json';later.parent.mkdir();later.write_bytes(b'later exact metadata')
+            backup_bundle.restore_backup_bundle(created['name'])
+            self.assertEqual(original.read_bytes(),b'original source')
+            self.assertEqual(later.read_bytes(),b'later exact metadata')
+            original.write_bytes(b'conflicting bytes')
+            with self.assertRaisesRegex(RuntimeError,'verification failed'):
+                backup_bundle.restore_backup_bundle(created['name'])
+            self.assertEqual(original.read_bytes(),b'conflicting bytes')
+            self.assertEqual(later.read_bytes(),b'later exact metadata')
+
+    def test_preserved_originals_rollback_with_existing_components(self):
+        preserved=self.temp/'preserved';preserved.mkdir()
+        (preserved/'source.json').write_bytes(b'original source')
+        with patch.object(backup_bundle,'_preserved_path',lambda:preserved):
+            created=backup_bundle.create_backup_bundle()
+            original_replace=Path.replace
+            def fail_install(path,target):
+                if path.name=='incoming' and target==preserved:raise OSError('preservation interruption')
+                return original_replace(path,target)
+            with patch.object(Path,'replace',fail_install),self.assertRaisesRegex(OSError,'preservation interruption'):
+                backup_bundle.restore_backup_bundle(created['name'])
+            self.assertEqual((preserved/'source.json').read_bytes(),b'original source')
+
+    def test_youtube_description_snapshots_keep_zero_unknown_and_later_wording(self):
+        from modules.youtube import details,metadata
+        stage=self.temp/'capture';stage.mkdir();body='Original 한글 description\nExact second line'
+        (stage/'video.description').write_bytes(body.encode())
+        facts=metadata.capture(dict(id='abcdefghijk'),'https://www.youtube.com/watch?v=abcdefghijk','video.mp4')
+        captured=details.capture(dict(id='abcdefghijk',description=body,like_count=0),stage,facts,engine_version='fixture')
+        preserved=self.temp/'preserved';original=preserved/'library/item/originals/first/description.txt'
+        original.parent.mkdir(parents=True);original.write_bytes(details.asset_bytes(stage,captured))
+        record=preserved/'library/item/captures/first.json';record.parent.mkdir();record.write_text(json.dumps(captured),encoding='utf-8')
+        with patch.object(backup_bundle,'_preserved_path',lambda:preserved):
+            created=backup_bundle.create_backup_bundle()
+            later=preserved/'library/item/originals/later/description.txt';later.parent.mkdir();later.write_bytes(b'Later wording')
+            backup_bundle.restore_backup_bundle(created['name'])
+            self.assertEqual(original.read_bytes(),body.encode());self.assertEqual(later.read_bytes(),b'Later wording')
+            value=json.loads(record.read_text());self.assertEqual(value['like_count'],0);self.assertIsNone(value['dislike_count'])
+            with zipfile.ZipFile(created['path'])as archive:
+                self.assertEqual(archive.read('preserved/library/item/originals/first/description.txt'),body.encode())
+
+    def test_origin_details_and_deliberate_clear_survive_user_backup_restore(self) -> None:
+        from files_base import annotations
+        expected = {}
+        with closing(sqlite3.connect(self.user_db)) as connection:
+            connection.row_factory = sqlite3.Row
+            annotations.ensure_annotations_schema(connection)
+            expected['filled'] = annotations.upsert_annotation(connection, subject_kind='dir', source_id='offline',
+                relative_path='album', author='Manual', details=[{'label':'Album','value':'保存된 音楽'}], metadata_applied=True)
+            expected['cleared'] = annotations.upsert_annotation(connection, subject_kind='dir', source_id='offline',
+                relative_path='cleared', details=[], metadata_applied=True)
+        created = backup_bundle.create_backup_bundle()
+        with closing(sqlite3.connect(self.user_db)) as connection:
+            connection.execute("UPDATE files_annotations SET details='[]', metadata_applied=0")
+            connection.commit()
+        backup_bundle.restore_backup_bundle(Path(created['path']).name)
+        with closing(sqlite3.connect(self.user_db)) as connection:
+            connection.row_factory = sqlite3.Row
+            self.assertEqual(annotations.get_annotation(connection, source_id='offline', relative_path='album'), expected['filled'])
+            self.assertEqual(annotations.get_annotation(connection, source_id='offline', relative_path='cleared'), expected['cleared'])
+            self.assertEqual(annotations.annotated_keys(connection), (set(), {('offline','album')}))
+        self.assertEqual(self.external_image.read_bytes(), b'original-image-must-stay')
+
+    def test_category_names_memberships_and_retry_receipts_roundtrip_in_user_backup(self) -> None:
+        from services.library_categories import CategoryStore
+        from uuid import uuid4
+        expected = {}
+        with closing(sqlite3.connect(self.user_db)) as connection:
+            connection.row_factory = sqlite3.Row
+            for owner in ('video', 'manga'):
+                store = CategoryStore(owner)
+                store.publish(connection)
+                expected[owner] = store.create(connection, 'Preserved shelf', str(uuid4()))
+                connection.execute(f'INSERT INTO {store.memberships}(category_id,source_id,path) VALUES(?,?,?)',
+                    (expected[owner]['id'], 'missing-source', 'same/relative-item'))
+                connection.commit()
+                # Preserve unavailable historical metadata without touching media.
+                store.set_membership(connection, 'missing-source', 'same/relative-item', [], 0,
+                    str(uuid4()), lambda *args: None)
+        created = backup_bundle.create_backup_bundle()
+        with closing(sqlite3.connect(self.user_db)) as connection:
+            connection.execute("UPDATE marker SET value='temporary fixture change'")
+            connection.commit()
+        backup_bundle.restore_backup_bundle(Path(created['path']).name)
+        with closing(sqlite3.connect(self.user_db)) as connection:
+            connection.row_factory = sqlite3.Row
+            assert connection.execute('SELECT value FROM marker').fetchone()[0] == 'user-original'
+            for owner in ('video', 'manga'):
+                store = CategoryStore(owner)
+                assert store.listing(connection, 0, 120)['items'] == [expected[owner]]
+                assert connection.execute(f'SELECT source_id,path FROM {store.memberships}').fetchone()['path'] == 'same/relative-item'
+                assert connection.execute(f'SELECT request_id FROM {store.table}').fetchone()[0]
+                assert connection.execute(f'SELECT active FROM {store.memberships}').fetchone()[0] == 0
+                assert store.membership(connection, 'missing-source', 'same/relative-item') == {'version': 1, 'category_ids': []}
+                assert connection.execute(f'SELECT category_ids FROM {store.updates}').fetchone()[0] == '[]'
 
     def test_disabled_owner_data_remains_eligible(self) -> None:
         import suite_modules
@@ -125,6 +235,226 @@ class MetadataBackupBundleTests(unittest.TestCase):
         backup_bundle.restore_backup_bundle(Path(created["path"]).name)
         self.assertEqual(archived.read_bytes(), b"previous draft")
         self.assertEqual(original.read_bytes(), b"current original note")
+
+    def test_language_vocabulary_and_retry_receipts_survive_user_backup_restore(self) -> None:
+        from uuid import uuid4
+        from unicodedata import normalize
+        from modules.language import vocabulary, study
+        from modules.language.user_schema import publish
+        data=vocabulary.VocabularyCreate(request_id=uuid4(),korean=normalize('NFD','  한글')+'  단어 ',
+                                          pronunciation='han-geul\t단어',english='  authored  meaning\n🐾 ')
+        with closing(sqlite3.connect(self.user_db)) as connection:
+            connection.row_factory=sqlite3.Row
+            publish(connection)
+            first=vocabulary.create(connection,data)
+            second=vocabulary.create(connection,data.model_copy(update={'request_id':uuid4()}))
+            edit=vocabulary.VocabularyEdit(request_id=uuid4(),revision=0,korean=first.korean,
+                pronunciation=first.pronunciation,english=' revised exact meaning\n🐾 ')
+            edited=vocabulary.edit(connection,first.id,edit)
+            deletion=vocabulary.VocabularyMutation(request_id=uuid4(),revision=0)
+            archived=vocabulary.archive(connection,second.id,deletion)
+            revisions=[dict(row) for row in connection.execute('SELECT * FROM language_vocabulary_revisions ORDER BY entry_id,revision')]
+            choice=study.StudyPreferences(category='hours',answer_language='korean',minimum=2,maximum=12)
+            study.save(connection,choice)
+        with patch('suite_modules.enabled_ids',side_effect=AssertionError('Personal backup ignores module enablement')):
+            created=backup_bundle.create_backup_bundle()
+        with closing(sqlite3.connect(self.user_db)) as connection:
+            connection.row_factory=sqlite3.Row
+            vocabulary.create(connection,vocabulary.VocabularyCreate(request_id=uuid4(),korean='나중',english='later'))
+            vocabulary.edit(connection,first.id,edit.model_copy(update={'request_id':uuid4(),'revision':1,'english':'after backup'}))
+        backup_bundle.restore_backup_bundle(created['name'])
+        with closing(sqlite3.connect(self.user_db)) as connection:
+            connection.row_factory=sqlite3.Row
+            self.assertEqual(vocabulary.listing(connection,0,50).items,[vocabulary.VocabularyEntry(**{key:getattr(edited,key) for key in vocabulary.VocabularyEntry.model_fields})])
+            self.assertEqual(vocabulary.create(connection,data),first)
+            self.assertEqual(vocabulary.edit(connection,first.id,edit),edited)
+            self.assertEqual(vocabulary.archive(connection,second.id,deletion),archived)
+            self.assertEqual(vocabulary.read(connection,second.id),archived)
+            self.assertEqual([dict(row) for row in connection.execute('SELECT * FROM language_vocabulary_revisions ORDER BY entry_id,revision')],revisions)
+            self.assertEqual(vocabulary.listing(connection,0,50).total,1)
+            self.assertEqual(study.read(connection),choice)
+            self.assertEqual(connection.execute('SELECT value FROM marker').fetchone()[0],'user-original')
+        self.assertEqual(self.external_image.read_bytes(),b'original-image-must-stay')
+
+    def test_language_practice_choices_survive_complete_user_backup_restore(self) -> None:
+        from modules.language import study
+        from modules.language.user_schema import publish
+        choice = study.StudyPreferences(category='hours',answer_language='korean',minimum=3,maximum=12)
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
+            publish(connection)
+            study.save(connection,choice)
+        with patch('suite_modules.enabled_ids',side_effect=AssertionError('Personal backup ignores enablement')):
+            created=backup_bundle.create_backup_bundle()
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
+            study.save(connection,study.StudyPreferences())
+        backup_bundle.restore_backup_bundle(created['name'])
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
+            connection.row_factory=sqlite3.Row
+            self.assertEqual(study.read(connection),choice)
+            self.assertEqual(connection.execute('SELECT value FROM marker').fetchone()[0],'user-original')
+        self.assertEqual(self.external_image.read_bytes(),b'original-image-must-stay')
+
+    def test_compound_practice_and_preserved_legacy_choices_roundtrip(self) -> None:
+        from modules.language import study
+        from modules.language.user_schema import publish
+        legacy = (1,'native','korean',17,20)
+        choice = study.StudyPreferences(category='date_time',answer_language='english',minimum=1,maximum=262800)
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
+            publish(connection)
+            connection.execute('INSERT INTO language_study_preferences VALUES (?,?,?,?,?)',legacy)
+            study.save(connection,choice)
+        with patch('suite_modules.enabled_ids',side_effect=AssertionError('Personal backup ignores enablement')):
+            created=backup_bundle.create_backup_bundle()
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
+            study.save(connection,study.StudyPreferences())
+        backup_bundle.restore_backup_bundle(created['name'])
+        with closing(sqlite3.connect(self.user_db)) as connection:
+            connection.row_factory=sqlite3.Row
+            publish(connection)
+            self.assertEqual(study.read(connection),choice)
+            self.assertEqual(tuple(connection.execute('SELECT * FROM language_study_preferences').fetchone()),legacy)
+            self.assertEqual(connection.execute('SELECT value FROM marker').fetchone()[0],'user-original')
+        self.assertEqual(self.external_image.read_bytes(),b'original-image-must-stay')
+
+    def test_manga_progress_survives_complete_user_backup_restore(self) -> None:
+        from modules.manga.user_schema import publish
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
+            publish(connection)
+            connection.execute("INSERT INTO manga_reading_sessions VALUES ('source','Story/Chapter','folder',4)")
+            connection.execute("""INSERT INTO manga_reading_progress VALUES
+                ('source','Story','Story/Chapter','folder',?,3,1,'vertical',0.35,4,7,'2026-10-07T01:00:00Z')""", ('a'*64,))
+            connection.commit()
+        with patch('suite_modules.enabled_ids', side_effect=AssertionError('Personal backup ignores enablement')):
+            created = backup_bundle.create_backup_bundle()
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
+            connection.execute('UPDATE manga_reading_progress SET page=2')
+            connection.commit()
+        backup_bundle.restore_backup_bundle(created['name'])
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
+            self.assertEqual(connection.execute('SELECT page,anchor,generation,sequence FROM manga_reading_progress').fetchone(), (1,0.35,4,7))
+            self.assertEqual(connection.execute('SELECT generation FROM manga_reading_sessions').fetchone(), (4,))
+            self.assertEqual(connection.execute('SELECT value FROM marker').fetchone(), ('user-original',))
+        self.assertEqual(self.external_image.read_bytes(), b'original-image-must-stay')
+
+    def test_manga_metadata_sources_personal_choices_and_receipts_survive_backup(self):
+        from modules.manga import metadata,user_schema
+        from services import item_catalog
+        with closing(sqlite3.connect(self.user_db)) as db:
+            db.row_factory=sqlite3.Row;user_schema.publish(db);item_catalog.ensure_catalog_schema(db)
+            identity=item_catalog.ensure_item(db,namespace='manga.metadata.subject',legacy_key='retained',owner='manga',item_type='metadata')
+            payload=dict(source_id='source',path='Story',kind='series',facts=dict(summary='설명',tags=['source']),inputs=[])
+            revision=metadata.digest(payload)
+            item_catalog.record_capture(db,item_id=identity,namespace=metadata.SOURCE,capture_key=revision,format_version=1,payload=payload)
+            item_catalog.record_capture(db,item_id=identity,namespace=metadata.HEAD,capture_key='1',format_version=1,payload=dict(source_id='source',path='Story',kind='series',version=1,revision=revision))
+            db.execute('INSERT INTO manga_metadata_overrides(source_id,path,kind,version,fields_json) VALUES(?,?,?,?,?)',('source','Story','series',3,'{"tags":["personal"],"future":{"keep":true}}'))
+            request=json.dumps(dict(source_id='source',path='Story',kind='series',fields={'tags':['personal']},version=2,source_revision='a'*64))
+            response=json.dumps(dict(subject=dict(source_id='source',path='Story',kind='series'),fields={'tags':['personal']},version=3))
+            db.execute('INSERT INTO manga_metadata_updates VALUES(?,?,?,?,?,?)',('00000000-0000-4000-8000-000000000001','source','Story','series',request,response));db.commit()
+            original=[tuple(row) for row in db.execute('SELECT * FROM manga_metadata_overrides')]
+        created=backup_bundle.create_backup_bundle()
+        with closing(sqlite3.connect(self.user_db)) as db:
+            db.execute('UPDATE manga_metadata_overrides SET fields_json=?',('{"tags":["changed"]}',));db.execute('UPDATE kv_item_captures SET payload_json=? WHERE namespace=?',('{}',metadata.SOURCE));db.commit()
+        backup_bundle.restore_backup_bundle(created['name'])
+        with closing(sqlite3.connect(self.user_db)) as db:
+            db.row_factory=sqlite3.Row
+            self.assertEqual([tuple(row) for row in db.execute('SELECT * FROM manga_metadata_overrides')],original)
+            self.assertEqual(item_catalog.read_capture(db,item_id=identity,namespace=metadata.SOURCE,capture_key=revision)['payload'],payload)
+            self.assertEqual(db.execute('SELECT request_json,response_json FROM manga_metadata_updates').fetchone()[:],(request,response))
+        self.assertEqual(self.external_image.read_bytes(),b'original-image-must-stay')
+
+    def test_video_watch_history_survives_complete_user_backup_restore(self):
+        from modules.video.user_schema import publish
+        with closing(sqlite3.connect(self.user_db)) as db, db:
+            publish(db)
+            db.execute("INSERT INTO video_watch_sessions VALUES('source','episode.mp4',4,?)",('b'*64,))
+            for revision,position in [('a',12.5),('b',39.0)]:
+                db.execute("INSERT INTO video_watch_progress VALUES('source','episode.mp4',?,?,100,0,4,7,'observed')",(revision*64,position))
+        created=backup_bundle.create_backup_bundle()
+        with closing(sqlite3.connect(self.user_db)) as db, db:db.execute('UPDATE video_watch_progress SET position=1')
+        backup_bundle.restore_backup_bundle(created['name'])
+        with closing(sqlite3.connect(self.user_db)) as db:
+            self.assertEqual(db.execute('SELECT position FROM video_watch_progress ORDER BY revision').fetchall(),[(12.5,),(39.0,)])
+            self.assertEqual(db.execute('SELECT generation,revision FROM video_watch_sessions').fetchone(),(4,'b'*64))
+            self.assertEqual(db.execute('SELECT value FROM marker').fetchone(),('user-original',))
+        self.assertEqual(self.external_image.read_bytes(),b'original-image-must-stay')
+
+    def test_video_metadata_history_and_personal_choices_survive_complete_backup(self):
+        from modules.video.user_schema import publish
+        from services import item_catalog
+        with closing(sqlite3.connect(self.user_db)) as db, db:
+            publish(db);item_catalog.ensure_catalog_schema(db)
+            item_catalog.ensure_item(db,namespace='video.metadata.subject',legacy_key='backup',owner='video',item_type='metadata',item_id='metadata-backup')
+            item_catalog.record_capture(db,item_id='metadata-backup',namespace='video.metadata.source',capture_key='original',format_version=1,payload={'facts':{'summary':'Original'}})
+            db.execute("INSERT INTO video_metadata_overrides(source_id,path,kind,version,fields_json) VALUES('source','Show','series',2,?)",('{"summary":"Personal"}',))
+            request=json.dumps(dict(source_id='source',path='Show',kind='series',fields={'summary':'Personal'},version=1,source_revision='a'*64))
+            response=json.dumps(dict(subject=dict(source_id='source',path='Show',kind='series'),fields={'summary':'Personal'},overrides={'summary':'Personal'},local_fields={},version=2,source_revision='a'*64))
+            db.execute("INSERT INTO video_metadata_updates VALUES(?,'source','Show','series',?,?)",('a'*32,request,response))
+        created=backup_bundle.create_backup_bundle()
+        with closing(sqlite3.connect(self.user_db)) as db, db:db.execute('UPDATE video_metadata_overrides SET fields_json=?',('{"summary":"Later"}',))
+        backup_bundle.restore_backup_bundle(created['name'])
+        with closing(sqlite3.connect(self.user_db)) as db:
+            self.assertEqual(db.execute('SELECT fields_json,version FROM video_metadata_overrides').fetchone(),('{"summary":"Personal"}',2))
+            self.assertEqual(json.loads(db.execute('SELECT response_json FROM video_metadata_updates').fetchone()[0])['fields'],{'summary':'Personal'})
+            self.assertEqual(item_catalog.read_capture(db,item_id='metadata-backup',namespace='video.metadata.source',capture_key='original')['payload'],{'facts':{'summary':'Original'}})
+        self.assertEqual(self.external_image.read_bytes(),b'original-image-must-stay')
+
+    def test_twitter_preferences_and_receipts_survive_complete_user_backup_restore(self) -> None:
+        from modules.twitter.user_schema import publish
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
+            publish(connection)
+            connection.execute("INSERT INTO twitter_preferences VALUES(1,'preserved-twitter-root')")
+            connection.execute("""INSERT INTO twitter_downloads
+                (id,request_id,url,post_id,source_id,root,status,phase,attempt,capture_id,path,retry_requests)
+                VALUES ('job','receipt','https://x.com/SavedAuthor/status/333','333','preserved-twitter-root',
+                        'original-root','complete','completed',2,'saved-capture','saved-manifest','[\"retry-receipt\"]')""")
+        with patch('suite_modules.enabled_ids', side_effect=AssertionError('Personal backup ignores enablement')):
+            created = backup_bundle.create_backup_bundle()
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
+            connection.execute("UPDATE twitter_preferences SET source_id='later-choice'")
+            connection.execute("UPDATE twitter_downloads SET status='failed',attempt=3")
+        backup_bundle.restore_backup_bundle(created['name'])
+        with closing(sqlite3.connect(self.user_db)) as connection:
+            self.assertEqual(connection.execute('SELECT source_id FROM twitter_preferences').fetchone(), ('preserved-twitter-root',))
+            self.assertEqual(connection.execute('SELECT request_id,status,attempt,path,retry_requests FROM twitter_downloads').fetchone(),
+                             ('receipt','complete',2,'saved-manifest','["retry-receipt"]'))
+            self.assertEqual(connection.execute('SELECT value FROM marker').fetchone(), ('user-original',))
+        self.assertEqual(self.external_image.read_bytes(), b'original-image-must-stay')
+
+    def test_youtube_playlists_survive_complete_user_backup_restore(self) -> None:
+        from modules.youtube import _publish
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
+            _publish(connection)
+            connection.execute("INSERT INTO youtube_playlists(id,request_id,title,revision,deleted_at) VALUES ('playlist','request','공부 음악',2,'2026-10-10T00:00:00Z')")
+            connection.executemany("INSERT INTO youtube_playlist_history(playlist_id,revision,request_id,operation,previous_title,title) VALUES ('playlist',?,?,?,?,?)",[(0,'request','create','','Original'),(1,'rename-request','rename','Original','공부 음악'),(2,'archive-request','archive','공부 음악','공부 음악')])
+            connection.execute("INSERT INTO youtube_playlist_items(playlist_id,job_id,position) VALUES ('playlist','retained-job',7)")
+            connection.execute("INSERT INTO youtube_playlist_versions VALUES ('retained-job',3)")
+            connection.execute("""INSERT INTO youtube_downloads(id,url,source_id,root,video,audio,title,status,metadata_version,channel_id,channel_name,avatar,avatar_error)
+                VALUES ('captured','https://www.youtube.com/watch?v=abcdefghijk','source','external-root','best','best','Kept video','complete',1,?,'Historical channel','YouTube/captured/.keivotos/channel-avatar.png','')""",('UC'+'a'*22,))
+            connection.execute("INSERT INTO youtube_channel_folders VALUES('source',?,'YouTube/Historical channel [stable-id]')",('UC'+'a'*22,))
+            connection.execute("UPDATE youtube_downloads SET layout_version=1,bundle_path='YouTube/Historical channel [stable-id]/Saved [item-id]',manifest_sha256=? WHERE id='captured'",('a'*64,))
+            connection.commit()
+        with patch('suite_modules.enabled_ids', side_effect=AssertionError('Personal backup ignores enablement')):
+            created=backup_bundle.create_backup_bundle()
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
+            connection.execute("UPDATE youtube_playlists SET title='later title',revision=3,deleted_at=''")
+            connection.execute('DELETE FROM youtube_playlist_history')  # isolated fixture changes after its backup
+            connection.execute('UPDATE youtube_playlist_versions SET version=4')
+            connection.execute("UPDATE youtube_downloads SET channel_name='later name',avatar='' WHERE id='captured'")
+            connection.execute("UPDATE youtube_channel_folders SET directory='later folder'")
+            connection.execute("UPDATE youtube_downloads SET bundle_path='',manifest_sha256='' WHERE id='captured'")
+            connection.commit()
+        backup_bundle.restore_backup_bundle(created['name'])
+        with closing(sqlite3.connect(self.user_db)) as connection, connection:
+            self.assertEqual(connection.execute('SELECT title FROM youtube_playlists').fetchone(), ('공부 음악',))
+            self.assertEqual(connection.execute('SELECT revision,deleted_at FROM youtube_playlists').fetchone(), (2,'2026-10-10T00:00:00Z'))
+            self.assertEqual(connection.execute('SELECT operation,previous_title,title FROM youtube_playlist_history ORDER BY revision').fetchall(), [('create','','Original'),('rename','Original','공부 음악'),('archive','공부 음악','공부 음악')])
+            self.assertEqual(connection.execute('SELECT job_id,position FROM youtube_playlist_items').fetchone(), ('retained-job',7))
+            self.assertEqual(connection.execute('SELECT version FROM youtube_playlist_versions').fetchone(), (3,))
+            self.assertEqual(connection.execute("SELECT metadata_version,channel_id,channel_name,avatar,avatar_error FROM youtube_downloads WHERE id='captured'").fetchone(),(1,'UC'+'a'*22,'Historical channel','YouTube/captured/.keivotos/channel-avatar.png',''))
+            self.assertEqual(connection.execute('SELECT directory FROM youtube_channel_folders').fetchone(),('YouTube/Historical channel [stable-id]',))
+            self.assertEqual(connection.execute("SELECT layout_version,bundle_path,manifest_sha256 FROM youtube_downloads WHERE id='captured'").fetchone(),(1,'YouTube/Historical channel [stable-id]/Saved [item-id]','a'*64))
+            self.assertEqual(connection.execute('SELECT value FROM marker').fetchone(), ('user-original',))
+        self.assertEqual(self.external_image.read_bytes(), b'original-image-must-stay')
 
     def test_missing_optional_artifacts_are_reported_without_creating_them(self) -> None:
         self.data_db.unlink()  # Disposable fixture only.

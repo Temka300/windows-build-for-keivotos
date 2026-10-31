@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
 from modules.danbooru.models import HomeCoverCandidate, HomeImageRail, HomeImageRailItem, HomeImageRails, HomeTagInfo, HomeTags
@@ -14,6 +15,7 @@ __all__ = [
     "HOME_IMAGE_RAIL_CATEGORIES",
     "HOME_TAGS_CACHE",
     "HOME_IMAGE_RAILS_CACHE",
+    "home_cache_key",
     "home_cache_get",
     "home_cache_set",
     "clear_home_caches",
@@ -35,6 +37,8 @@ HOME_IMAGE_RAIL_CATEGORIES = [
 ]
 HOME_TAGS_CACHE: dict[tuple[Any, ...], tuple[float, HomeTags]] = {}
 HOME_IMAGE_RAILS_CACHE: dict[tuple[Any, ...], tuple[float, HomeImageRails]] = {}
+_HOME_CACHE_LOCK = RLock()
+_home_cache_state: tuple[Any, ...] | None = None
 HOME_COVER_CANDIDATE_LIMIT = 6
 HOME_COVER_ASPECT_ORDER_SQL = """
     CASE
@@ -49,6 +53,37 @@ HOME_COVER_ASPECT_ORDER_SQL = """
         ELSE ABS((1.0 * p.width / p.height) - 1.7777778)
     END ASC
 """
+
+
+def _database_stamp(path: Path) -> tuple[Any, ...]:
+    facts: list[Any] = [str(path)]
+    # WAL commits need not touch the main SQLite file until checkpointing.
+    # Read only cheap database facts; do not open or scan media/sidecars.
+    for candidate in (path, Path(str(path) + "-wal")):
+        try:
+            stat = candidate.stat()
+            facts.append((stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
+        except FileNotFoundError:
+            facts.append(None)
+        except OSError:
+            # An unreadable state is never permission to reuse an old result.
+            facts.append(("unreadable", object()))
+    return tuple(facts)
+
+
+def home_cache_key(*query: Any) -> tuple[Any, ...]:
+    from config import DATA_DB_PATH, USER_DB_PATH
+
+    global _home_cache_state
+    state = (_database_stamp(Path(DATA_DB_PATH)), _database_stamp(Path(USER_DB_PATH)))
+    with _HOME_CACHE_LOCK:
+        if state != _home_cache_state:
+            HOME_TAGS_CACHE.clear()
+            HOME_IMAGE_RAILS_CACHE.clear()
+            _home_cache_state = state
+    # Include the state in the key as well: an older in-flight query may finish
+    # after invalidation, but its result cannot become the new state's hit.
+    return (*query, state)
 
 
 def home_cache_get(cache: dict[tuple[Any, ...], tuple[float, Any]], key: tuple[Any, ...]) -> Any | None:
@@ -68,8 +103,11 @@ def home_cache_set(cache: dict[tuple[Any, ...], tuple[float, Any]], key: tuple[A
 
 
 def clear_home_caches() -> None:
-    HOME_TAGS_CACHE.clear()
-    HOME_IMAGE_RAILS_CACHE.clear()
+    global _home_cache_state
+    with _HOME_CACHE_LOCK:
+        HOME_TAGS_CACHE.clear()
+        HOME_IMAGE_RAILS_CACHE.clear()
+        _home_cache_state = None
 
 
 def home_rating_clause(rating: str | None, alias: str = "p") -> tuple[str, list[Any]]:

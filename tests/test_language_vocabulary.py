@@ -42,7 +42,7 @@ def payload(**changes):
     return {'request_id': str(uuid4()), 'korean':'안녕', 'pronunciation':'annyeong', 'english':'hello', **changes}
 
 
-def request(method='GET', data=None, query='', *, drop_reply=False):
+def request(method='GET', data=None, query='', *, drop_reply=False, path='/api/language/vocabulary'):
     app = FastAPI()
     app.include_router(router.router)
     async def run():
@@ -53,7 +53,6 @@ def request(method='GET', data=None, query='', *, drop_reply=False):
             messages.append(message)
             if drop_reply and message['type']=='http.response.body':
                 raise ConnectionError('Generated loss of committed response')
-        path='/api/language/vocabulary'
         await app({'type':'http','asgi':{'version':'3.0'},'http_version':'1.1','method':method,
                    'scheme':'http','path':path,'raw_path':path.encode(),'root_path':'',
                    'query_string':query.encode(),'headers':[(b'content-type',b'application/json')],
@@ -124,7 +123,7 @@ def test_invalid_payload_never_changes_saved_words(store,changes):
     assert request()[1]=={'items':[entry],'total':1}
 
 
-def test_save_token_is_required_and_no_delete_or_update_api_exists(store):
+def test_save_token_is_required_and_base_route_rejects_delete_and_put(store):
     data=payload();del data['request_id']
     assert request('POST',data)[0]==422
     entry=request('POST',payload())[1]
@@ -284,3 +283,153 @@ def test_additive_schema_preserves_old_study_and_unknown_personal_tables(tmp_pat
         assert study.read(connection).model_dump()=={'category':'hours','answer_language':'korean','minimum':2,'maximum':12}
         assert vocabulary.listing(connection,0,50).items==[word]
         assert connection.execute('SELECT content FROM old_personal_annotations').fetchone()[0]=='preserve every old row'
+
+
+def version_path(entry):return '/api/language/vocabulary/'+str(entry['id'])
+
+
+def edit_payload(revision=0,**changes):return {**payload(**changes),'revision':revision}
+
+
+def test_edit_archive_preserve_originals_identity_order_and_old_create_receipts(store):
+    original=payload(korean='  친구\n',english=' Friend 🐾 ')
+    first=request('POST',original)[1];duplicate=request('POST',{**original,'request_id':str(uuid4())})[1]
+    with store[1]() as db:before=[dict(row) for row in db.execute('SELECT rowid,* FROM language_vocabulary')]
+    data=edit_payload(korean=unicodedata.normalize('NFD',' 한글 '),pronunciation=' exact\tmanual ',english=' changed\nmeaning ')
+    status,edited,_=request('PUT',data,path=version_path(first));assert status==200
+    assert edited['id']==first['id'] and edited['created_at']==first['created_at'] and edited['revision']==1 and not edited['archived']
+    assert all(edited[key]==data[key] for key in ('korean','pronunciation','english'))
+    projected={key:edited[key] for key in first}
+    assert request()[1]=={'items':[duplicate,projected],'total':2}
+    assert request('POST',original)[1]==first
+    deletion={'request_id':str(uuid4()),'revision':1}
+    status,removed,_=request('POST',deletion,path=version_path(first)+'/archive');assert status==200 and removed['archived'] and removed['revision']==2
+    assert request()[1]=={'items':[duplicate],'total':1}
+    assert request('POST',original)[1]==first and request()[1]['total']==1
+    assert request(path=version_path(first))[1]==removed
+    with store[1]() as db:
+        assert [dict(row) for row in db.execute('SELECT rowid,* FROM language_vocabulary')]==before
+        assert [row['kind'] for row in db.execute('SELECT * FROM language_vocabulary_revisions ORDER BY revision')]==['edit','archive']
+        assert db.execute('SELECT value FROM precious').fetchone()[0]=='original personal data'
+
+
+def test_mutation_receipts_replay_exact_prior_outcome_after_later_changes(store):
+    first=request('POST',payload())[1];path=version_path(first)
+    data=edit_payload(english='first edit');edited=request('PUT',data,path=path)[1]
+    newer=request('PUT',edit_payload(1,english='newer edit'),path=path)[1]
+    assert request('PUT',data,path=path)[1]==edited
+    assert request(path=path)[1]==newer
+    deletion={'request_id':str(uuid4()),'revision':2}
+    removed=request('POST',deletion,path=path+'/archive')[1]
+    assert request('POST',deletion,path=path+'/archive')[1]==removed
+    assert request('PUT',data,path=path)[1]==edited and request()[1]['total']==0
+    for changes in ({'english':'different'},{'revision':1},{'pronunciation':'different'}):
+        assert request('PUT',{**data,**changes},path=path)[0]==409
+    assert request('POST',{'request_id':data['request_id'],'revision':0},path=path+'/archive')[0]==409
+    other=request('POST',payload())[1]
+    assert request('PUT',data,path=version_path(other))[0]==409
+    assert request('POST',{key:value for key,value in data.items() if key!='revision'})[0]==409
+    with store[1]() as db:assert db.execute('SELECT count(*) FROM language_vocabulary_revisions').fetchone()[0]==3
+
+
+@pytest.mark.parametrize('revision',[-1,True,1.5,'0',None,9007199254740991])
+def test_edit_archive_revision_bounds_preserve_entries(store,revision):
+    first=request('POST',payload())[1];path=version_path(first)
+    assert request('PUT',edit_payload(revision),path=path)[0]==422
+    assert request('POST',{'request_id':str(uuid4()),'revision':revision},path=path+'/archive')[0]==422
+    assert request()[1]=={'items':[first],'total':1}
+
+
+def test_stale_or_archived_changes_and_original_create_tokens_are_refused(store):
+    original=payload();first=request('POST',original)[1];path=version_path(first)
+    assert request('PUT',edit_payload(request_id=original['request_id']),path=path)[0]==409
+    edited=request('PUT',edit_payload(),path=path)[1]
+    assert request('PUT',edit_payload(),path=path)[0]==409
+    assert request('POST',{'request_id':str(uuid4()),'revision':0},path=path+'/archive')[0]==409
+    assert request(path=path)[1]==edited
+    request('POST',{'request_id':str(uuid4()),'revision':1},path=path+'/archive')
+    assert request('PUT',edit_payload(2),path=path)[0]==409
+    assert request('POST',{'request_id':str(uuid4()),'revision':2},path=path+'/archive')[0]==409
+    unknown='/api/language/vocabulary/'+str(uuid4())
+    assert request(path=unknown)[0]==404 and request('PUT',edit_payload(),path=unknown)[0]==404
+    assert request('POST',{'request_id':str(uuid4()),'revision':0},path=unknown+'/archive')[0]==404
+    assert request(path='/api/language/vocabulary/not-a-uuid')[0]==422
+
+
+@pytest.mark.parametrize('kind',['edit','archive'])
+def test_lost_mutation_reply_and_sqlite_lock_retry_one_revision(store,kind):
+    first=request('POST',payload())[1];path=version_path(first)+('/archive' if kind=='archive' else '')
+    data=edit_payload() if kind=='edit' else {'request_id':str(uuid4()),'revision':0}
+    method='PUT' if kind=='edit' else 'POST'
+    with closing(sqlite3.connect(store[0])) as blocker:
+        blocker.execute('BEGIN IMMEDIATE');assert request(method,data,path=path)[0]==503;blocker.rollback()
+    with pytest.raises(ConnectionError,match='Generated loss'):request(method,data,path=path,drop_reply=True)
+    receipt=request(method,data,path=path)[1];assert receipt['revision']==1 and receipt['archived']==(kind=='archive')
+    assert request(method,data,path=path)[1]==receipt
+    with store[1]() as db:assert db.execute('SELECT count(*) FROM language_vocabulary_revisions').fetchone()[0]==1
+
+
+@pytest.mark.parametrize('identical',[True,False])
+def test_concurrent_edits_serialize_receipts_and_reject_stale_writer(store,identical):
+    first=request('POST',payload())[1];barrier=Barrier(2);data=edit_payload()
+    def change(number):
+        with closing(sqlite3.connect(store[0],timeout=5)) as db:
+            db.row_factory=sqlite3.Row;barrier.wait(timeout=5)
+            try:return vocabulary.edit(db,first['id'],vocabulary.VocabularyEdit(**(data if identical else edit_payload(english=str(number)))))
+            except vocabulary.RequestConflict:return 'conflict'
+    with ThreadPoolExecutor(max_workers=2) as executor:results=list(executor.map(change,[1,2]))
+    assert results[0]==results[1] if identical else results.count('conflict')==1
+    with store[1]() as db:assert db.execute('SELECT count(*) FROM language_vocabulary_revisions').fetchone()[0]==1
+
+
+def test_mutation_commit_failure_rolls_back_and_actual_process_restart_preserves_history(store,monkeypatch):
+    first=request('POST',payload())[1];data=edit_payload(english='Restarted exact meaning');path=version_path(first)
+    @contextmanager
+    def fail():
+        with store[1]() as db:
+            class Wrapper:
+                execute=db.execute
+                rollback=db.rollback
+                def commit(self):raise sqlite3.OperationalError('Generated edit commit failure')
+            yield Wrapper()
+    with monkeypatch.context() as m:
+        m.setattr(router,'get_user_db',fail);assert request('PUT',data,path=path)[0]==503
+    assert request(path=path)[1]['revision']==0
+    edited=request('PUT',data,path=path)[1]
+    code="""import json,sqlite3,sys
+sys.path.insert(0,sys.argv[2])
+from modules.language import vocabulary
+db=sqlite3.connect(sys.argv[1]);db.row_factory=sqlite3.Row
+saved=vocabulary.edit(db,sys.argv[3],vocabulary.VocabularyEdit(**json.loads(sys.argv[4])))
+print(json.dumps(saved.model_dump(mode='json')))
+"""
+    result=subprocess.run([sys.executable,'-c',code,str(store[0]),str(ROOT/'backend'),first['id'],json.dumps(data)],capture_output=True,text=True,check=True)
+    assert json.loads(result.stdout)==edited
+
+
+def test_new_routes_refuse_disabled_owner_before_opening_storage(store,monkeypatch):
+    first=request('POST',payload())[1];path=version_path(first)
+    monkeypatch.setattr(router,'require_enabled',lambda slug:(_ for _ in ()).throw(RuntimeError('Language disabled')))
+    monkeypatch.setattr(router,'get_user_db',lambda:pytest.fail('Disabled owner opened vocabulary storage'))
+    assert request(path=path)[0]==409
+    assert request('PUT',edit_payload(),path=path)[0]==409
+    assert request('POST',{'request_id':str(uuid4()),'revision':0},path=path+'/archive')[0]==409
+
+
+def test_process_interruption_before_edit_commit_keeps_old_text_and_retry_identity(store):
+    first=request('POST',payload())[1];data=edit_payload(english='After an interrupted edit')
+    code="""import json,os,sqlite3,sys
+sys.path.insert(0,sys.argv[2])
+from modules.language import vocabulary
+db=sqlite3.connect(sys.argv[1]);db.row_factory=sqlite3.Row
+class Crash:
+ execute=db.execute
+ rollback=db.rollback
+ def commit(self):os._exit(74)
+vocabulary.edit(Crash(),sys.argv[3],vocabulary.VocabularyEdit(**json.loads(sys.argv[4])))
+"""
+    crash=subprocess.run([sys.executable,'-c',code,str(store[0]),str(ROOT/'backend'),first['id'],json.dumps(data)],capture_output=True,text=True)
+    assert crash.returncode==74,crash.stderr
+    assert request(path=version_path(first))[1]['revision']==0
+    assert request()[1]=={'items':[first],'total':1}
+    assert request('PUT',data,path=version_path(first))[1]['revision']==1

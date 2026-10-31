@@ -116,3 +116,12 @@ def extension_for(file_name: str, media_type: str) -> str:
         return suffix
     subtype = media_type.split("/", 1)[-1].strip().lower()
     return {"jpeg": "jpg", "quicktime": "mov", "x-matroska": "mkv"}.get(subtype, subtype)
+
+
+def resolve_stored_attachment(stored, connection, suite_home):
+    """Read canonical preserved bytes only when the original store is unavailable."""
+    ext=extension_for(stored.file_name,stored.media_type)
+    original=resolve_attachment(stored.stored_root,stored.content_hash,ext)
+    if original.is_file():return original
+    from services.asset_preservation import resolve
+    return resolve(connection,suite_home,'files','attachment:'+str(stored.id),expected_source=original) or original

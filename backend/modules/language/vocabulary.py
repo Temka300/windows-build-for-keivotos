@@ -32,11 +32,37 @@ class VocabularyPage(BaseModel):
     total: int = Field(ge=0)
 
 
+class VocabularyMutation(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    request_id: UUID
+    revision: int = Field(ge=0, le=9007199254740990, strict=True)
+
+
+class VocabularyEdit(VocabularyContent, VocabularyMutation):
+    pass
+
+
+class VocabularyVersion(VocabularyEntry):
+    revision: int = Field(ge=0)
+    archived: bool
+
+
 class RequestConflict(ValueError):
     """The same save token cannot authorize different authored text."""
 
 
+class EntryMissing(ValueError):
+    pass
+
+
 _COLUMNS = 'id,korean,pronunciation,english,created_at'
+_CURRENT = '''v.id,v.created_at,coalesce(r.revision,0) AS revision,
+    coalesce(r.kind='archive',0) AS archived,
+    CASE WHEN r.revision IS NULL THEN v.korean ELSE r.korean END AS korean,
+    CASE WHEN r.revision IS NULL THEN v.pronunciation ELSE r.pronunciation END AS pronunciation,
+    CASE WHEN r.revision IS NULL THEN v.english ELSE r.english END AS english'''
+_LATEST = '''FROM language_vocabulary v LEFT JOIN language_vocabulary_revisions r
+    ON r.entry_id=v.id AND r.revision=(SELECT max(revision) FROM language_vocabulary_revisions WHERE entry_id=v.id)'''
 
 
 def _entry(row) -> VocabularyEntry:
@@ -47,9 +73,10 @@ def listing(connection, offset: int, limit: int) -> VocabularyPage:
     # Count and rows share a read snapshot, even if another process saves a word.
     with connection:
         connection.execute('BEGIN')
-        total = connection.execute('SELECT COUNT(*) AS total FROM language_vocabulary').fetchone()['total']
-        rows = connection.execute(f'SELECT {_COLUMNS} FROM language_vocabulary '
-                                  'ORDER BY rowid DESC LIMIT ? OFFSET ?', (limit, offset)).fetchall()
+        active=" WHERE r.kind IS NULL OR r.kind!='archive'"
+        total = connection.execute('SELECT COUNT(*) AS total '+_LATEST+active).fetchone()['total']
+        rows = connection.execute('SELECT '+_CURRENT+' '+_LATEST+active+
+                                  ' ORDER BY v.rowid DESC LIMIT ? OFFSET ?', (limit, offset)).fetchall()
         return VocabularyPage(items=[_entry(row) for row in rows], total=total)
 
 
@@ -57,6 +84,8 @@ def create(connection, payload: VocabularyCreate) -> VocabularyEntry:
     connection.execute('BEGIN IMMEDIATE')
     try:
         token = str(payload.request_id)
+        if connection.execute('SELECT 1 FROM language_vocabulary_revisions WHERE request_id=?',(token,)).fetchone():
+            raise RequestConflict('This request already changed a saved vocabulary entry.')
         row = connection.execute(f'SELECT {_COLUMNS} FROM language_vocabulary WHERE request_id=?',
                                  (token,)).fetchone()
         if row is not None:
@@ -75,3 +104,48 @@ def create(connection, payload: VocabularyCreate) -> VocabularyEntry:
     except Exception:
         connection.rollback()
         raise
+
+
+def read(connection, identity: UUID) -> VocabularyVersion:
+    row=connection.execute('SELECT '+_CURRENT+' '+_LATEST+' WHERE v.id=?',(str(identity),)).fetchone()
+    if row is None:raise EntryMissing('This vocabulary entry is unavailable.')
+    return VocabularyVersion(**dict(row))
+
+
+def _change(connection, identity: UUID, payload: VocabularyMutation, kind: str) -> VocabularyVersion:
+    connection.execute('BEGIN IMMEDIATE')
+    try:
+        identity=str(identity);token=str(payload.request_id)
+        receipt=connection.execute('SELECT * FROM language_vocabulary_revisions WHERE request_id=?',(token,)).fetchone()
+        if receipt is not None:
+            same=(receipt['entry_id']==identity and receipt['kind']==kind and receipt['revision']==payload.revision+1)
+            if kind=='edit':same=same and all(receipt[key]==getattr(payload,key) for key in ('korean','pronunciation','english'))
+            if not same:raise RequestConflict('This request already saved different vocabulary changes.')
+            original=connection.execute('SELECT created_at FROM language_vocabulary WHERE id=?',(identity,)).fetchone()
+            result=VocabularyVersion(id=identity,created_at=original['created_at'],revision=receipt['revision'],
+                archived=kind=='archive',**{key:receipt[key] for key in ('korean','pronunciation','english')})
+        else:
+            if connection.execute('SELECT 1 FROM language_vocabulary WHERE request_id=?',(token,)).fetchone():
+                raise RequestConflict('This request already created a vocabulary entry.')
+            current=read(connection,identity)
+            if current.archived or current.revision!=payload.revision:
+                raise RequestConflict('This entry changed or was deleted. Reload the saved entry before changing it.')
+            values={key:getattr(payload if kind=='edit' else current,key) for key in ('korean','pronunciation','english')}
+            connection.execute('INSERT INTO language_vocabulary_revisions '
+                '(entry_id,revision,request_id,kind,korean,pronunciation,english) VALUES(?,?,?,?,?,?,?)',
+                (identity,current.revision+1,token,kind,values['korean'],values['pronunciation'],values['english']))
+            result=VocabularyVersion(id=identity,created_at=current.created_at,revision=current.revision+1,
+                archived=kind=='archive',**values)
+        connection.commit()
+        return result
+    except Exception:
+        connection.rollback()
+        raise
+
+
+def edit(connection,identity:UUID,payload:VocabularyEdit)->VocabularyVersion:
+    return _change(connection,identity,payload,'edit')
+
+
+def archive(connection,identity:UUID,payload:VocabularyMutation)->VocabularyVersion:
+    return _change(connection,identity,payload,'archive')

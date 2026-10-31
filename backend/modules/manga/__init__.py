@@ -1,11 +1,22 @@
-"""Basic local Manga: shared Files discovery, no separate durable reading state."""
+"""Basic local Manga: shared Files discovery, personal progress in shared user data."""
 from pathlib import Path
 from module_descriptor import ModuleDescriptor
 
 
+def publish(connection):
+    from modules.manga.user_schema import publish as publish_schema
+    publish_schema(connection)
+
+
+def _schema():
+    from modules.manga.user_schema import SCHEMA
+    return SCHEMA
+
+
 def _routers():
     from modules.manga.router import router
-    return [router]
+    from modules.manga.categories import router as categories_router
+    return [router, categories_router]
 
 
 def adopt(source_id: str) -> dict:
@@ -34,9 +45,28 @@ def release(source_id: str, forget: bool = False) -> dict:
 
 def descriptor(suite_home: Path, version: str) -> ModuleDescriptor:
     return ModuleDescriptor(
+        portable_provider=_portable,
+        index_rescan_hook=_rescan_metadata,
+        transfer_provider=_transfer,
         slug="manga", name="Manga", description="Read manga from your local folders.",
         home=suite_home / "modules" / "manga", database=suite_home / "base" / "files.sqlite",
         credentials=None, api_prefix="/api/manga", log_prefix="manga",
         user_agent=f"Keivotos/{version} (Manga)", disableable=True, is_base=False,
-        router_provider=_routers, adopt_hook=adopt, release_hook=release,
+        router_provider=_routers, adopt_hook=adopt, release_hook=release, shared_folder_relocation=True,
+        user_schema_provider=_schema, publish_hook=publish,
     )
+
+
+def _portable():
+    from modules.manga.portable import contribution
+    return contribution()
+
+
+def _transfer():
+    from modules.manga.transfer import contribution
+    return contribution()
+
+
+def _rescan_metadata(source_id):
+    from modules.manga.metadata import after_rescan
+    return after_rescan(source_id)

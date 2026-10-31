@@ -1,6 +1,8 @@
 """Experimental YouTube acquisition; originals belong to registered Files folders."""
 from pathlib import Path
 from module_descriptor import ModuleDescriptor
+from modules.youtube.user_schema import SCHEMA as PERSONAL_SCHEMA
+from modules.youtube.user_schema import migrate as migrate_personal
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS youtube_preferences (
@@ -29,8 +31,17 @@ def _tasks():
     return [('youtube-downloads', run_queue())]
 
 
+def _file_metadata(context):
+    from modules.youtube.metadata import file_metadata
+    exists=context.user_connection.execute("SELECT 1 FROM sqlite_master WHERE name='kv_operational_migrations'").fetchone()
+    migrated=exists and context.user_connection.execute("SELECT 1 FROM kv_operational_migrations WHERE owner='youtube'").fetchone()
+    return file_metadata(context,use_catalog=bool(migrated))
+
+
 def _publish(connection):
-    connection.executescript(SCHEMA)
+    connection.executescript(SCHEMA + PERSONAL_SCHEMA)
+    connection.execute('BEGIN IMMEDIATE')
+    migrate_personal(connection)
     columns={row[0] if not isinstance(row,dict) else row['name']
              for row in connection.execute('SELECT name FROM pragma_table_info(\'youtube_downloads\')')}
     for name in ('retry_of','superseded_by','failure_phase'):
@@ -40,7 +51,9 @@ def _publish(connection):
 
 
 def _startup():
-    from modules.youtube.jobs import recover
+    from modules.youtube.jobs import recover,get_jobs_db
+    from services.download_controls import recover_workers
+    with get_jobs_db() as db:recover_workers(db,'youtube')
     recover()
 
 
@@ -70,9 +83,34 @@ def release(source_id: str, forget: bool = False) -> dict:
 
 def descriptor(suite_home: Path, version: str):
     return ModuleDescriptor(
+        portable_provider=_portable,
+        download_history_provider=_download_history,
+        download_control_provider=_download_controls,
+        transfer_provider=_transfer,
         slug='youtube', name='YouTube', description='Download videos to your local folders.',
         experimental=True, home=suite_home/'modules/youtube', database=suite_home/'base/files.sqlite',
         credentials=None, api_prefix='/api/youtube', log_prefix='youtube',
         user_agent=f'Keivotos/{version} (YouTube)', disableable=True, is_base=False,
-        user_schema_provider=lambda: SCHEMA, publish_hook=_publish, router_provider=_routers,
-        adopt_hook=adopt, release_hook=release, startup_hook=_startup, background_tasks_hook=_tasks)
+        user_schema_provider=lambda: SCHEMA + PERSONAL_SCHEMA, publish_hook=_publish, router_provider=_routers,
+        adopt_hook=adopt, release_hook=release, shared_folder_relocation=True, startup_hook=_startup, background_tasks_hook=_tasks,
+        file_metadata_provider=_file_metadata)
+
+
+def _portable():
+    from modules.youtube.portable import contribution
+    return contribution()
+
+
+def _transfer():
+    from modules.youtube.transfer import contribution
+    return contribution()
+
+
+def _download_history(context):
+    from modules.youtube.downloads import contribute
+    return contribute(context)
+
+
+def _download_controls():
+    from modules.youtube.downloads import controls
+    return controls()

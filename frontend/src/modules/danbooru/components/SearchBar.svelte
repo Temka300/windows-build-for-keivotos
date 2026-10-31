@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { activeTags } from '../stores';
+  import { onDestroy } from 'svelte';
+  import { activeTags, activeCollectionId, browseTagSelection, viewMode } from '../stores';
   import { danbooruApi as api } from '../api';
   import { type TagInfo } from '../apiTypes';
 
@@ -9,6 +10,10 @@
   let showSuggestions = false;
   let highlightedSuggestionIndex = -1;
   let debounceTimer: ReturnType<typeof setTimeout>;
+  let blurTimer: ReturnType<typeof setTimeout>;
+  let suggestionRequest: AbortController | null = null;
+  let suggestionSerial = 0, alive = true, composing = false, focused = false;
+  onDestroy(() => { alive = false; cancelSuggestions(); clearTimeout(blurTimer); });
 
   const tagPrefixes = new Set(['artist', 'character', 'copyright', 'general', 'meta', 'unknown']);
   const idPrefixes = new Set(['id', 'post', 'post_id', 'danbooru', 'danbooru_id', 'danbooru_post_id']);
@@ -72,32 +77,46 @@
     return `${isExclude ? '-' : ''}${tagName}`;
   }
 
+  function cancelSuggestions(hide = true) {
+    clearTimeout(debounceTimer); suggestionRequest?.abort(); suggestionRequest = null; suggestionSerial++;
+    if (hide) { suggestions = []; showSuggestions = false; highlightedSuggestionIndex = -1; }
+  }
+
   function onInput() {
-    clearTimeout(debounceTimer);
+    cancelSuggestions();
+    if (composing || !focused) return;
+    const value = inputValue, serial = suggestionSerial;
     debounceTimer = setTimeout(async () => {
-      const words = normalizeSearchTerms(inputValue).trim().split(/\s+/);
-      const last = words[words.length - 1] || '';
-      const query = pendingSuggestionQuery(last);
-      if (query) {
-        try {
-          suggestions = await api.suggestTags(query);
-          showSuggestions = suggestions.length > 0;
-          highlightedSuggestionIndex = suggestions.length > 0 ? 0 : -1;
-        } catch {
-          suggestions = [];
-          highlightedSuggestionIndex = -1;
-        }
-      } else {
-        suggestions = [];
-        showSuggestions = false;
-        highlightedSuggestionIndex = -1;
+      const words = normalizeSearchTerms(value).trim().split(/\s+/);
+      const query = pendingSuggestionQuery(words[words.length - 1] || '');
+      if (!query || !alive || !focused || composing || serial !== suggestionSerial) return;
+      const current = new AbortController(); suggestionRequest = current;
+      try {
+        const result = await api.suggestTags(query, undefined, current.signal);
+        if (!alive || !focused || composing || current.signal.aborted || serial !== suggestionSerial || value !== inputValue) return;
+        suggestions = result; showSuggestions = result.length > 0;
+        highlightedSuggestionIndex = result.length > 0 ? 0 : -1;
+      } catch {
+        if (!alive || current.signal.aborted || serial !== suggestionSerial) return;
+        suggestions = []; showSuggestions = false; highlightedSuggestionIndex = -1;
       }
     }, 250);
   }
 
+  function openSearchResults() {
+    if (['home', 'profile', 'collections', 'timelapse', 'challenges'].includes($viewMode)) {
+      browseTagSelection.set(null); activeCollectionId.set(null); viewMode.set('gallery');
+    }
+  }
+
+  function onFocus() { focused = true; clearTimeout(blurTimer); onInput(); }
+  function beginComposition() { composing = true; cancelSuggestions(); }
+  function endComposition() { composing = false; onInput(); }
+
   function commitTerms(text: string) {
     const terms = normalizeSearchTerms(text).trim().split(/\s+/).filter(Boolean);
-    if (terms.length === 0) return;
+    if (terms.length === 0 || composing) return;
+    cancelSuggestions();
     activeTags.update(existing => {
       const combined = [...existing];
       for (const t of terms) {
@@ -105,6 +124,7 @@
       }
       return combined;
     });
+    openSearchResults();
     inputValue = '';
     suggestions = [];
     showSuggestions = false;
@@ -112,6 +132,8 @@
   }
 
   function selectSuggestion(tag: TagInfo) {
+    if (composing) return;
+    cancelSuggestions();
     const words = inputValue.trim().split(/\s+/);
     const last = words.pop() || '';
     const pending = words.join(' ');
@@ -119,6 +141,7 @@
     activeTags.update(existing =>
       existing.includes(termForSuggestion(last, tag.name)) ? existing : [...existing, termForSuggestion(last, tag.name)]
     );
+    openSearchResults();
     inputValue = '';
     suggestions = [];
     showSuggestions = false;
@@ -126,6 +149,7 @@
   }
 
   function onKeydown(e: KeyboardEvent) {
+    if (composing || e.isComposing || e.keyCode === 229) return;
     if (showSuggestions && suggestions.length > 0 && e.key === 'ArrowDown') {
       e.preventDefault();
       highlightedSuggestionIndex = (highlightedSuggestionIndex + 1) % suggestions.length;
@@ -148,10 +172,7 @@
       }
       commitTerms(inputValue);
     }
-    if (e.key === 'Escape') {
-      showSuggestions = false;
-      highlightedSuggestionIndex = -1;
-    }
+    if (e.key === 'Escape') cancelSuggestions();
   }
 
   function isTextEntryTarget(target: EventTarget | null): boolean {
@@ -161,7 +182,7 @@
   }
 
   function onWindowKeydown(e: KeyboardEvent) {
-    if (isTextEntryTarget(e.target) || e.ctrlKey || e.altKey || e.metaKey) return;
+    if (composing || e.isComposing || e.keyCode === 229 || isTextEntryTarget(e.target) || e.ctrlKey || e.altKey || e.metaKey) return;
     if (e.key.length !== 1) return;
 
     e.preventDefault();
@@ -175,7 +196,8 @@
   }
 
   function onBlur() {
-    setTimeout(() => { showSuggestions = false; }, 200);
+    focused = false; cancelSuggestions(false); clearTimeout(blurTimer);
+    blurTimer = setTimeout(() => { showSuggestions = false; }, 200);
   }
 
   const categoryColors: Record<string, string> = {
@@ -197,7 +219,9 @@
     on:input={onInput}
     on:keydown={onKeydown}
     on:blur={onBlur}
-    on:focus={onInput}
+    on:focus={onFocus}
+    on:compositionstart={beginComposition}
+    on:compositionend={endComposition}
     placeholder="Search tags, filenames, IDs, size, or shape..."
     class="w-full bg-[#1e1e2e] border border-[#2a2a3a] rounded-lg px-3 py-1.5 text-sm text-gray-200 placeholder-gray-500 outline-none focus:border-purple-500 transition-colors"
   />

@@ -4,7 +4,7 @@ import shutil
 import sqlite3
 import sys
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -24,6 +24,9 @@ def _row_factory(cursor: sqlite3.Cursor, row: tuple) -> dict:
 class FolderRootIdentityTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = ROOT / "tests" / ".tmp-folder-roots"
+        jobs_patch=patch("config.JOBS_DB_PATH",self.temp/"state/jobs.sqlite")
+        jobs_patch.start()
+        self.addCleanup(jobs_patch.stop)
         shutil.rmtree(self.temp, ignore_errors=True)
         self.temp.mkdir(parents=True)
         self.data_root = self.temp / "managed"
@@ -158,7 +161,10 @@ class FolderRootIdentityTests(unittest.TestCase):
             self.assertEqual(file_row["root_id"], "root-stable")
             self.assertEqual(file_row["relative_path"], "characters/sample.jpg")
             self.assertEqual(connection.execute("SELECT media_path FROM sync_manifest").fetchone()["media_path"], str(new_media.resolve()))
-            self.assertEqual(connection.execute("SELECT media_path FROM ingest_state").fetchone()["media_path"], str(new_media.resolve()))
+        with closing(sqlite3.connect(self.temp/"state/jobs.sqlite")) as state:
+            self.assertEqual(state.execute("SELECT media_path FROM ingest_state").fetchone()[0],str(new_media.resolve()))
+        with self.data_connection() as preserved:
+            self.assertEqual(preserved.execute("SELECT media_path FROM ingest_state").fetchone()["media_path"],str(old_media))
         with self.user_connection() as connection:
             for table in ("favorites", "collection_items", "user_image_tags", "image_views", "tag_removals"):
                 self.assertEqual(connection.execute(f"SELECT file_path FROM {table}").fetchone()["file_path"], str(new_media.resolve()))

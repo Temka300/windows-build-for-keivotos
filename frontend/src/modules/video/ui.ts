@@ -1,3 +1,4 @@
 import type { ModuleUiDescriptor } from '../registry';
-const descriptor: ModuleUiDescriptor = {slug:'video', iconSrc:null, drawerActions:[]};
+import {videoApi} from './api';
+const descriptor: ModuleUiDescriptor = {slug:'video', iconSrc:null, drawerActions:[], categories:videoApi.categories};
 export default descriptor;

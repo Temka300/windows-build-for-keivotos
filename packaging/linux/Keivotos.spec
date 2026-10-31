@@ -24,13 +24,14 @@ analysis = Analysis(
     binaries=[],
     datas=MODULE_METADATA + [
         (str(ROOT / "frontend" / "dist"), "frontend/dist"),
+        (str(ROOT / "assets" / "branding" / "keivotos" / "keivotos-icon-256.png"), "assets/branding/keivotos"),
         *((str(ROOT / path), str(Path(path).parent)) for _label, path in PLAN.helpers),
         (str(ROOT / "config.json"), "."),
     ],
     hiddenimports=[*PLAN.hidden_imports, *MODULE_IMPORTS, *UVICORN_HIDDEN_IMPORTS],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[str(ROOT / "packaging" / "runtime_hooks" / "diagnostics.py")],
     excludes=["gallery_dl", "imageio_ffmpeg"],
     noarchive=False,
 )

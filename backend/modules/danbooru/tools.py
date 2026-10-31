@@ -7,6 +7,8 @@ The task registry and its lock aliases retain their original object identity.
 """
 from __future__ import annotations
 
+from services import operation_diagnostics as diagnostics
+from services.tool_diagnostics import ToolEvidence
 import copy
 import base64
 import json
@@ -16,6 +18,10 @@ import subprocess
 import sys
 import threading
 import traceback
+import time
+import asyncio
+from modules.danbooru import operational_state
+from services import operations
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable
@@ -28,6 +34,7 @@ from config import (
     SCAN_FOLDERS,
     SIDECAR_DIR,
     USER_DB_PATH,
+    JOBS_DB_PATH,
 )
 import maintenance
 from maintenance import (
@@ -47,12 +54,19 @@ TOOL_WORKING_DIRECTORY = SCRIPT_PATH.parent.parent
 
 _running_tasks: dict[str, dict[str, Any]] = {}
 _running_processes: dict[str, subprocess.Popen[str]] = {}
+_running_threads: dict[str, threading.Thread] = {}
+_interrupted_tools: set[str] = set()
 _logger = logging.getLogger("keivotos.danbooru.jobs")
 def tool_task_snapshot(tool_id: str) -> dict[str, Any] | None:
     """Return request-safe task state while the worker may still be updating it."""
     with _tool_state_lock:
         task = _running_tasks.get(tool_id)
-        return copy.deepcopy(task) if task is not None else None
+        result = copy.deepcopy(task) if task is not None else operational_state.snapshot(tool_id)
+        if result is not None and result.get("status") == "interrupted":
+            # Keep the existing API/UI failure vocabulary and retry affordance.
+            # The durable operation retains the distinct interruption outcome.
+            result.update(status="error", stage="Interrupted", cancellable=False)
+        return result
 
 
 def _tool_base_command() -> list[str]:
@@ -67,6 +81,7 @@ def _tool_base_command() -> list[str]:
         "--gallery-dl-dir", str(GALLERY_DL_DIR),
         "--sidecar-dir", str(SIDECAR_DIR),
         "--user-db", str(USER_DB_PATH),
+        "--jobs-db", str(JOBS_DB_PATH),
     ]
 
 
@@ -192,11 +207,33 @@ def _launch_tool(
                 "result_counts": {"matched": 0, "partial": 0, "no_match": 0, "error": 0},
             }
 
+    try:
+        run_id,attempt_token=operational_state.begin(tool_id,tool_commands,_running_tasks[tool_id])
+    except BaseException:
+        with _tool_state_lock:
+            _running_tasks.pop(tool_id,None)
+            if maintenance._active_tool_id==tool_id:maintenance._active_tool_id=None
+        raise
+    last_saved=0.0
+    def persist(force=False):
+        nonlocal last_saved
+        if not force and time.monotonic()-last_saved<.1:return
+        with _tool_state_lock:
+            task=copy.deepcopy(_running_tasks[tool_id])
+        operational_state.persist(run_id,attempt_token,task)
+        last_saved=time.monotonic()
+
     def _run():
+        terminal_status="interrupted"
         secrets: tuple[str, ...] = ()
         incomplete = False
+        evidence = None
         try:
-            child_environment = environment if environment is not None else credential_environment()
+            from config import SUITE_HOME
+            child_environment = diagnostics.worker_environment(environment if environment is not None else credential_environment(), profile=SUITE_HOME)
+            child_environment["KEIVOTOS_PIPELINE_START_GATE"]="1"
+            child_environment["KEIVOTOS_DANBOORU_OPERATION"]=json.dumps(
+                {"id":run_id,"token":attempt_token,"jobs":str(JOBS_DB_PATH)})
             username = child_environment.get("DANBOORU_USERNAME", "")
             api_key = child_environment.get("DANBOORU_API_KEY", "")
             secrets = (api_key,)
@@ -210,7 +247,7 @@ def _launch_tool(
                 with _tool_state_lock:
                     task = _running_tasks[tool_id]
                     if task["status"] == "cancelling":
-                        task["status"] = "cancelled"
+                        terminal_status = "cancelled"
                         _logger.info("%s: cancelled before the next step", tool_id)
                         return
                     stage = (
@@ -232,21 +269,48 @@ def _launch_tool(
                                 "current_file_status": None,
                             }
                         )
+                persist(True)
                 _logger.info("%s: %s", tool_id, stage)
+                if evidence is not None:
+                    evidence.finish(proc.returncode, outcome="completed-with-warnings" if incomplete else None, validation=True)
+                evidence = ToolEvidence("danbooru", cmd, destination=TOOL_WORKING_DIRECTORY, secrets=secrets, packages=("gallery-dl",))
                 proc = subprocess.Popen(
                     cmd,
                     cwd=str(TOOL_WORKING_DIRECTORY),
                     stdout=subprocess.PIPE,
+                    stdin=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
                     bufsize=1,
                     env=child_environment,
+                    **({"creationflags":subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
+                       if os.name=="nt" else {"start_new_session":True}),
                 )
                 with _tool_state_lock:
                     _running_processes[tool_id] = proc
+                    cancelled=_running_tasks[tool_id]["status"]=="cancelling"
+                with operational_state.database() as process_db:
+                    operations.register_process(process_db,'danbooru',run_id,proc.pid)
+                if cancelled:
+                    _cancel_tool(tool_id)
+                elif proc.stdin is not None:
+                    try:
+                        proc.stdin.write("start\n")
+                        proc.stdin.flush()
+                    except (BrokenPipeError,OSError):
+                        pass
+                if proc.stdin is not None:
+                    try:
+                        proc.stdin.close()
+                    except (BrokenPipeError, OSError):
+                        # A worker can exit before consuming its start gate.
+                        # Its exit status and structured results still decide
+                        # the outcome; closing that pipe must not replace them.
+                        pass
                 assert proc.stdout is not None
                 while True:
                     line = proc.stdout.readline()
+                    if line:evidence.output(line, "combined")
                     if not line:
                         break
                     if not line.startswith("FILE_STATUS:"):
@@ -259,6 +323,7 @@ def _launch_tool(
                                 "discover": "Finding files", "enrich": "Reading file information",
                                 "metadata": "Fetching Danbooru tags", "finalize": "Updating library",
                             }.get(value, value.replace("_", " ").title())
+                        persist(True)
                         continue
                     if line.startswith("PROGRESS:"):
                         parts = line.strip().split(":", 1)[1].split("/")
@@ -271,6 +336,7 @@ def _launch_tool(
                             else:
                                 with _tool_state_lock:
                                     _running_tasks[tool_id].update({"progress": progress, "total": total})
+                        persist()
                         continue
                     if line.startswith("FILE_STATUS:"):
                         try:
@@ -309,6 +375,7 @@ def _launch_tool(
                             level = logging.ERROR if status == "error" else logging.WARNING if status == "partial" else logging.INFO
                             _logger.log(level, "%s: %s | %s | %s", tool_id, filename,
                                         status, str(event.get("detail") or ""))
+                        persist()
                         continue
                     lines.append(line)
                     message = line.rstrip()
@@ -324,7 +391,8 @@ def _launch_tool(
                     _running_processes.pop(tool_id, None)
                     task = _running_tasks[tool_id]
                     if task["status"] == "cancelling":
-                        task.update({"status": "cancelled", "cancellable": False})
+                        terminal_status="cancelled"
+                        task.update({"cancellable": False})
                         _logger.info("%s: cancelled", tool_id)
                         return
                     if proc.returncode != 0:
@@ -332,10 +400,16 @@ def _launch_tool(
                             incomplete = True
                             _logger.warning("%s: some items need attention; preserving successful results", tool_id)
                             continue
-                        task.update({"status": "error", "output": "".join(lines), "cancellable": False})
+                        terminal_status="error"
+                        task.update({"output": "".join(lines), "cancellable": False})
                         _logger.error("%s: %s failed (exit %s); results: %s", tool_id,
                                       stage, proc.returncode, task["result_counts"])
                         return
+            with _tool_state_lock:
+                if _running_tasks[tool_id]["status"]=="cancelling":
+                    terminal_status="cancelled"
+                    _running_tasks[tool_id].update(cancellable=False)
+                    return
             if on_success is not None:
                 post_step_output = on_success()
                 if post_step_output:
@@ -344,9 +418,8 @@ def _launch_tool(
                     _logger.info("%s: %s", tool_id, post_step_output)
             clear_home_caches()
             with _tool_state_lock:
-                _running_tasks[tool_id].update(
-                    {"status": "partial" if incomplete else "done", "output": "".join(lines), "cancellable": False}
-                )
+                terminal_status="partial" if incomplete else "done"
+                _running_tasks[tool_id].update({"output": "".join(lines), "cancellable": False})
                 counts = dict(_running_tasks[tool_id]["result_counts"])
             _logger.info("%s: completed; results: %s", tool_id, counts)
         except Exception as exc:
@@ -354,14 +427,51 @@ def _launch_tool(
                           redact_log_text(traceback.format_exc(), secrets))
             with _tool_state_lock:
                 task = _running_tasks.setdefault(tool_id, {})
-                task.update({"status": "error", "output": redact_log_text(str(exc), secrets), "cancellable": False})
+                terminal_status="error"
+                task.update({"output": redact_log_text(str(exc), secrets), "cancellable": False})
         finally:
+            process=None
             with _tool_state_lock:
-                _running_processes.pop(tool_id, None)
-                if maintenance._active_tool_id == tool_id:
-                    maintenance._active_tool_id = None
+                process=_running_processes.get(tool_id)
+            if process is not None and process.poll() is None:
+                _cancel_tool(tool_id)
+                process.wait()
+            with _tool_state_lock:
+                if tool_id in _interrupted_tools and terminal_status=="cancelled":
+                    terminal_status="interrupted"
+                final=copy.deepcopy(_running_tasks[tool_id])
+                final.update(status=terminal_status,cancellable=False)
+            if evidence is not None:
+                evidence.finish(getattr(_running_processes.get(tool_id),"returncode",None),
+                    outcome={"done":"completed","partial":"completed-with-warnings","error":"failed"}.get(final["status"],final["status"]),
+                    reason="user_cancelled" if final["status"]=="cancelled" else None,
+                    validation=final["status"] in ("done","partial"))
+            try:
+                operational_state.persist(run_id,attempt_token,final)
+            except operations.StaleAttempt:
+                final.update(status="interrupted",cancellable=False)
+                _logger.warning("%s: obsolete attempt result ignored",tool_id)
+            except Exception:
+                final.update(status="error",cancellable=False)
+                _logger.exception("%s: could not save final operation state",tool_id)
+            finally:
+                # Expose completion only after durable acknowledgement and child
+                # drain. The next button click cannot race the old active flag.
+                with _tool_state_lock:
+                    _running_tasks[tool_id]=final
+                    _running_threads.pop(tool_id,None)
+                    _interrupted_tools.discard(tool_id)
+                    _running_processes.pop(tool_id,None)
+                    if maintenance._active_tool_id==tool_id:
+                        maintenance._active_tool_id=None
 
-    threading.Thread(target=_run, daemon=True).start()
+    def correlated_run():
+        with operations.bind("danbooru",run_id,attempt_token):
+            diagnostics.emit("danbooru","operation.attempt_started","Tool attempt started")
+            _run()
+    thread=threading.Thread(target=correlated_run,daemon=True)
+    with _tool_state_lock:_running_threads[tool_id]=thread
+    thread.start()
     return {"status": "started"}
 
 
@@ -382,5 +492,30 @@ def _cancel_tool(tool_id: str) -> dict[str, Any]:
                 check=False,
             )
         else:
-            process.terminate()
+            import signal
+            try:os.killpg(process.pid,signal.SIGKILL)
+            except ProcessLookupError:pass
     return {"status": "cancelling"}
+
+
+async def shutdown():
+    """Stop and join every owned runner before the module becomes disabled."""
+    with _tool_state_lock:
+        threads=list(_running_threads.items())
+    for tool_id,_thread in threads:
+        with _tool_state_lock:_interrupted_tools.add(tool_id)
+        _cancel_tool(tool_id)
+    for tool_id,thread in threads:
+        await asyncio.to_thread(thread.join,10)
+        if thread.is_alive():
+            raise RuntimeError('Danbooru worker did not drain: '+tool_id)
+    operational_state.recover()
+
+
+def cancel_download_attempt(tool_id,supervisor_pid):
+    """A Downloads row cannot cancel a later tool reusing the same tool ID."""
+    with _tool_state_lock:
+        process=_running_processes.get(tool_id)
+        if process is None or process.pid!=supervisor_pid or process.poll() is not None:
+            raise ValueError('Download tool already finished or changed')
+    return _cancel_tool(tool_id)

@@ -131,25 +131,13 @@ assert.match(config.home, /[/\\]keivotos-modularization-[^/\\]+[/\\]home$/);
 
   await settings.getByRole('button',{name:'Back up now',exact:true}).click();
   await settings.getByText(/Backup saved ✓/).waitFor();
-  assert.match(await settings.locator('[aria-live="polite"]').innerText(),/Not included: Library index/);
+  assert.match(await settings.locator('[aria-live="polite"]').innerText(),/Not included:.*Tags and metadata/);
   await settings.getByRole('button',{name:'Restore now',exact:true}).click();
   await restore.getByText(/Replaces user data for Files/).waitFor();
   await restore.getByText(/Not included:/).waitFor();
   await restore.getByRole('button',{name:'Cancel',exact:true}).click();
   assert.equal(report.restoreRequests,0);
   check('verified manual backup reports omissions; reviewed restore explains scope and cancellation writes nothing');
-  await page.evaluate(()=>localStorage.setItem('keivotos:files-grid-size',JSON.stringify('absurd')));
-  await settings.getByRole('button',{name:'Restore now',exact:true}).click();
-  await restore.getByText(/Replaces user data for Files/).waitFor();
-  await restore.getByRole('button',{name:'Restore',exact:true}).click();
-  await restore.getByText(/Restore complete/).waitFor();
-  assert.equal(report.restoreRequests,1);
-  assert.equal(await page.evaluate(()=>JSON.parse(localStorage.getItem('keivotos:files-grid-size'))),'absurd');
-  await restore.getByRole('button',{name:'Close backup dialog',exact:true}).click();
-  assert.equal(await settings.getByRole('button',{name:'Checkpoint now',exact:true}).count(),0);
-  check('real scratch restore preserves browser preferences and recovery results without standalone checkpoint controls');
-  await settings.locator('main').evaluate(node => node.scrollTo(0,0));
-  await page.screenshot({path:path.join(config.output,'backups.png')});
   await page.route('**/api/backups',async route=>{
    const response=await route.fetch();const value=await response.json();
    value.components={user_database:true,file_attachments:true,extra_archive:false};
@@ -164,6 +152,20 @@ assert.match(config.home, /[/\\]keivotos-modularization-[^/\\]+[/\\]home$/);
   await settings.getByRole('button',{name:'example',exact:true}).click();
   await moduleDialog('example').getByRole('checkbox',{name:'extra archive',exact:true}).waitFor();
   check('fixture: absent owners disappear, contributed components remain available and failed automatic status points to Logs');
+  await page.unroute('**/api/backups');
+  await page.reload();await open();
+  await page.evaluate(()=>localStorage.setItem('keivotos:files-grid-size',JSON.stringify('absurd')));
+  await settings.getByRole('button',{name:'Restore now',exact:true}).click();
+  await restore.getByText(/Replaces user data for Files/).waitFor();
+  await restore.getByRole('button',{name:'Restore',exact:true}).click();
+  await restore.getByText(/Restore complete/).waitFor();
+  assert.equal(report.restoreRequests,1);
+  assert.equal(await page.evaluate(()=>JSON.parse(localStorage.getItem('keivotos:files-grid-size'))),'absurd');
+  await restore.getByRole('button',{name:'Close backup dialog',exact:true}).click();
+  assert.equal(await settings.getByRole('button',{name:'Checkpoint now',exact:true}).count(),0);
+  check('real scratch restore preserves browser preferences and recovery results without standalone checkpoint controls');
+  await settings.locator('main').evaluate(node => node.scrollTo(0,0));
+  await page.screenshot({path:path.join(config.output,'backups.png')});
   assert.deepEqual(report.errors,[]);
  } catch(e) {report.failure=e.stack;await page.screenshot({path:path.join(config.output,'failure.png')});throw e;}
  finally {fs.writeFileSync(path.join(config.output,'report.json'),JSON.stringify(report,null,2));await context.tracing.stop({path:path.join(config.output,'trace.zip')});await browser.close();}

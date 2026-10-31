@@ -36,6 +36,9 @@ BACKEND_DIR = ROOT / "backend"
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+from services.log_bootstrap import install as install_bootstrap, record_failure
+install_bootstrap()
+
 from product import DEFAULT_HOST, DEFAULT_PORT, DISPLAY_NAME, VERSION, WEB_TITLE  # noqa: E402
 
 
@@ -43,6 +46,8 @@ LAN_HOST_ENV = "KEIVOTOS_LAN_HOST"
 LAN_DEVELOPER_ENV = "KEIVOTOS_DEVELOPER_LAN"
 MIGRATE_LEGACY_HOME_ENV = "KEIVOTOS_MIGRATE_LEGACY_HOME"
 CONSOLE_ICON_PATH = ROOT / "assets" / "branding" / "keivotos" / "keivotos.ico"
+WINDOWS_APP_ID = "Keivotos.Desktop"
+_console_icons: dict[int, int] = {}
 LAN_IPV4_NETWORKS = tuple(
     ipaddress.ip_network(network)
     for network in (
@@ -62,6 +67,10 @@ def _load_configuration(*, migrate_legacy_home: bool):
         return importlib.import_module("config")
     except Exception as exc:  # noqa: BLE001 - configuration must fail clearly before logging exists.
         message = f"Keivotos could not load its configuration. {exc}"
+        from services.diagnostic_events import redact_log_text
+        message=redact_log_text(message)
+        saved=record_failure("configuration.load_failed",exc)
+        if saved:message+="\nDiagnostic log: "+saved
         print(message, file=sys.stderr)
         if getattr(sys, "frozen", False) and sys.platform == "win32":
             try:
@@ -83,6 +92,13 @@ def _load_asgi_app():
 def _set_console_branding() -> None:
     if sys.platform != "win32":
         return
+    try:
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        shell32.SetCurrentProcessExplicitAppUserModelID.argtypes = [ctypes.c_wchar_p]
+        shell32.SetCurrentProcessExplicitAppUserModelID.restype = ctypes.c_int32
+        shell32.SetCurrentProcessExplicitAppUserModelID(WINDOWS_APP_ID)
+    except (AttributeError, OSError):
+        pass
     try:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -111,14 +127,20 @@ def _set_console_branding() -> None:
         load_from_file = 0x0010
         wm_seticon = 0x0080
         for icon_kind, size in ((1, 32), (0, 16)):
-            icon = user32.LoadImageW(
-                None,
-                str(CONSOLE_ICON_PATH),
-                image_icon,
-                size,
-                size,
-                load_from_file,
-            )
+            icon = _console_icons.get(size)
+            if not icon:
+                icon = user32.LoadImageW(
+                    None,
+                    str(CONSOLE_ICON_PATH),
+                    image_icon,
+                    size,
+                    size,
+                    load_from_file,
+                )
+                if icon:
+                    # Keep the two HICONs alive for this process/window lifetime.
+                    # Repeated branding reuses them; process exit releases them.
+                    _console_icons[size] = icon
             if icon:
                 user32.SendMessageW(console_window, wm_seticon, icon_kind, icon)
     except (AttributeError, OSError):
@@ -275,6 +297,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.portable_check:
         configuration = _load_configuration(migrate_legacy_home=False)
         return _portable_check(configuration)
+    _set_console_branding()
     configuration = _load_configuration(migrate_legacy_home=True)
     lan_enabled = bool(getattr(args, "lan", False))
     lan_host: str | None = None
@@ -297,14 +320,15 @@ def main(argv: list[str] | None = None) -> int:
 
     runtime_log_path, access_log_path = runtime_logging.configure_runtime_logging()
     logger = logging.getLogger("keivotos")
-    _set_console_branding()
     url_host = f"[{browser_host}]" if browser_host == "::1" else browser_host
     url = f"http://{url_host}:{args.port}/"
-    logger.info("Starting %s %s at %s", DISPLAY_NAME, VERSION, url)
+    logger.info("Starting %s %s at %s", DISPLAY_NAME, VERSION, url,
+                extra={"event_code":"lifecycle.launch","event_details":{"version":VERSION}})
     if lan_host is not None:
         logger.warning("Trusted-network LAN access is enabled at http://%s:%s/", lan_host, args.port)
         logger.warning("Devices on this network can use Keivotos while this process is running")
-    logger.info("Writable application data: %s", configuration.SUITE_HOME)
+    logger.info("Writable application data: %s", configuration.SUITE_HOME,
+                extra={"event_code":"configuration.loaded","event_details":{"profile":str(configuration.SUITE_HOME)}})
     logger.info("Runtime log: %s", runtime_log_path)
     logger.info("HTTP access log: %s", access_log_path)
     port_available, port_error = _port_available(bind_host, args.port)
@@ -322,14 +346,17 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_browser:
         _open_browser_when_ready(url)
     application = "server:app" if args.dev and not frozen else _load_asgi_app()
-    uvicorn.run(
-        application,
-        host=bind_host,
-        port=args.port,
-        reload=bool(args.dev and not frozen),
-        app_dir=str(BACKEND_DIR),
-        log_config=None,
-    )
+    try:
+        uvicorn.run(
+            application,
+            host=bind_host,
+            port=args.port,
+            reload=bool(args.dev and not frozen),
+            app_dir=str(BACKEND_DIR),
+            log_config=None,
+        )
+    finally:
+        logging.shutdown()
     return 0
 
 

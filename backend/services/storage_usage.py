@@ -85,6 +85,11 @@ def usage():
             elif path==backups or backups in path.parents:key='backups'
             elif any(path==db or str(path) in (str(db)+'-wal',str(db)+'-shm',str(db)+'-journal') for db in databases) or path.suffix.lower() in ('.sqlite','.sqlite3','.db'):key='databases'
             elif logs in path.parents:key='logs'
+            elif Path(config.SUITE_HOME).absolute()/'cache' in path.parents:key='cache'
+            elif Path(config.SUITE_HOME).absolute()/'assets' in path.parents:
+                relative=path.relative_to(Path(config.SUITE_HOME).absolute()/'assets')
+                key=relative.parts[0] if relative.parts[0] in counts else 'files'
+            elif Path(config.SUITE_HOME).absolute()/'preserved' in path.parents:key='files'
             else:key=next((slug for home,slug in homes if home in path.parents),None)
             if key:counts[key]+=stat.st_size
         except OSError:unreadable+=1

@@ -4,6 +4,7 @@ Only fixed X CDN hosts are admitted, including every redirect before it is
 followed. Cookies, proxies, extractors for arbitrary URLs and browser engines
 are not used. Every output is create-only in a caller-owned fresh directory.
 """
+from services.operation_diagnostics import observed
 from datetime import datetime, timezone
 import hashlib
 from io import BytesIO
@@ -44,6 +45,7 @@ class Redirects(HTTPRedirectHandler):
         return super().redirect_request(request, fp, code, message, headers, newurl)
 
 
+@observed('twitter', 'network.read')
 def read_remote(url, host, limit):
     remote_url(url, host)
     opener = build_opener(ProxyHandler({}), Redirects(host))
@@ -200,7 +202,7 @@ def media_transport():
     return GuardedTransport(logger=Log(), proxies={}, timeout=20)
 
 
-def download_video(spec, url, notify):
+def download_video(spec, url, notify, media_notify=None):
     from yt_dlp import YoutubeDL
     from yt_dlp.networking.common import Request as MediaRequest
 
@@ -222,6 +224,7 @@ def download_video(spec, url, notify):
         now = time.monotonic()
         if now - last >= .2 or value.get('status') == 'finished':
             notify('video', min(90, 10 + downloaded / total * 80) if total else 10)
+            if media_notify:media_notify('video.mp4',min(99,downloaded/total*100) if total else None)
             last = now
     output = directory(spec) / 'video.mp4'
     if output.exists() or output.with_suffix('.mp4.part').exists():
@@ -240,6 +243,7 @@ def download_video(spec, url, notify):
         transport.close()
 
 
+@observed('twitter', 'capture.verify')
 def verify(spec):
     from PIL import Image
     folder = directory(spec)
@@ -280,7 +284,8 @@ def verify(spec):
         ffmpeg = ffmpeg_executable()
         if not ffmpeg:
             raise ValueError('FFmpeg is unavailable')
-        decoded = subprocess.run([ffmpeg, '-nostdin', '-v', 'error', '-xerror', '-f', 'mp4', '-i',
+        from services.tool_diagnostics import run
+        decoded = run("twitter", [ffmpeg, '-nostdin', '-v', 'error', '-xerror', '-f', 'mp4', '-i',
                               str(resolved['video.mp4']), '-map', '0:v:0', '-f', 'null', '-'],
                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
         if decoded.returncode or decoded.stderr.strip():
@@ -303,7 +308,8 @@ def verify(spec):
     return files
 
 
-def capture(spec, notify):
+@observed('twitter', 'capture')
+def capture(spec, notify, media_notify=None):
     from yt_dlp.jsinterp import js_number_to_string
     url, post_id = archive.canonical_url(spec['url'])
     if url != spec['url'] or post_id != spec['post_id']:
@@ -327,9 +333,13 @@ def capture(spec, notify):
     if isinstance(media, list):
         for number, (name, url) in enumerate(media):
             notify('photos', 10 + number / len(media) * 80)
+            if media_notify:media_notify(name,0)
             new_file(spec, name, read_remote(url, 'pbs.twimg.com', archive.PHOTO_LIMITS[name]))
+            if media_notify:media_notify(name,99)
     else:
         notify('video', 10)
-        download_video(spec, media, notify)
+        if media_notify:media_notify('video.mp4',0)
+        if media_notify:download_video(spec,media,notify,media_notify=media_notify)
+        else:download_video(spec,media,notify)
     notify('verifying', 92)
     return verify(spec)

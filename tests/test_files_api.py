@@ -161,6 +161,7 @@ class FilesApiRouteTests(unittest.TestCase):
 
         self.files = files
         self._patchers = [
+            patch.object(files, "get_user_db", database.get_user_db),
             patch.object(config, "SUITE_HOME", self.suite_home),
             patch.object(config, "FILES_DB_PATH", self.suite_home / "base" / "files.sqlite"),
             patch.object(database, "USER_DB_PATH", self.temp / "user.sqlite"),
@@ -194,6 +195,25 @@ class FilesApiRouteTests(unittest.TestCase):
 
         # Forgetting a source is covered in test_folder_roles, against the batch
         # apply path the app actually uses.
+
+    def test_search_offset_preserves_array_and_scope(self) -> None:
+        from fastapi import HTTPException
+        from files_base import index
+        registered = self.files.register_source(self.files.SourceRegister(path=str(self.library)))
+        first = self.files.search('.', registered.source_id, 1)
+        following = self.files.search('.', registered.source_id, 1, offset=1)
+        assert isinstance(first, list) and first and following
+        assert first[0] != following[0]
+        assert set(first[0].model_dump()) == set(self.files.FileNode.model_fields)
+        with self.assertRaises(HTTPException) as unknown:
+            self.files.search('.', 'unknown', 200)
+        assert unknown.exception.status_code == 404
+        with self.files.get_user_db() as connection:
+            sources.update_source(connection, registered.source_id, visible=False)
+        assert self.files.search('.', registered.source_id, 200) == []
+        with index.open_index(self.files.config.FILES_DB_PATH) as connection:
+            assert connection.execute('SELECT count(*) FROM files_index').fetchone()[0] == 4
+        assert (self.library / 'notes.txt').read_bytes() == b'txt'
 
     def test_filesystem_browse_keeps_empty_folders_selectable(self) -> None:
         result = self.files.browse_filesystem(str(self.library / "sub"))
@@ -286,6 +306,151 @@ class FilesApiRouteTests(unittest.TestCase):
         )
         # Reclaiming a nested source's files on forget is covered in
         # test_folder_roles, against the batch apply path.
+
+    def test_edit_path_api_accepts_nested_destination_and_preserves_source_id(self):
+        from routers import suite
+        from services import folder_roles
+        files = self.files
+        parent = files.register_source(files.SourceRegister(path=str(self.library)))
+        old = self.temp / 'old child'; old.mkdir()
+        shutil.copy2(self.library / 'sub' / 'clip.mp4', old / 'clip.mp4')
+        child = files.register_source(files.SourceRegister(path=str(old), display_name='Child'))
+        with patch.object(folder_roles, 'FILES_DB_PATH', self.suite_home / 'base/files.sqlite'), patch.object(folder_roles, 'USER_DB_PATH', self.temp / 'user.sqlite'), patch.object(folder_roles, 'SUITE_HOME', self.suite_home):
+            result = suite.relocate_folder_source(child.source_id, suite.FolderRelocatePayload(path=str(self.library / 'sub')))
+        self.assertEqual(result.source_id, child.source_id)
+        self.assertEqual([node.name for node in files.browse(source_id=child.source_id, parent='')], ['clip.mp4'])
+        files.scan_source(parent.source_id)
+        self.assertEqual([node.name for node in files.search(q='clip', source_id=parent.source_id, limit=200)], ['clip.mp4'])
+        self.assertEqual(next(source for source in files.list_sources() if source.source_id == child.source_id).display_name, 'Child')
+
+
+import pytest
+
+
+@pytest.fixture(params=['row', 'dict'])
+def stream_fixture(tmp_path, monkeypatch, request):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from fastapi import FastAPI
+    from routers import files
+    media = tmp_path / 'media'; media.mkdir()
+    private = tmp_path / 'private'; private.mkdir()
+    child = media / 'child'; child.mkdir()
+    grandchild = child / 'grandchild'; grandchild.mkdir()
+    data = b'Generated original stream bytes 0123456789'
+    for folder in (media, child, grandchild): (folder / 'clip.webm').write_bytes(data)
+    database = tmp_path / 'stream.sqlite'
+    factory = sqlite3.Row if request.param == 'row' else lambda cursor, row: dict(zip([column[0] for column in cursor.description], row))
+    @contextmanager
+    def connect():
+        connection = sqlite3.connect(database)
+        connection.row_factory = factory
+        try: yield connection
+        finally: connection.close()
+    with connect() as connection:
+        sources.ensure_sources_schema(connection)
+        source = sources.register_source(connection, media)
+    monkeypatch.setattr(files, 'get_user_db', connect)
+    monkeypatch.setattr(files.config, 'SUITE_HOME', private)
+    app = FastAPI(); app.include_router(files.router)
+    return SimpleNamespace(app=app, root=media, private=private, child=child, grandchild=grandchild,
+                           data=data, database=database, connect=connect, source=source, directory=tmp_path)
+
+
+def stream_request(case, source_id=None, path='clip.webm', range_header=None):
+    import asyncio
+    from urllib.parse import urlencode
+    async def run():
+        messages = []
+        async def receive(): return {'type': 'http.request', 'body': b'', 'more_body': False}
+        async def send(message): messages.append(message)
+        headers = [(b'host', b'test')]
+        if range_header is not None: headers.append((b'range', range_header.encode()))
+        await case.app(dict(type='http', asgi=dict(version='3.0', spec_version='2.4'), method='GET', http_version='1.1',
+            scheme='http', path='/api/files/file', raw_path=b'/api/files/file',
+            query_string=urlencode(dict(source_id=source_id or case.source.source_id, path=path)).encode(),
+            headers=headers, server=('test', 80), client=('127.0.0.1', 12345)), receive, send)
+        start = next(message for message in messages if message['type'] == 'http.response.start')
+        return start['status'], dict(start['headers']), b''.join(message.get('body', b'') for message in messages if message['type'] == 'http.response.body')
+    return asyncio.run(run())
+
+
+@pytest.mark.parametrize('range_header,expected', [(None, 200), ('bytes=2-8', 206), ('bytes=-5', 206), ('bytes=99999-', 416)])
+def test_stream_visible_unindexed_file_preserves_bytes_ranges_and_headers(stream_fixture, range_header, expected):
+    case = stream_fixture
+    before = case.database.read_bytes()
+    status, headers, body = stream_request(case, range_header=range_header)
+    assert status == expected
+    if expected != 416:
+        assert body == (case.data if range_header is None else case.data[2:9] if range_header == 'bytes=2-8' else case.data[-5:])
+        assert headers[b'content-type'].startswith(b'video/webm') and headers[b'x-content-type-options'] == b'nosniff'
+        assert headers[b'accept-ranges'] == b'bytes' and headers[b'cache-control'] == b'private, no-cache'
+        assert headers[b'content-disposition'].startswith(b'inline;')
+        if expected == 206: assert b'content-range' in headers
+    else: assert headers[b'content-range'] == ('bytes */' + str(len(case.data))).encode()
+    assert case.database.read_bytes() == before and (case.root / 'clip.webm').read_bytes() == case.data
+
+
+def test_stream_hidden_and_unknown_sources_are_denied_and_visibility_is_fresh(stream_fixture):
+    case = stream_fixture
+    assert stream_request(case)[0] == 200
+    with case.connect() as connection: sources.update_source(connection, case.source.source_id, visible=False)
+    assert stream_request(case)[0] == 404 and stream_request(case, range_header='bytes=0-3')[0] == 404
+    assert stream_request(case, source_id='unknown')[0] == 404
+    with case.connect() as connection: sources.update_source(connection, case.source.source_id, visible=True)
+    assert stream_request(case, range_header='bytes=0-3')[2] == case.data[:4]
+
+
+@pytest.mark.parametrize('child_visible', [False, True])
+def test_stream_parent_cannot_bypass_registered_child_ownership(stream_fixture, child_visible):
+    case = stream_fixture
+    with case.connect() as connection:
+        child = sources.register_source(connection, case.child)
+        sources.update_source(connection, child.source_id, role='language', visible=child_visible)
+    assert stream_request(case, path='child/clip.webm')[0] == 403
+    assert stream_request(case, path='child/clip.webm', range_header='bytes=0-3')[0] == 403
+    assert stream_request(case, child.source_id)[0] == (200 if child_visible else 404)
+    assert stream_request(case)[0] == 200
+
+
+def test_stream_grandchild_and_current_registration_changes_are_rechecked(stream_fixture):
+    case = stream_fixture
+    with case.connect() as connection:
+        child = sources.register_source(connection, case.child)
+        grandchild = sources.register_source(connection, case.grandchild)
+    assert stream_request(case, path='child/grandchild/clip.webm')[0] == 403
+    assert stream_request(case, child.source_id, 'grandchild/clip.webm')[0] == 403
+    assert stream_request(case, grandchild.source_id)[2] == case.data
+    with case.connect() as connection: sources.update_source(connection, grandchild.source_id, visible=False)
+    assert stream_request(case, grandchild.source_id)[0] == 404
+    with case.connect() as connection: sources.remove_source(connection, grandchild.source_id)
+    assert stream_request(case, child.source_id, 'grandchild/clip.webm')[0] == 200
+
+
+@pytest.mark.parametrize('hazard,status', [('traversal', 400), ('private', 403), ('missing', 404), ('outside-symlink', 403)])
+def test_stream_existing_private_path_and_missing_file_guards_remain(stream_fixture, hazard, status):
+    import os
+    case = stream_fixture
+    path = 'clip.webm'
+    source_id = case.source.source_id
+    if hazard == 'traversal': path = '../outside.webm'
+    elif hazard == 'private':
+        (case.private / path).write_bytes(case.data)
+        with case.connect() as connection:
+            # Direct SQL represents a pre-existing legacy registration; normal
+            # source registration already refuses the application's private tree.
+            connection.execute("INSERT INTO files_sources(source_id,path,display_name,role) VALUES('private',?,'Private','files')", (str(case.private),))
+            connection.commit()
+        source_id = 'private'
+    elif hazard == 'missing': path = 'missing.webm'
+    else:
+        outside = case.directory / 'outside.webm'; outside.write_bytes(case.data)
+        path = 'alias.webm'
+        try: (case.root / path).symlink_to(outside)
+        except OSError as error:
+            if os.name == 'nt' and getattr(error, 'winerror', None) == 1314: pytest.skip('Windows token lacks symbolic-link privilege')
+            raise
+    assert stream_request(case, source_id, path, range_header='bytes=0-3')[0] == status
 
 
 if __name__ == "__main__":

@@ -14,9 +14,25 @@
       "id": "danbooru",
       "label": "Danbooru",
       "module": "danbooru"
+    },
+    {
+      "id": "youtube",
+      "label": "YouTube",
+      "module": "youtube"
+    },
+    {
+      "id": "twitter",
+      "label": "Twitter",
+      "module": "twitter"
     }
   ],
   "sections": [
+    {
+      "id": "modules",
+      "group": "general",
+      "label": "Modules",
+      "icon": "grid"
+    },
     {
       "id": "appearance",
       "group": "general",
@@ -30,6 +46,12 @@
       "icon": "window"
     },
     {
+      "id": "categories",
+      "group": "general",
+      "label": "Categories",
+      "icon": "folder"
+    },
+    {
       "id": "player",
       "group": "general",
       "label": "Player",
@@ -38,7 +60,7 @@
     {
       "id": "storage",
       "group": "general",
-      "label": "Storage",
+      "label": "Data & storage",
       "icon": "folder"
     },
     {
@@ -46,6 +68,18 @@
       "group": "general",
       "label": "Backup",
       "icon": "shield"
+    },
+    {
+      "id": "general-advanced",
+      "group": "general",
+      "label": "Advanced",
+      "icon": "settings"
+    },
+    {
+      "id": "about",
+      "group": "general",
+      "label": "About",
+      "icon": "window"
     },
     {
       "id": "roots",
@@ -88,9 +122,72 @@
       "group": "danbooru",
       "label": "Advanced",
       "icon": "shield"
+    },
+    {
+      "id": "youtube-downloads",
+      "group": "youtube",
+      "label": "Downloads",
+      "icon": "folder"
+    },
+    {
+      "id": "twitter-capture",
+      "group": "twitter",
+      "label": "Capture",
+      "icon": "folder"
     }
   ],
   "searchItems": [
+    {
+      "id": "accent-style",
+      "section": "appearance",
+      "label": "Accent style",
+      "description": "Choose the interface accent color.",
+      "keywords": [
+        "purple",
+        "pink",
+        "cyan",
+        "yellow",
+        "blue",
+        "green",
+        "orange",
+        "color"
+      ]
+    },
+    {
+      "id": "settings-style",
+      "section": "general-advanced",
+      "label": "Settings style",
+      "description": "Modern or Legacy presentation.",
+      "keywords": [
+        "theme",
+        "legacy",
+        "modern",
+        "colors"
+      ]
+    },
+    {
+      "id": "modules",
+      "section": "modules",
+      "label": "Modules",
+      "description": "Enable modules and check their status.",
+      "keywords": [
+        "enable",
+        "disable",
+        "retry"
+      ]
+    },
+    {
+      "id": "diagnostics",
+      "section": "general-advanced",
+      "label": "Logs and data",
+      "description": "Open logs, the data folder, and choose diagnostic options.",
+      "keywords": [
+        "crash",
+        "access",
+        "verbose",
+        "experimental"
+      ]
+    },
     {
       "id": "motion",
       "section": "appearance",
@@ -115,6 +212,23 @@
       ]
     },
     {
+      "id": "notification-position",
+      "section": "appearance",
+      "label": "Notification position",
+      "description": "Choose the corner for action messages.",
+      "keywords": [
+        "notifications",
+        "overlay",
+        "messages",
+        "toast",
+        "corner",
+        "top",
+        "bottom",
+        "left",
+        "right"
+      ]
+    },
+    {
       "id": "startup-module",
       "section": "startup",
       "label": "Startup destination",
@@ -125,6 +239,18 @@
         "last used",
         "launch",
         "open"
+      ]
+    },
+    {
+      "id": "library-categories",
+      "section": "categories",
+      "label": "Categories",
+      "description": "Create separate Video and Manga categories.",
+      "keywords": [
+        "video",
+        "manga",
+        "organize",
+        "category"
       ]
     },
     {
@@ -140,10 +266,61 @@
       ]
     },
     {
+      "id": "thumbnail-cache",
+      "section": "storage",
+      "label": "Data & storage",
+      "description": "Application data usage and thumbnail cleanup.",
+      "keywords": [
+        "300",
+        "600",
+        "1200",
+        "cleanup",
+        "cache"
+      ]
+    },
+    {
+      "id": "backup",
+      "section": "backup",
+      "label": "Backup",
+      "description": "Choose Keivotos backup contents, location and automatic schedule.",
+      "keywords": [
+        "automatic",
+        "frequency",
+        "retention",
+        "destination",
+        "size",
+        "modules"
+      ]
+    },
+    {
+      "id": "restore",
+      "section": "backup",
+      "label": "Restore",
+      "description": "Validate and restore a Keivotos backup bundle with rollback.",
+      "keywords": [
+        "recovery",
+        "rollback",
+        "backup"
+      ]
+    },
+    {
+      "id": "about",
+      "section": "about",
+      "label": "About Keivotos",
+      "description": "Version <version> and recorded release date.",
+      "keywords": [
+        "about",
+        "version",
+        "release",
+        "date",
+        "<version>"
+      ]
+    },
+    {
       "id": "folder-roles",
       "section": "roots",
       "label": "Folders",
-      "description": "Add, re-scan, relocate, or remove folders, and assign each to Files or Danbooru.",
+      "description": "Add, re-scan, relocate, or remove folders, and assign each to Files or a module.",
       "keywords": [
         "role",
         "module",
@@ -161,57 +338,6 @@
         "remove",
         "path",
         "register"
-      ]
-    },
-    {
-      "id": "thumbnail-cache",
-      "section": "storage",
-      "label": "Thumbnail cache",
-      "description": "Manage the three derived thumbnail tiers and size limit.",
-      "keywords": [
-        "300",
-        "600",
-        "1200",
-        "cleanup",
-        "cache"
-      ]
-    },
-    {
-      "id": "backup",
-      "section": "backup",
-      "label": "Backup",
-      "description": "Choose protected components for the fixed Keivotos backup location.",
-      "keywords": [
-        "snapshot",
-        "database",
-        "sidecar",
-        "destination",
-        "size",
-        "metadata"
-      ]
-    },
-    {
-      "id": "restore",
-      "section": "backup",
-      "label": "Restore",
-      "description": "Validate and restore a Keivotos backup bundle with rollback.",
-      "keywords": [
-        "recovery",
-        "rollback",
-        "backup"
-      ]
-    },
-    {
-      "id": "local-recovery",
-      "section": "backup",
-      "label": "Automatic local recovery",
-      "description": "Keep rotating user database checkpoints.",
-      "keywords": [
-        "checkpoint",
-        "user sqlite",
-        "favorites",
-        "collections",
-        "automatic"
       ]
     },
     {
@@ -235,12 +361,14 @@
       "id": "danbooru-access",
       "section": "account",
       "label": "Danbooru access",
-      "description": "Manage encrypted credentials.",
+      "description": "Manage host and encrypted credentials.",
       "keywords": [
         "username",
         "api key",
         "credentials",
-        "connection"
+        "connection",
+        "host",
+        "betabooru"
       ]
     },
     {
@@ -424,18 +552,6 @@
       ]
     },
     {
-      "id": "rescan",
-      "section": "library",
-      "label": "Re-scan library",
-      "description": "Incrementally reconcile the local index.",
-      "keywords": [
-        "sync",
-        "sqlite",
-        "changed",
-        "removed"
-      ]
-    },
-    {
       "id": "storage-location",
       "section": "library",
       "label": "Generated metadata location",
@@ -451,13 +567,15 @@
     {
       "id": "import-pipeline",
       "section": "library",
-      "label": "Import pipeline",
-      "description": "Run the four resumable library import phases.",
+      "label": "Library update",
+      "description": "Update local files, fetch missing tags and retry unfinished work.",
       "keywords": [
-        "discover",
-        "enrich",
+        "import",
+        "rescan",
+        "sync",
         "metadata",
-        "finalize"
+        "retry",
+        "logs"
       ]
     },
     {
@@ -499,6 +617,18 @@
       ]
     },
     {
+      "id": "refresh-tags",
+      "section": "maintenance",
+      "label": "Refresh existing tags",
+      "description": "Fetch current Danbooru metadata and archive replaced sidecars.",
+      "keywords": [
+        "network",
+        "refresh",
+        "tags",
+        "archive"
+      ]
+    },
+    {
       "id": "rebuild",
       "section": "maintenance",
       "label": "Rebuild database",
@@ -507,6 +637,67 @@
         "recovery",
         "sqlite",
         "repair"
+      ]
+    },
+    {
+      "id": "youtube-location",
+      "section": "youtube-downloads",
+      "label": "Save to location",
+      "description": "",
+      "keywords": [
+        "youtube",
+        "download",
+        "folder",
+        "path",
+        "default",
+        "custom"
+      ]
+    },
+    {
+      "id": "twitter-destination",
+      "section": "twitter-capture",
+      "label": "Save to",
+      "description": "",
+      "keywords": [
+        "twitter",
+        "download",
+        "capture",
+        "folder",
+        "destination",
+        "save"
+      ]
+    },
+    {
+      "id": "hold-space",
+      "section": "player",
+      "label": "Hold Space to speed up",
+      "description": "Temporarily speed up Video and YouTube while holding Space.",
+      "keywords": [
+        "video",
+        "youtube",
+        "player",
+        "space",
+        "hold",
+        "speed",
+        "keyboard"
+      ]
+    },
+    {
+      "id": "hold-speed-multiplier",
+      "section": "player",
+      "label": "Hold speed multiplier",
+      "description": "Choose how much holding Space multiplies the selected playback speed.",
+      "keywords": [
+        "video",
+        "youtube",
+        "player",
+        "space",
+        "hold",
+        "speed",
+        "multiplier",
+        "1.25",
+        "1.5",
+        "2"
       ]
     }
   ]

@@ -97,6 +97,42 @@ class FilesInfoRouteTests(unittest.TestCase):
         self.assertEqual(fetched.subject_kind, "dir")
         self.assertIsNone(fetched.content_hash)
 
+    def test_details_roundtrip_legacy_update_and_clear_marker(self) -> None:
+        from files_base import annotations
+        files = self.files
+        request = dict(source_id=self._sid(), path="Piano Sheets")
+        saved = files.put_info(files.AnnotationRequest(**request,
+            details=[{"label": " Album ", "value": " 初音 <b>inert</b> "}], metadata_applied=True))
+        self.assertEqual(saved.details[0].label, "Album")
+        self.assertEqual(saved.details[0].value, "初音 <b>inert</b>")
+        # Old clients and attachment writers omit new fields: preserve both.
+        updated = files.put_info(files.AnnotationRequest(**request, author="Manual"))
+        self.assertEqual(updated.details, saved.details)
+        self.assertTrue(updated.metadata_applied)
+        cleared = files.put_info(files.AnnotationRequest(**request, details=[]))
+        self.assertEqual(cleared.id, saved.id)
+        self.assertEqual(cleared.details, [])
+        self.assertTrue(cleared.metadata_applied)
+        with self.database.get_user_db() as db:
+            self.assertFalse(annotations.prune_if_empty(db, cleared.id))
+            self.assertEqual(annotations.annotated_keys(db), (set(), set()))
+        self.assertTrue(files.get_info(**request).metadata_applied)
+        # An explicit reset retains the existing ordinary empty-note behavior.
+        self.assertIsNone(files.put_info(files.AnnotationRequest(**request, details=[], metadata_applied=False)))
+
+    def test_details_validation_and_read_only_open(self) -> None:
+        from pydantic import ValidationError
+        files = self.files
+        for details in ([{"label":" ","value":"x"}], [{"label":"x","value":" "}],
+                        [{"label":"Album","value":"a"},{"label":" album ","value":"b"}],
+                        [{"label":str(i),"value":"a"} for i in range(33)]):
+            with self.subTest(details=details):
+                with self.assertRaises(ValidationError):
+                    files.AnnotationRequest(source_id=self._sid(), details=details)
+        self.assertIsNone(files.get_info(source_id=self._sid(), path="3D/iroha.zip"))
+        with self.database.get_user_db() as db:
+            self.assertEqual(db.execute('SELECT count(*) AS n FROM files_annotations').fetchone()['n'], 0)
+
     def test_non_http_links_are_rejected(self) -> None:
         from fastapi import HTTPException
 

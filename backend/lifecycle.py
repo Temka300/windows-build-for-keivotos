@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from services.operation_diagnostics import emit as diagnostic_event
 import threading
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
@@ -35,6 +36,7 @@ from config import (
 from database import get_user_db, init_data_db, init_user_db
 from module_descriptor import ModuleDescriptor
 from services.default_library import install_default_library
+from services.storage_authority import startup as activate_storage
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,7 @@ class ModuleRuntime:
     def __init__(self):
         self.loop = asyncio.get_running_loop()
         self.tasks: dict[str, list[asyncio.Task]] = {}
+        self.descriptors: dict[str, ModuleDescriptor] = {}
         self._states: dict[str, dict] = {}
         self._state_lock = threading.Lock()
 
@@ -104,11 +107,14 @@ class ModuleRuntime:
         message = f"{stage} failed; see the runtime log"
         self._set_state(slug, "failed", message)
         logger.error("Module '%s': %s: %s", slug, stage, exc,
-                     exc_info=(type(exc), exc, exc.__traceback__))
+                     exc_info=(type(exc), exc, exc.__traceback__),
+                     extra={"event_code": "module.runtime_failed",
+                            "event_details": {"module": slug, "stage": stage}})
 
     def start(self, descriptor: ModuleDescriptor) -> bool:
         if descriptor.slug in self.tasks:
             return self.status(descriptor.slug)["state"] == "running"
+        self.descriptors[descriptor.slug]=descriptor
         self._set_state(descriptor.slug, "starting")
         tasks = self.tasks[descriptor.slug] = []
         pending = []
@@ -144,7 +150,9 @@ class ModuleRuntime:
             return  # One-shot maintenance completes normally.
         if self.status(slug)["state"] in {"stopping", "disabled"}:
             logger.error("Module '%s': worker cleanup failed", slug,
-                         exc_info=(type(exception), exception, exception.__traceback__))
+                         exc_info=(type(exception), exception, exception.__traceback__),
+                         extra={"event_code": "module.cleanup_failed",
+                                "event_details": {"module": slug}})
             return
         self.fail(slug, f"Worker {task.get_name()}", exception)
         for sibling in self.tasks.get(slug, []):
@@ -158,7 +166,11 @@ class ModuleRuntime:
             if not task.done() and not task.cancelling():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        descriptor=self.descriptors.get(slug)
+        if descriptor is not None:
+            await descriptor.run_shutdown()
         self.tasks.pop(slug, None)
+        self.descriptors.pop(slug,None)
         self._set_state(slug, "disabled")
 
     async def change(self, descriptor: ModuleDescriptor, enabled: bool) -> None:
@@ -170,6 +182,20 @@ class ModuleRuntime:
                 raise ModuleStartError(message)
         else:
             await self.stop(descriptor.slug)
+
+    async def suspend_storage(self):
+        descriptors=tuple(self.descriptors.values())
+        for slug in list(self.tasks):await self.stop(slug)
+        return descriptors
+
+    def suspend_storage_from_request(self):
+        return asyncio.run_coroutine_threadsafe(self.suspend_storage(),self.loop).result()
+
+    async def resume_storage(self,descriptors):
+        for descriptor in descriptors:self.start(descriptor)
+
+    def resume_storage_from_request(self,descriptors):
+        asyncio.run_coroutine_threadsafe(self.resume_storage(descriptors),self.loop).result()
 
     def change_from_request(self, descriptor: ModuleDescriptor, enabled: bool) -> None:
         asyncio.run_coroutine_threadsafe(self.change(descriptor, enabled), self.loop).result()
@@ -187,7 +213,8 @@ module_runtime: ModuleRuntime | None = None
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+async def _profile_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    diagnostic_event("suite","lifecycle.starting","Application startup started")
     # Suite-level startup — always runs, independent of any module.
     promotion = promote_user_database()
     if promotion.get("promoted"):
@@ -204,6 +231,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             "Warmed the thumbnail cache from the pre-v1.1.3 location: %s files copied",
             thumbnail_migration["copied"],
         )
+    activation = activate_storage(config)
+    logger.info("Verified coordinated profile storage: %s", activation["generation"])
     # Only suite-owned tables are needed to read the module enablement state.
     init_user_db(set())
     active = _active_module_slugs()
@@ -243,10 +272,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         try:
             await asyncio.to_thread(cleanup_thumbnail_cache, None)
         except OSError:
-            logger.exception("Startup thumbnail cleanup failed")
+            logger.exception("Startup thumbnail cleanup failed",
+                             extra={"event_code": "runtime.thumbnail_cleanup_failed"})
+    try:
+        with get_user_db() as summary_db:
+            available=summary_db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='files_sources'").fetchone()
+            library_count=summary_db.execute("SELECT count(*) FROM files_sources").fetchone()[0] if available else None
+    except Exception:
+        library_count=None
+    diagnostic_event("suite","lifecycle.ready","Application is ready",
+                     details={"libraries":library_count,"modules":[{"module":slug,**runtime.status(slug)} for slug in runtime.tasks]})
     try:
         yield
     finally:
+        diagnostic_event("suite","lifecycle.stopping","Application shutdown started")
         backup_stop.set()
         # Finish an in-progress archive before shutdown; cancelling to_thread
         # would abandon a writer that continues running outside this coroutine.
@@ -254,3 +293,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         module_runtime = None
         for slug in list(runtime.tasks):
             await runtime.stop(slug)
+        diagnostic_event("suite","lifecycle.stopped","Application shutdown completed")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None,None]:
+    from services.data_migrations import _attempt_lock
+    from services.storage_authority import _guard
+    directory=_guard(config.SUITE_HOME/'state/runtime-lease')
+    directory.mkdir(parents=True,exist_ok=True)
+    with _attempt_lock(directory):
+        async with _profile_lifespan(app):
+            yield

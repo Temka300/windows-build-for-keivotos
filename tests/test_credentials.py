@@ -54,6 +54,27 @@ def test_linux_save_replace_reuse_clear_and_redaction(vault):
     assert not credentials.CREDENTIALS_PATH.exists()
 
 
+@pytest.mark.parametrize('environment', [{}, {'DANBOORU_USERNAME': 'env-user'},
+    {'DANBOORU_USERNAME': 'env-user', 'DANBOORU_API_KEY': 'dummy-env-key'}])
+def test_public_environment_never_reads_vault_or_changes_saved_credentials(vault, monkeypatch, environment):
+    credentials.save_credentials('saved-user', 'dummy-saved-key')
+    before = credentials.CREDENTIALS_PATH.read_bytes()
+    saved = dict(vault)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    original_environment = dict(os.environ)
+    def forbidden():
+        raise AssertionError('Anonymous work opened the credential vault')
+    monkeypatch.setattr(credentials, 'effective_credentials', forbidden)
+    public = credentials.credential_environment(use_saved_credentials=False)
+    assert 'DANBOORU_USERNAME' not in public
+    assert 'DANBOORU_API_KEY' not in public
+    assert {k: v for k, v in original_environment.items() if k not in {'DANBOORU_USERNAME', 'DANBOORU_API_KEY'}} == public
+    assert dict(os.environ) == original_environment
+    assert credentials.CREDENTIALS_PATH.read_bytes() == before
+    assert vault == saved
+
+
 @pytest.mark.parametrize('reader', ['saved_credentials', 'effective_credentials'])
 @pytest.mark.parametrize('mutation', ['replace', 'clear'])
 def test_read_keeps_manifest_and_vault_consistent_during_mutation(vault, monkeypatch, reader, mutation):

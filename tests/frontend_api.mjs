@@ -24,7 +24,7 @@ try {
   await fs.writeFile(bundle, output.code);
   const { api, suiteDataApi, danbooruApi, thumbnailUrl, imageFileUrl } = await import(pathToFileURL(bundle).href);
   assert.deepEqual(Object.keys(api).sort(), [...new Set(snapshot.cases.map(c => c.name))].sort());
-  assert.equal(Object.keys(suiteDataApi).length, 15);
+  assert.deepEqual(Object.keys(suiteDataApi).sort(), ["cleanupThumbnailCache", "clearThumbnailCache", "configureBackups", "configureDiagnostics", "createMetadataBackup", "estimateBackup", "getAutomaticBackupStatus", "getBackupConfiguration", "getDiagnostics", "getStorageConfiguration", "getStorageUsage", "getThumbnailCache", "getUserSetting", "inspectMetadataBackup", "openDiagnostics", "putUserSetting", "restoreMetadataBackup", "setCacheStartup", "setThumbnailCacheLimit"]);
   for (const [name, method] of Object.entries(api)) {
     assert.strictEqual(method, suiteDataApi[name] ?? danbooruApi[name], name + ' method identity');
   }

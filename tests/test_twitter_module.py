@@ -323,6 +323,7 @@ def catalog(tmp_path, monkeypatch):
     monkeypatch.setattr(config, 'USER_DB_PATH', user)
     monkeypatch.setattr(config, 'FILES_DB_PATH', db)
     monkeypatch.setattr(config, 'SUITE_HOME', home)
+    monkeypatch.setattr(config, 'JOBS_DB_PATH', tmp_path/'home/state/jobs.sqlite')
     return source, media, db, connect
 
 
@@ -820,7 +821,7 @@ def test_user_backup_retains_role_without_originals_or_extra_artifact(catalog, t
 
 
 def job_count(catalog):
-    with catalog[3]() as db:
+    with jobs.get_jobs_db() as db:
         return db.execute('SELECT COUNT(*) AS count FROM twitter_downloads').fetchone()['count']
 
 
@@ -856,7 +857,7 @@ def test_committed_lost_acknowledgement_reuses_original_uuid(catalog, monkeypatc
     def lost():
         with connect() as db:
             yield db
-            if db.execute('SELECT 1 FROM twitter_downloads').fetchone():
+            if jobs.config.JOBS_DB_PATH.exists():
                 raise OSError('Intentional committed reply loss')
     monkeypatch.setattr(jobs, 'get_user_db', lost)
     with pytest.raises(OSError, match='reply loss'):
@@ -864,6 +865,18 @@ def test_committed_lost_acknowledgement_reuses_original_uuid(catalog, monkeypatc
     monkeypatch.setattr(jobs, 'get_user_db', connect)
     assert new_job(catalog, token)['id'] == str(token)
     assert job_count(catalog) == 1
+
+
+def test_exact_request_keeps_first_default_destination(catalog, monkeypatch):
+    source, media, _, connect = catalog
+    twitter.adopt(source.source_id)
+    token = uuid4()
+    first = jobs.create('https://x.com/SavedAuthor/status/333', None, token)
+    monkeypatch.setattr(jobs, 'preferences', lambda: {'source_id': 'changed-default'})
+    assert jobs.create(first['url'], None, token) == first
+    assert job_count(catalog) == 1
+    with pytest.raises(ValueError, match='different capture'):
+        jobs.create(first['url'], 'different-explicit-source', token)
 
 
 def test_pending_restart_and_retry_receipts_do_not_start_remote_work(catalog):
@@ -1108,8 +1121,8 @@ raise SystemExit(worker.main([]))
     assert paths[0] != paths[1]
     assert all((path.parent / 'source.json').read_bytes() == raw for path in paths)
     assert browse()['items'] == []
-    with catalog[3]() as connection:
-        assert connection.execute('SELECT count(*) FROM twitter_downloads').fetchone()[0] == 1
+    with jobs.get_jobs_db() as connection:
+        assert connection.execute('SELECT count(*) AS total FROM twitter_downloads').fetchone()['total'] == 1
 
 
 @pytest.mark.parametrize('post_kind', ['video', 'photo', 'text'])
@@ -1257,3 +1270,427 @@ def test_live_worker_stop_preserves_partial_files_and_reaps_child(catalog, monke
             await asyncio.gather(runner, return_exceptions=True)
     asyncio.run(check())
     assert jobs.get(job['id'])['status'] == {'cancel':'cancelled','disable':'interrupted','source':'failed'}[action]
+
+
+@pytest.fixture
+def twitter_assets(catalog, monkeypatch):
+    """Short disposable originals and a separate catalog, also on native Windows."""
+    from tempfile import TemporaryDirectory
+    from services import item_catalog
+    with TemporaryDirectory(prefix='kt65-') as directory:
+        root = Path(directory)
+        media = root / 'posts'
+        media.mkdir()
+        old_source, _, files_db, connect = catalog
+        with connect() as db:
+            db.execute("UPDATE files_sources SET path=?,role='twitter' WHERE source_id=?",
+                       (str(media), old_source.source_id))
+            db.commit()
+            source = next(s for s in sources.list_sources(db) if s.source_id == old_source.source_id)
+        @contextmanager
+        def catalog_db():
+            db = sqlite3.connect(root / 'catalog.sqlite')
+            try:
+                yield db
+            finally:
+                db.close()
+        with catalog_db() as db:
+            item_catalog.ensure_catalog_schema(db)
+            library = item_catalog.ensure_library(db, namespace='files.source', legacy_key=source.source_id,
+                                                  kind='linked', display_name='Saved posts')
+        monkeypatch.setattr(jobs, 'dependencies', lambda: {'ready': True, 'missing': []})
+        yield dict(source=source, media=media, catalog_db=catalog_db, library=library, connect=connect,
+                   catalog=(source, media, files_db, connect))
+
+
+def twitter_assets_register(state, path, *, receipt=None, connection=None, registered=None, suite_home=None):
+    from modules.twitter.user_schema import register_catalog_capture
+    arguments = dict(source_id=state['source'].source_id, path=path, receipt=receipt,
+                     registered=registered if registered is not None else [state['source']],
+                     suite_home=suite_home or config.SUITE_HOME)
+    if connection is not None:
+        return register_catalog_capture(connection, **arguments)
+    with state['catalog_db']() as db:
+        db.execute('BEGIN IMMEDIATE')
+        result = register_catalog_capture(db, **arguments)
+        db.commit()
+        return result
+
+
+def twitter_assets_snapshot(state):
+    with state['catalog_db']() as db:
+        return list(db.iterdump())
+
+
+@pytest.mark.parametrize('kind,extension', [('legacy', 'jpg'), ('photos', 'jpg'),
+    ('video', 'jpg'), ('video', 'png'), ('video', 'webp'), ('text', 'png'), ('text', 'webp')])
+def test_twitter_assets_registers_complete_originals_without_job_tables(twitter_assets, kind, extension):
+    from services import item_catalog
+    state = twitter_assets
+    photos = {f'photo-{i}.jpg': f'photo {i}'.encode() for i in range(1, 5)} if kind == 'photos' else {} if kind == 'text' else None
+    path = write_capture(state['media'], photos=photos, avatar_file='avatar.' + extension,
+                         current_format=kind in ('video', 'text'), text='한' * 100000)
+    originals = {p: p.read_bytes() for p in (state['media'] / path).parent.iterdir()}
+    result = twitter_assets_register(state, path)
+    before = twitter_assets_snapshot(state)
+    assert twitter_assets_register(state, path)['item_id'] == result['item_id']
+    assert twitter_assets_snapshot(state) == before
+    with state['catalog_db']() as db:
+        assert not db.execute("SELECT 1 FROM sqlite_master WHERE name='twitter_downloads'").fetchone()
+        captured = item_catalog.read_capture(db, item_id=result['item_id'],
+            namespace='twitter.asset-observation', capture_key=result['capture_key'])['payload']
+        assert captured['library_id'] == state['library'] and captured['path'] == path
+        facts = db.execute('SELECT a.media_type,a.byte_size,a.content_hash,r.role,r.position FROM kv_assets a '
+                           'JOIN kv_item_assets r ON r.asset_id=a.id').fetchall()
+        assert {row[3] for row in facts} == {'manifest', 'source', 'metadata', 'avatar'} | (
+            {f'photo-{i}' for i in range(1, 5)} if kind == 'photos' else set() if kind == 'text' else {'video'})
+        for media_type, size, digest, role, position in facts:
+            value = captured['files'][role]
+            raw = (state['media'] / value['path']).read_bytes()
+            assert len(raw) == size == value['size'] and hashlib.sha256(raw).hexdigest() == digest == value['sha256']
+            assert position == 0 and media_type in ('application/json', 'image/jpeg', 'image/png', 'image/webp', 'video/mp4')
+        assert '한' not in json.dumps(captured, ensure_ascii=False)
+        assert str(state['media']) not in json.dumps(captured)
+    assert all(p.read_bytes() == raw for p, raw in originals.items())
+
+
+def test_twitter_assets_relocation_and_distinct_capture_identities(twitter_assets):
+    state = twitter_assets
+    path = write_capture(state['media'])
+    first = twitter_assets_register(state, path)
+    before = twitter_assets_snapshot(state)
+    moved = state['media'].with_name('moved')
+    state['media'].rename(moved)
+    state['media'] = moved
+    state['source'] = replace(state['source'], path=str(moved), display_name='Renamed')
+    assert twitter_assets_register(state, path)['item_id'] == first['item_id']
+    assert twitter_assets_snapshot(state) == before
+    later = write_capture(moved, 1, post_id='2000000')
+    assert twitter_assets_register(state, later)['item_id'] != first['item_id']
+    another = replace(state['source'], source_id='another-source')
+    from services import item_catalog
+    with state['catalog_db']() as db:
+        item_catalog.ensure_library(db, namespace='files.source', legacy_key=another.source_id,
+                                   kind='linked', display_name='Other')
+    state['source'] = another
+    assert twitter_assets_register(state, path)['item_id'] != first['item_id']
+
+
+def test_twitter_assets_offline_receipt_import_and_publisher_share_identity(twitter_assets):
+    from modules.twitter import user_schema
+    state = twitter_assets
+    path = write_capture(state['media'], post_id='333')
+    job = new_job(state['catalog'])
+    jobs.update(job['id'], status='complete', path=path, capture_id=archive._path_parts(path)[1])
+    job = jobs.get(job['id'])
+    with state['catalog_db']() as db:
+        user_schema.publish(db)
+        db.execute('INSERT INTO twitter_downloads(' + ','.join(job) + ') VALUES(' + ','.join('?' for _ in job) + ')', tuple(job.values()))
+        assert user_schema.import_catalog_receipts(db) == 1
+        result = twitter_assets_register(state, path, receipt=job, connection=db)
+        receipt = user_schema.preserved_receipt(db, job['id'], source_id=job['source_id'],
+                                               post_id='333', capture_id=job['capture_id'])
+        assert receipt['item_id'] == result['item_id'] and receipt['payload']['record']['root'] == job['root']
+        db.commit()
+
+
+@pytest.mark.parametrize('guard', ['hidden', 'role', 'absent', 'duplicate', 'child', 'hidden-child', 'private'])
+def test_twitter_assets_current_source_guards_refuse_without_catalog_writes(twitter_assets, guard):
+    state = twitter_assets
+    path = write_capture(state['media'])
+    registered = [state['source']]
+    if guard == 'hidden': registered = [replace(state['source'], visible=False)]
+    if guard == 'role': registered = [replace(state['source'], role='files')]
+    if guard == 'absent': registered = []
+    if guard == 'duplicate': registered *= 2
+    if guard in ('child', 'hidden-child'):
+        registered.append(replace(state['source'], source_id='child', path=str(state['media'] / 'captures'),
+                                  visible=guard == 'child', role='files'))
+    before = twitter_assets_snapshot(state)
+    with pytest.raises((ValueError, serving.ServeDenied)):
+        twitter_assets_register(state, path, registered=registered,
+                                suite_home=state['media'] if guard == 'private' else None)
+    assert twitter_assets_snapshot(state) == before
+
+
+def test_twitter_assets_require_transaction_and_known_library_before_media_reads(twitter_assets, monkeypatch):
+    from modules.twitter.user_schema import register_catalog_capture
+    state = twitter_assets
+    path = 'captures/333/20261015T120000000000Z-1234abcd/manifest.json'
+    monkeypatch.setattr(archive, 'verified_assets', lambda *a: (_ for _ in ()).throw(AssertionError('Must not read media')))
+    with state['catalog_db']() as db:
+        with pytest.raises(ValueError, match='caller transaction'):
+            register_catalog_capture(db, source_id='unknown', registered=[], suite_home=config.SUITE_HOME, path=path)
+        db.execute('BEGIN')
+        with pytest.raises(ValueError, match='source library'):
+            register_catalog_capture(db, source_id='unknown', registered=[], suite_home=config.SUITE_HOME, path=path)
+
+
+@pytest.mark.parametrize('name', ['source.json', 'tweet.json', 'avatar.jpg', 'video.mp4', 'manifest.json'])
+@pytest.mark.parametrize('mutation', ['missing', 'same-size'])
+def test_twitter_assets_refuse_missing_or_same_size_tampering(twitter_assets, name, mutation):
+    state = twitter_assets
+    path = write_capture(state['media'])
+    target = (state['media'] / path).with_name(name)
+    before = twitter_assets_snapshot(state)
+    raw = target.read_bytes()
+    if mutation == 'missing': target.rename(target.with_name('preserved-' + name))
+    else: target.write_bytes(b'!' + raw[1:])
+    with pytest.raises((ValueError, serving.ServeDenied)):
+        twitter_assets_register(state, path)
+    assert twitter_assets_snapshot(state) == before
+    assert (target if mutation == 'same-size' else target.with_name('preserved-' + name)).read_bytes() == (b'!' + raw[1:] if mutation == 'same-size' else raw)
+
+
+@pytest.mark.parametrize('mutation', ['grow', 'replace', 'earlier', 'manifest'])
+def test_twitter_assets_detect_changes_during_and_after_hashing(twitter_assets, monkeypatch, mutation):
+    state = twitter_assets
+    path = write_capture(state['media'], video=b'v' * (2 * 1024 * 1024))
+    folder = (state['media'] / path).parent
+    original = archive._verified_file
+    def verify(source, relative, forbidden, expected):
+        if mutation == 'grow' and relative.endswith('/video.mp4'):
+            # Change after the pre-hash size check but during the actual read.
+            original_open = Path.open
+            class Growing:
+                def __init__(self, handle): self.handle, self.changed = handle, False
+                def __enter__(self): return self
+                def __exit__(self, *args): self.handle.close()
+                def fileno(self): return self.handle.fileno()
+                def read(self, maximum):
+                    value = self.handle.read(maximum)
+                    if not self.changed:
+                        with original_open(folder / 'video.mp4', 'ab') as output: output.write(b'growth')
+                        self.changed = True
+                    return value
+            with monkeypatch.context() as scoped:
+                scoped.setattr(Path, 'open', lambda target, *a, **kw: Growing(original_open(target, *a, **kw))
+                               if target == folder / 'video.mp4' and a == ('rb',) else original_open(target, *a, **kw))
+                return original(source, relative, forbidden, expected)
+        result = original(source, relative, forbidden, expected)
+        if relative.endswith('/video.mp4'):
+            if mutation == 'replace':
+                target = folder / 'video.mp4'
+                target.rename(folder / 'preserved-video.mp4')
+                target.write_bytes(b'v' * expected['size'])
+            if mutation == 'earlier': (folder / 'avatar.jpg').write_bytes(b'changed-avatar!!')
+            if mutation == 'manifest':
+                with (folder / 'manifest.json').open('ab') as output: output.write(b' ')
+        return result
+    monkeypatch.setattr(archive, '_verified_file', verify)
+    before = twitter_assets_snapshot(state)
+    with pytest.raises((ValueError, serving.ServeDenied)):
+        twitter_assets_register(state, path)
+    assert twitter_assets_snapshot(state) == before
+
+
+@pytest.mark.parametrize('conflict', ['asset', 'receipt', 'late-write', 'final-file'])
+def test_twitter_assets_conflict_or_interruption_rolls_back_entire_registration(twitter_assets, monkeypatch, conflict):
+    from services import item_catalog
+    state = twitter_assets
+    path = write_capture(state['media'], post_id='333')
+    job = new_job(state['catalog'])
+    jobs.update(job['id'], status='running', path=path, capture_id=archive._path_parts(path)[1])
+    receipt = jobs.get(job['id'])
+    if conflict in ('asset', 'receipt'):
+        twitter_assets_register(state, path, receipt=receipt)
+        if conflict == 'receipt': receipt = dict(receipt, created_at='different')
+        else:
+            target = (state['media'] / path).with_name('video.mp4')
+            target.write_bytes(b'another-original')
+            rewrite(state['media'] / path, lambda value: value['files'].update({'video.mp4': {
+                'size': target.stat().st_size, 'sha256': hashlib.sha256(target.read_bytes()).hexdigest()}}))
+    before = twitter_assets_snapshot(state)
+    if conflict in ('late-write', 'final-file'):
+        original = item_catalog.record_asset_capture
+        def fail(*a, **kw):
+            value = original(*a, **kw)
+            if conflict == 'late-write': raise InterruptedError('late registration failure')
+            with (state['media'] / path).open('ab') as output: output.write(b' ')
+            return value
+        monkeypatch.setattr(item_catalog, 'record_asset_capture', fail)
+    with state['catalog_db']() as db:
+        db.execute('BEGIN')
+        db.execute("INSERT INTO kv_libraries(id,kind,display_name) VALUES('unrelated','linked','Pending caller write')")
+        with pytest.raises((ValueError, InterruptedError)):
+            twitter_assets_register(state, path, receipt=receipt, connection=db)
+        assert db.in_transaction
+        assert db.execute("SELECT 1 FROM kv_libraries WHERE id='unrelated'").fetchone()
+        assert db.execute('SELECT count(*) FROM kv_assets').fetchone()[0] == (5 if conflict in ('asset', 'receipt') else 0)
+        db.rollback()
+    assert twitter_assets_snapshot(state) == before
+
+
+def test_twitter_assets_outer_rollback_and_current_receipt_validation(twitter_assets):
+    state = twitter_assets
+    path = write_capture(state['media'], post_id='333')
+    before = twitter_assets_snapshot(state)
+    with state['catalog_db']() as db:
+        db.execute('BEGIN')
+        twitter_assets_register(state, path, connection=db)
+        assert db.execute('SELECT count(*) FROM kv_assets').fetchone()[0] == 5
+        db.rollback()
+    assert twitter_assets_snapshot(state) == before
+    job = new_job(state['catalog'])
+    jobs.update(job['id'], path=path, capture_id=archive._path_parts(path)[1])
+    with pytest.raises(ValueError, match='source URL'):
+        twitter_assets_register(state, path, receipt=dict(jobs.get(job['id']), url='https://x.com/Other/status/333'))
+    assert twitter_assets_snapshot(state) == before
+
+
+@pytest.mark.parametrize('failure', ['index', 'catalog', 'acknowledgement', 'none'])
+def test_twitter_assets_publish_and_local_completion_repair(twitter_assets, monkeypatch, failure):
+    state = twitter_assets
+    job = new_job(state['catalog'])
+    path = write_capture(state['media'], post_id='333')
+    folder = (state['media'] / path).parent
+    original_manifest = json.loads((state['media'] / path).read_text(encoding='utf-8'))
+    # A separate unpublished fixture supplies actual worker facts. Publication
+    # itself must create the completion manifest, preserving every original.
+    (state['media'] / path).rename(folder / 'fixture-manifest.json')
+    jobs.update(job['id'], status='running', path=path, capture_id=original_manifest['capture_id'])
+    spec = dict(jobs.get(job['id']), captured_at=original_manifest['captured_at'],
+                directory_identity=[folder.stat().st_dev, folder.stat().st_ino], forbidden=[])
+    files = {name: dict(facts, identity=list(archive._identity((folder / name).stat())))
+             for name, facts in original_manifest['files'].items()}
+    originals = {folder / name: (folder / name).read_bytes() for name in files}
+    original_update, original_scan = jobs.update, index.scan_source
+    @contextmanager
+    def failed_catalog():
+        raise OSError('catalog unavailable')
+        yield
+    def acknowledge(job_id, **values):
+        if values.get('status') == 'complete' and failure == 'acknowledgement': raise OSError('acknowledgement unavailable')
+        return original_update(job_id, **values)
+    monkeypatch.setattr(jobs, 'update', acknowledge)
+    if failure == 'index': monkeypatch.setattr(index, 'scan_source', lambda *a, **kw: (_ for _ in ()).throw(OSError('index unavailable')))
+    factory = failed_catalog if failure == 'catalog' else state['catalog_db']
+    if failure != 'none':
+        with pytest.raises(OSError, match='unavailable'): jobs.publish(spec, files, catalog_database=factory)
+        assert jobs.get(job['id'])['status'] == 'running' and (state['media'] / path).is_file()
+        with state['catalog_db']() as db:
+            assert db.execute('SELECT count(*) FROM kv_assets').fetchone()[0] == (5 if failure == 'acknowledgement' else 0)
+        saved_manifest = (state['media'] / path).read_bytes()
+        monkeypatch.setattr(index, 'scan_source', original_scan)
+        monkeypatch.setattr(jobs, 'update', original_update)
+        jobs.recover()
+        jobs.retry(job['id'], uuid4())
+        jobs.update(job['id'], status='running')
+        monkeypatch.setattr(acquisition, 'capture', lambda *a: (_ for _ in ()).throw(AssertionError('No acquisition on registration repair')))
+        jobs.register(jobs.get(job['id']), catalog_database=state['catalog_db'])
+        assert (state['media'] / path).read_bytes() == saved_manifest
+    else:
+        jobs.publish(spec, files, catalog_database=factory)
+    assert jobs.get(job['id'])['status'] == 'complete'
+    assert all(p.read_bytes() == raw for p, raw in originals.items())
+    with state['catalog_db']() as db:
+        assert db.execute('SELECT count(*) FROM kv_items').fetchone()[0] == 1
+        assert db.execute('SELECT count(*) FROM kv_assets').fetchone()[0] == 5
+        assert db.execute("SELECT count(*) FROM kv_item_captures WHERE namespace IN ('twitter.download','twitter.asset-observation')").fetchone()[0] == 2
+        for namespace in ('portable.manifest','portable.location'):
+            assert db.execute('SELECT count(*) FROM kv_item_captures WHERE namespace=?',(namespace,)).fetchone()[0]==1
+
+
+@pytest.mark.parametrize('change', ['hidden', 'role', 'child', 'relocate', 'cancel', 'capture', 'request'])
+def test_twitter_assets_completion_rechecks_authority_after_hashing(twitter_assets, monkeypatch, change):
+    from modules.twitter import user_schema
+    state = twitter_assets
+    path = write_capture(state['media'], post_id='333')
+    job = new_job(state['catalog'])
+    jobs.update(job['id'], status='running', path=path, capture_id=archive._path_parts(path)[1])
+    before = twitter_assets_snapshot(state)
+    original = user_schema.register_catalog_capture
+    def alter(*args, **kwargs):
+        value = original(*args, **kwargs)
+        with (jobs.get_jobs_db if change=='request' else state['connect'])() as db:
+            if change == 'hidden': db.execute('UPDATE files_sources SET visible=0')
+            if change == 'role': db.execute("UPDATE files_sources SET role='files'")
+            if change == 'relocate': db.execute('UPDATE files_sources SET path=?', (str(state['media'].with_name('missing')),))
+            if change == 'child':
+                sources.register_source(db, state['media'] / 'captures', 'Child')
+                db.execute("UPDATE files_sources SET visible=0 WHERE display_name='Child'")
+            if change == 'request': db.execute("UPDATE twitter_downloads SET request_id='changed'")
+            db.commit()
+        if change == 'cancel': jobs.update(job['id'], status='cancelled')
+        if change == 'capture': jobs.update(job['id'], capture_id='20261015T120000000000Z-1234abcd')
+        return value
+    monkeypatch.setattr(user_schema, 'register_catalog_capture', alter)
+    with pytest.raises((ValueError, serving.ServeDenied)):
+        jobs.register(jobs.get(job['id']), catalog_database=state['catalog_db'])
+    assert jobs.get(job['id'])['status'] != 'complete'
+    assert twitter_assets_snapshot(state) == before
+
+
+def test_twitter_assets_default_completion_preserves_essential_catalog(twitter_assets, monkeypatch):
+    state = twitter_assets
+    path = write_capture(state['media'], post_id='333')
+    job = new_job(state['catalog'])
+    jobs.update(job['id'], status='running', path=path, capture_id=archive._path_parts(path)[1])
+    before = twitter_assets_snapshot(state)
+    jobs.register(jobs.get(job['id']))
+    assert jobs.get(job['id'])['status'] == 'complete' and twitter_assets_snapshot(state) == before
+    with jobs.get_user_db() as db:
+        assert db.execute("SELECT count(*) AS total FROM kv_item_captures WHERE namespace='twitter.request'").fetchone()['total']==1
+
+
+@pytest.mark.parametrize('target_kind', ['inside', 'outside', 'private', 'child'])
+def test_twitter_assets_links_follow_shared_resolved_containment(twitter_assets, target_kind):
+    state = twitter_assets
+    path = write_capture(state['media'])
+    original = (state['media'] / path).with_name('video.mp4')
+    directory = state['media'] if target_kind == 'inside' else state['media'].parent if target_kind == 'outside' else state['media'] / target_kind
+    directory.mkdir(exist_ok=True)
+    retained = directory / 'retained-video.mp4'
+    original.rename(retained)
+    try:
+        original.symlink_to(retained)
+    except OSError:
+        pytest.skip('Native symlink privilege unavailable; exercised on Linux')
+    before = twitter_assets_snapshot(state)
+    registered = [state['source']]
+    if target_kind == 'child':
+        registered.append(replace(state['source'], source_id='nested', path=str(directory), visible=False))
+    if target_kind == 'inside':
+        twitter_assets_register(state, path)
+    else:
+        with pytest.raises((ValueError, serving.ServeDenied)):
+            twitter_assets_register(state, path, registered=registered,
+                                    suite_home=directory if target_kind == 'private' else None)
+        assert twitter_assets_snapshot(state) == before
+    assert retained.read_bytes() == b'generated-video'
+
+
+@pytest.mark.parametrize('change', ['missing', 'type', 'source', 'post', 'capture', 'path'])
+def test_twitter_assets_bad_receipt_refuses_before_file_access(twitter_assets, monkeypatch, change):
+    state = twitter_assets
+    path = write_capture(state['media'], post_id='333')
+    job = new_job(state['catalog'])
+    jobs.update(job['id'], path=path, capture_id=archive._path_parts(path)[1])
+    receipt = jobs.get(job['id'])
+    if change == 'missing': del receipt['request_id']
+    if change == 'type': receipt = []
+    if change == 'source': receipt['source_id'] = 'other'
+    if change == 'post': receipt['post_id'] = '444'
+    if change == 'capture': receipt['capture_id'] = '20261015T120000000000Z-1234abcd'
+    if change == 'path': receipt['path'] = '../outside'
+    monkeypatch.setattr(archive, 'verified_assets', lambda *a: (_ for _ in ()).throw(AssertionError('Invalid receipt cannot authorize media reads')))
+    before = twitter_assets_snapshot(state)
+    with pytest.raises(ValueError): twitter_assets_register(state, path, receipt=receipt)
+    assert twitter_assets_snapshot(state) == before
+
+
+@pytest.mark.parametrize('change', ['path', 'capture', 'request', 'status'])
+def test_twitter_assets_stale_completion_refuses_before_index_or_catalog(twitter_assets, monkeypatch, change):
+    state = twitter_assets
+    path = write_capture(state['media'], post_id='333')
+    job = new_job(state['catalog'])
+    jobs.update(job['id'], status='running', path=path, capture_id=archive._path_parts(path)[1])
+    stale = jobs.get(job['id'])
+    with jobs.get_jobs_db() as db:
+        field = {'path':'path', 'capture':'capture_id', 'request':'request_id', 'status':'status'}[change]
+        db.execute('UPDATE twitter_downloads SET ' + field + '=?', ('cancelled' if change == 'status' else 'changed',))
+        db.commit()
+    monkeypatch.setattr(index, 'scan_source', lambda *a, **kw: (_ for _ in ()).throw(AssertionError('Do not index stale intent')))
+    before = twitter_assets_snapshot(state)
+    with pytest.raises(ValueError, match='changed'): jobs.register(stale, catalog_database=state['catalog_db'])
+    assert twitter_assets_snapshot(state) == before

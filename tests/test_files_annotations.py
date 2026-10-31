@@ -38,6 +38,23 @@ class AnnotationStoreTests(unittest.TestCase):
             )
         )
 
+    def test_old_schema_details_migration_preserves_notes_and_rows(self) -> None:
+        old = sqlite3.connect(':memory:')
+        self.addCleanup(old.close)
+        old.row_factory = sqlite3.Row
+        old.execute('CREATE TABLE files_annotations (id INTEGER PRIMARY KEY, subject_kind TEXT, content_hash TEXT, source_id TEXT, relative_path TEXT, description TEXT, created_at TEXT, updated_at TEXT)')
+        old.execute("INSERT INTO files_annotations VALUES (7,'dir',NULL,'src','folder','irreplaceable','then','now')")
+        annotations.ensure_annotations_schema(old)
+        note = annotations.get_annotation(old, source_id='src', relative_path='folder')
+        self.assertEqual((note.id, note.description, note.details, note.metadata_applied), (7, 'irreplaceable', [], False))
+        annotations.upsert_annotation(old, subject_kind='dir', source_id='src', relative_path='folder',
+            details=[{'label':'Album','value':'音楽'}], metadata_applied=True)
+        annotations.ensure_annotations_schema(old)
+        note = annotations.get_annotation(old, source_id='src', relative_path='folder')
+        self.assertEqual(note.description, 'irreplaceable')
+        self.assertEqual(note.details, [{'label':'Album','value':'音楽'}])
+        self.assertTrue(note.metadata_applied)
+
     def test_author_and_extra_info_persist_and_update_independently(self) -> None:
         created = annotations.upsert_annotation(
             self.conn,

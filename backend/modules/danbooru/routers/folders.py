@@ -1,8 +1,10 @@
 from __future__ import annotations
+from modules.danbooru.operational_state import index_connection, ingest_table
 
 import os
 import sqlite3
 import subprocess
+from services.process_launch import quiet_options
 import sys
 from pathlib import Path
 from typing import Literal
@@ -138,7 +140,7 @@ def _remove_index_rows(
 ) -> int:
     removed_ids = [int(row["id"]) for row in rows]
     removed_paths = [str(row["path"]) for row in rows]
-    with get_data_db() as conn:
+    with index_connection(get_data_db,get_user_db) as conn:
         for start in range(0, len(removed_ids), 400):
             chunk = removed_ids[start:start + 400]
             placeholders = ",".join("?" for _ in chunk)
@@ -151,7 +153,7 @@ def _remove_index_rows(
             conn.execute(f"DELETE FROM files WHERE id IN ({placeholders})", chunk)
         if removed_ids:
             conn.execute("DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM post_tags)")
-        for table in ("sync_manifest", "ingest_state"):
+        for table in ("sync_manifest", ingest_table(conn)):
             try:
                 for start in range(0, len(removed_paths), 400):
                     chunk = removed_paths[start:start + 400]
@@ -172,7 +174,8 @@ def _remove_index_rows(
         # Release keeps the folder in Files; forget/removal withdraws it.
         if published and published.get("path"):
             sources.ensure_sources_schema(uconn)
-            source_id = sources.deterministic_source_id(str(published["path"]))
+            shared = sources.get_source_by_path(uconn, str(published["path"]))
+            source_id = shared.source_id if shared is not None else sources.deterministic_source_id(str(published["path"]))
             if keep_files_source:
                 sources.update_source(uconn, source_id, role="files", commit=False)
             else:
@@ -471,6 +474,7 @@ def browse_for_folder():
             capture_output=True,
             text=True,
             timeout=300,
+            **quiet_options(),
         )
     except subprocess.TimeoutExpired:
         raise HTTPException(408, "Folder picker timed out")
@@ -532,7 +536,7 @@ def relocate_folder(root_id: str, data: FolderRelocate):
     old_root = Path(str(registered["path"])).expanduser().resolve(strict=False)
     display_name = new_root.name or str(registered["name"])
 
-    with get_data_db() as conn:
+    with index_connection(get_data_db,get_user_db) as conn:
         root_rows = conn.execute(
             "SELECT id, path, relative_path FROM files WHERE root_id=? ORDER BY id",
             (root_id,),
@@ -578,7 +582,7 @@ def relocate_folder(root_id: str, data: FolderRelocate):
                     continue
                 # These are regenerable index rows. A stale entry at the new
                 # location must not block preservation of the stable file/root IDs.
-                for table in ("sync_manifest", "ingest_state"):
+                for table in ("sync_manifest", ingest_table(conn)):
                     try:
                         conn.execute(f"DELETE FROM {table} WHERE media_path=?", (new_path,))
                     except sqlite3.OperationalError:
@@ -594,7 +598,7 @@ def relocate_folder(root_id: str, data: FolderRelocate):
                     "UPDATE files SET path=?, folder=? WHERE id=?",
                     (new_path, folder_label, file_id),
                 )
-                for table in ("sync_manifest", "ingest_state"):
+                for table in ("sync_manifest", ingest_table(conn)):
                     try:
                         conn.execute(
                             f"UPDATE {table} SET media_path=? WHERE media_path=?",

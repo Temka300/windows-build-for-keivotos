@@ -1,8 +1,10 @@
 """One isolated capture helper; stdout carries bounded structured events only."""
+from services.operation_diagnostics import worker_diagnostics
 import json
 import sys
 
 
+@worker_diagnostics
 def main(arguments):
     if arguments:
         return 2
@@ -11,7 +13,9 @@ def main(arguments):
         spec = json.loads(sys.stdin.readline(16384))
         def notify(phase, progress):
             print(json.dumps({'event': 'progress', 'phase': phase, 'progress': progress}), flush=True)
-        files = capture(spec, notify)
+        def media_notify(name,progress):
+            print(json.dumps({'event':'file','name':name,'progress':progress}),flush=True)
+        files = capture(spec, notify, media_notify=media_notify)
         print(json.dumps({'event': 'complete', 'files': files}), flush=True)
         return 0
     except Exception as error:

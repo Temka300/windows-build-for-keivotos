@@ -1,7 +1,18 @@
-import {get} from '../../lib/http';
+import {get,post} from '../../lib/http';
+import type {LibraryCategory,CategoryItem,CategoryMembership} from '../registry';
 export interface Chapter {path:string; kind:'folder'|'archive'; name:string;}
 export interface Manga {source_id:string; path:string; name:string; cover:Chapter; cover_revision?:string|null;}
 export interface PageMetadata {count:number; revision:string; revisions:string[];}
+export const mangaDetailFields=['summary','tags'] as const;
+export type MangaDetailField=typeof mangaDetailFields[number];
+export interface MangaFields {summary?:string|null;tags?:string[]|null;}
+export interface MangaDetailSubject {source_id:string;path:string;}
+export interface MangaDetails {subject:MangaDetailSubject;fields:MangaFields;local_fields:MangaFields;overrides:MangaFields;version:number;source_revision:string;}
+export interface MangaDetailSave extends MangaDetailSubject {fields:MangaFields;version:number;source_revision:string;request_id:string;}
+
+export interface ReadingPosition {source_id:string;series_path:string;path:string;kind:'folder'|'archive';revision:string;page_count:number;page:number;mode:'paged'|'vertical';anchor:number;generation:number;sequence:number;updated_at:string;}
+export interface ReadingState {generation:number;position:ReadingPosition|null;}
+export const progressIdentity=(manga:Manga,chapter:Chapter,revision:string)=>({source_id:manga.source_id,series_path:manga.path,path:chapter.path,kind:chapter.kind,revision});
 
 /** Keep a small image window alive so native image requests can reuse it. */
 export function createPagePrefetch(){
@@ -56,7 +67,20 @@ export function createPagePrefetch(){
   };
 }
 export const mangaApi = {
-  library:(q:string,offset=0,signal?:AbortSignal)=>get<{items:Manga[];total:number}>('/manga/library',{q,offset},signal),
+  details:(subject:MangaDetailSubject,signal?:AbortSignal)=>get<MangaDetails>('/manga/metadata',{source_id:subject.source_id,path:subject.path},signal),
+  refreshDetails:(subject:MangaDetailSubject)=>post<MangaDetails>('/manga/metadata/refresh',{source_id:subject.source_id,path:subject.path}),
+  saveDetails:(payload:MangaDetailSave)=>post<MangaDetails>('/manga/metadata/overrides',payload),
+  categories: {
+    list:(offset=0,signal?:AbortSignal)=>get<{items:LibraryCategory[];total:number}>('/manga/categories',{offset,limit:120},signal),
+    create:(name:string,request_id:string)=>post<LibraryCategory>('/manga/categories',{name,request_id}),
+    membership:(item:CategoryItem,signal?:AbortSignal)=>get<CategoryMembership>('/manga/category-membership',{source_id:item.source_id,path:item.path},signal),
+    saveMembership:(item:CategoryItem,category_ids:string[],version:number,request_id:string)=>post<CategoryMembership>('/manga/category-membership',{source_id:item.source_id,path:item.path,category_ids,version,request_id}),
+  },
+  progress:(manga:Manga,chapter:Chapter,revision:string)=>post<ReadingState>('/manga/progress/read',progressIdentity(manga,chapter,revision)),
+  beginProgress:(manga:Manga,chapter:Chapter,revision:string,expected_generation:number)=>post<{generation:number}>('/manga/progress/session',{...progressIdentity(manga,chapter,revision),expected_generation}),
+  saveProgress:(position:Omit<ReadingPosition,'page_count'|'updated_at'>)=>post<ReadingPosition>('/manga/progress',position),
+  seriesProgress:(manga:Manga,offset=0,signal?:AbortSignal)=>get<{items:ReadingPosition[];total:number}>('/manga/progress/series',{source_id:manga.source_id,series_path:manga.path,offset,limit:120},signal),
+  library:(q:string,offset=0,signal?:AbortSignal,category?:string)=>get<{items:Manga[];total:number}>('/manga/library',{q,offset,...(category?{category}:{})},signal),
   chapters:(manga:Manga,signal?:AbortSignal)=>get<{items:Chapter[]}>('/manga/chapters',{source_id:manga.source_id,path:manga.path},signal),
   pages:(manga:Manga,chapter:Chapter,signal?:AbortSignal)=>get<PageMetadata>('/manga/pages',{source_id:manga.source_id,path:chapter.path,kind:chapter.kind,metadata:true},signal),
   page:(manga:Manga,chapter:Chapter,page=0,cover=false,revision?:string,representation:'original'|'webp'='original')=>{

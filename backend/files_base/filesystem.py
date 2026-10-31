@@ -7,12 +7,15 @@ Isolated: no Danbooru or ``core`` imports.
 """
 from __future__ import annotations
 
+from services.operation_diagnostics import observed
 import string
 import subprocess
+from services.process_launch import quiet_options
 import sys
 from pathlib import Path
 
 
+@observed('suite', 'files.pick_folder')
 def native_pick_folder(code_root: Path) -> str | None:
     """Open the native Windows folder dialog; return the chosen path or None.
 
@@ -29,7 +32,7 @@ def native_pick_folder(code_root: Path) -> str | None:
         else [sys.executable, str(helper)]
     )
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(command, capture_output=True, text=True, timeout=300, **quiet_options())
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("folder picker timed out") from exc
     if result.returncode != 0:

@@ -18,17 +18,19 @@ except ModuleNotFoundError as exc:
 from modules.files import descriptor as files_descriptor
 try:
     from modules.video import descriptor as video_descriptor
+    from modules.video.delivery import contribution as video_delivery
 except ModuleNotFoundError as exc:
     if exc.name != "modules.video":
         raise
-    video_descriptor = None
+    video_descriptor = video_delivery = None
 
 try:
     from modules.manga import descriptor as manga_descriptor
+    from modules.manga.delivery import contribution as manga_delivery
 except ModuleNotFoundError as exc:
     if exc.name != "modules.manga":
         raise
-    manga_descriptor = None
+    manga_descriptor = manga_delivery = None
 
 try:
     from modules.language import descriptor as language_descriptor
@@ -53,21 +55,30 @@ except ModuleNotFoundError as exc:
         raise
     ost_descriptor = None
 
+try:
+    from modules.twitter import descriptor as twitter_descriptor
+    from modules.twitter.delivery import contribution as twitter_delivery
+    from modules.twitter.helpers import dispatch_helper as twitter_helper
+except ModuleNotFoundError as exc:
+    if exc.name != 'modules.twitter':
+        raise
+    twitter_descriptor = twitter_delivery = twitter_helper = None
+
 
 # One import/factory entry is the registration boundary for each module.
 _DESCRIPTOR_FACTORIES = (
     files_descriptor,
-) + ((danbooru_descriptor,) if danbooru_descriptor is not None else ()) + ((video_descriptor,) if video_descriptor is not None else ()) + ((manga_descriptor,) if manga_descriptor is not None else ()) + ((youtube_descriptor,) if youtube_descriptor is not None else ()) + ((language_descriptor,) if language_descriptor is not None else ()) + ((ost_descriptor,) if ost_descriptor is not None else ())
+) + ((danbooru_descriptor,) if danbooru_descriptor is not None else ()) + ((video_descriptor,) if video_descriptor is not None else ()) + ((manga_descriptor,) if manga_descriptor is not None else ()) + ((youtube_descriptor,) if youtube_descriptor is not None else ()) + ((language_descriptor,) if language_descriptor is not None else ()) + ((ost_descriptor,) if ost_descriptor is not None else ()) + ((twitter_descriptor,) if twitter_descriptor is not None else ())
 
 
-_DELIVERY_PROVIDERS = ((danbooru_delivery,) if danbooru_delivery is not None else ()) + ((youtube_delivery,) if youtube_delivery is not None else ())
+_DELIVERY_PROVIDERS = ((danbooru_delivery,) if danbooru_delivery is not None else ()) + ((video_delivery,) if video_delivery is not None else ()) + ((manga_delivery,) if manga_delivery is not None else ()) + ((youtube_delivery,) if youtube_delivery is not None else ()) + ((twitter_delivery,) if twitter_delivery is not None else ())
 
 
 def delivery_contributions(target: str):
     return tuple(provider(target) for provider in _DELIVERY_PROVIDERS)
 
 
-_HELPER_HANDLERS = ((danbooru_helper,) if danbooru_helper is not None else ()) + ((youtube_helper,) if youtube_helper is not None else ())
+_HELPER_HANDLERS = ((danbooru_helper,) if danbooru_helper is not None else ()) + ((youtube_helper,) if youtube_helper is not None else ()) + ((twitter_helper,) if twitter_helper is not None else ())
 
 
 def dispatch_helper(
@@ -119,6 +130,24 @@ class ModuleRegistry:
 
     def optional(self) -> tuple[ModuleDescriptor, ...]:
         return tuple(descriptor for descriptor in self if descriptor.disableable)
+
+    def file_metadata_contributions(self):
+        """Installed owners may expose preserved facts while operationally disabled."""
+        return tuple((owner, owner.file_metadata_provider) for owner in self
+                     if owner.file_metadata_provider is not None)
+
+    def download_control_contributions(self):
+        return tuple((owner,owner.download_control_provider) for owner in self
+                     if owner.download_control_provider is not None)
+
+    def download_history_contributions(self):
+        """Passive installed-owner facts, independent of runtime enablement."""
+        return tuple((owner,owner.download_history_provider) for owner in self
+                     if owner.download_history_provider is not None)
+
+    def portable_contributions(self):
+        return tuple((owner,owner.portable_provider) for owner in self
+                     if owner.portable_provider is not None)
 
     def replacing(self, replacement: ModuleDescriptor) -> "ModuleRegistry":
         if replacement.slug not in self._by_slug:

@@ -10,6 +10,7 @@ No ``core`` import.
 """
 from __future__ import annotations
 
+from services.operation_diagnostics import observed
 import hashlib
 import io
 import json
@@ -246,6 +247,7 @@ def download_artist_profile_image(url: str, platform: str) -> tuple[bytes, str, 
     return data, extension, int(width), int(height)
 
 
+@observed('danbooru', 'artist.archive')
 def archive_artist_profile_asset(
     tag_name: str,
     platform: str,
@@ -306,6 +308,7 @@ def archive_artist_profile_asset(
     return True
 
 
+@observed('danbooru', 'artist.archive_media')
 def archive_artist_profile_media(tag_name: str) -> ArtistProfileArchiveResult:
     name = normalize_search_tag(tag_name)
     sources = artist_profile_sources(name)

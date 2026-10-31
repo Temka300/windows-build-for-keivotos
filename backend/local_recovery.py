@@ -1,6 +1,7 @@
 """Small rotating recovery checkpoints for the irreplaceable user database."""
 from __future__ import annotations
 
+from services.operation_diagnostics import observed
 import hashlib
 import logging
 import shutil
@@ -160,6 +161,7 @@ def _next_checkpoint_stamp() -> str:
     return current.strftime("%Y%m%d_%H%M%S_%f")
 
 
+@observed('suite', 'recovery.checkpoint')
 def create_local_recovery_checkpoint(reason: str = "manual") -> dict[str, Any]:
     """Create a verified snapshot unless the newest checkpoint is identical."""
     with _checkpoint_lock:

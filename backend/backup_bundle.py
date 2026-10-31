@@ -1,5 +1,7 @@
 """Manual, user-directed metadata backup bundles and validated restoration."""
 from __future__ import annotations
+from services.operation_diagnostics import observed
+from contextlib import closing
 
 import errno
 import hashlib
@@ -45,6 +47,90 @@ BACKUP_FORMAT = "danbooru-metadata-backup"
 BACKUP_SUFFIX = ".keivotosbk"
 LEGACY_BACKUP_SUFFIXES = (".whbackup",)
 SUPPORTED_BACKUP_SUFFIXES = (BACKUP_SUFFIX, *LEGACY_BACKUP_SUFFIXES)
+
+
+
+def _jobs_path() -> Path:
+    import config
+    return config.JOBS_DB_PATH
+
+
+def _preserved_path() -> Path:
+    import config
+    return config.SUITE_HOME / 'preserved'
+
+
+def _preservation_files():
+    from storage_layout import portable_path
+    root=_preserved_path()
+    if not root.exists():return
+    if root.is_symlink() or root.absolute()!=root.resolve():
+        raise ValueError('Preservation storage contains links')
+    for directory,dirs,files in os.walk(root,followlinks=False):
+        for name in [*dirs,*files]:
+            target=Path(directory)/name
+            portable_path(root,target.relative_to(root).as_posix())
+        for name in files:
+            # Successful/recoverable complete records and originals only.
+            if name.endswith('.partial') or name=='.prepare.lock':continue
+            path=Path(directory)/name
+            if path.is_file():yield path
+
+
+def _restore_kind(key: str) -> str:
+    if key in ('preserved_items','runtime_configuration'):return 'tree'
+    return "sqlite" if key=="operational_database" else BACKUP_COMPONENTS[key].kind
+
+
+def _validate_operational_pair(user: Path, jobs: Path) -> None:
+    """Refuse incompatible generations without rewriting staged evidence."""
+    with closing(sqlite3.connect(jobs)) as job_connection:
+        from services import job_store_migration
+        generation=job_store_migration.initialize(job_connection)
+        owners=job_connection.execute('SELECT owner,version,receipt_token FROM kv_operational_owners').fetchall()
+        if any(version!=1 for _,version,_ in owners):
+            raise ValueError("Unsupported operational owner schema")
+    if owners:
+        with closing(sqlite3.connect(user)) as user_connection:
+            if not user_connection.execute("SELECT 1 FROM sqlite_master WHERE name='kv_operational_migrations'").fetchone():
+                raise ValueError("Operational backup has no essential migration receipt")
+            for owner,_,token in owners:
+                intent=user_connection.execute('SELECT token FROM kv_operational_intents WHERE owner=? AND generation=?',(owner,generation)).fetchone()
+                if intent!=(token,):raise ValueError('Operational backup has a different migration source')
+                row=user_connection.execute('SELECT version FROM kv_operational_migrations WHERE owner=? AND generation=?',(owner,generation)).fetchone()
+                if row!=(1,):
+                    raise ValueError("Operational backup generation does not match its user database")
+
+
+def _index_backup_owner(key, path, declaration=None):
+    from services.catalog_index import is_combined
+    component = BACKUP_COMPONENTS[key]
+    descriptor = MODULE_REGISTRY.get(component.owner)
+    if descriptor is None or descriptor.catalog_index_provider is None:
+        if declaration is not None:
+            raise ValueError("Unknown index backup owner")
+        return None
+    owner = descriptor.catalog_index_provider()
+    if declaration is not None and declaration != {"version":owner.version,"tables":list(owner.tables)}:
+        raise ValueError("Unsupported index backup ownership")
+    if Path(path).is_file():
+        with closing(sqlite3.connect(Path(path).resolve().as_uri()+"?mode=ro",uri=True)) as connection:
+            combined = is_combined(connection)
+        if combined:
+            return owner
+    return owner if declaration is not None else None
+
+
+def _component_available(key,path):
+    if not Path(path).exists():return False
+    component=BACKUP_COMPONENTS[key]
+    descriptor=MODULE_REGISTRY.get(component.owner)
+    if component.kind=='sqlite' and descriptor is not None and descriptor.catalog_index_provider:
+        from services.catalog_index import is_combined
+        with closing(sqlite3.connect(Path(path).resolve().as_uri()+'?mode=ro',uri=True)) as db:
+            if is_combined(db):
+                return db.execute('SELECT 1 FROM kv_index_owners WHERE owner=?',(descriptor.slug,)).fetchone() is not None
+    return True
 
 
 def collect_backup_components(registry=MODULE_REGISTRY) -> dict[str, BackupComponent]:
@@ -295,6 +381,18 @@ def backup_estimate(components: dict[str, Any] | None = None) -> dict[str, Any]:
             "bytes": size,
             "display_size": _format_bytes(size),
         }
+        if key=="user_database" and selected[key] and _jobs_path().exists():
+            extra_count,extra_size=_cached_tree_stats("operational_database",_jobs_path())
+            details[key]["files"]+=extra_count
+            details[key]["bytes"]+=extra_size
+            details[key]["display_size"]=_format_bytes(details[key]["bytes"])
+            count+=extra_count;size+=extra_size
+        if key=='user_database' and selected[key]:
+            preserved=list(_preservation_files())
+            extra_count=len(preserved);extra_size=sum(p.stat().st_size for p in preserved)
+            details[key]['files']+=extra_count;details[key]['bytes']+=extra_size
+            details[key]['display_size']=_format_bytes(details[key]['bytes'])
+            count+=extra_count;size+=extra_size
         total_files += count
         total_bytes += size
 
@@ -425,6 +523,7 @@ def _write_tree(archive: zipfile.ZipFile, source: Path, archive_root: str) -> in
     return written
 
 
+@observed('suite', 'backup.create')
 def create_backup_bundle(components: dict[str, Any] | None = None, *, automatic_id: str | None = None) -> dict[str, Any]:
     if not _bundle_lock.acquire(blocking=False):
         raise RuntimeError("A backup or restore is already running")
@@ -435,7 +534,7 @@ def create_backup_bundle(components: dict[str, Any] | None = None, *, automatic_
         selected = dict(requested)
         omitted = []
         for key, (_archive_name, source) in COMPONENTS.items():
-            if selected[key] and BACKUP_COMPONENTS[key].owner != "suite" and not source.exists():
+            if selected[key] and BACKUP_COMPONENTS[key].owner != "suite" and not _component_available(key,source):
                 selected[key] = False
                 omitted.append(key)
         if not any(selected.values()):
@@ -458,12 +557,32 @@ def create_backup_bundle(components: dict[str, Any] | None = None, *, automatic_
         with tempfile.TemporaryDirectory(prefix=".keivotos-backup-", dir=destination) as temporary_name:
             temporary = Path(temporary_name)
             staged: dict[str, Path] = {}
+            index_owners = {}
+            referenced_files = None
             with exclusive_database_access():
                 for key, (_archive_name, source) in COMPONENTS.items():
                     if selected[key] and BACKUP_COMPONENTS[key].kind == "sqlite":
                         snapshot = temporary / f"{key}.sqlite"
                         _sqlite_snapshot(source, snapshot)
+                        owner = _index_backup_owner(key, snapshot)
+                        if owner is not None:
+                            from services.catalog_index import restrict_snapshot
+                            restrict_snapshot(snapshot,owner)
+                            index_owners[key] = {"version":owner.version,"tables":list(owner.tables)}
                         staged[key] = snapshot
+                if selected["user_database"] and _jobs_path().exists():
+                    snapshot=temporary/"operational.sqlite"
+                    _sqlite_snapshot(_jobs_path(),snapshot)
+                    _validate_operational_pair(staged["user_database"],snapshot)
+                    staged["operational_database"]=snapshot
+                if selected["user_database"]:
+                    import config
+                    from services.asset_preservation import snapshot
+                    included_owners=set()
+                    if selected[ATTACHMENTS_COMPONENT]:included_owners.add("files")
+                    if selected.get("artist_profile_archive"):included_owners.add("danbooru")
+                    referenced_files=snapshot(staged["user_database"],config.SUITE_HOME,MODULE_REGISTRY,
+                        config,temporary/"referenced-files",include_owners=included_owners)
                 if selected[ATTACHMENTS_COMPONENT] and "user_database" not in staged:
                     snapshot = temporary / "attachment-user.sqlite"
                     _sqlite_snapshot(USER_DB_PATH, snapshot)
@@ -478,20 +597,32 @@ def create_backup_bundle(components: dict[str, Any] | None = None, *, automatic_
                 "requested_components": requested,
                 "component_owners": {key: BACKUP_COMPONENTS[key].owner for key in selected},
                 "omitted_components": omitted,
+                "operational_database": "operational_database" in staged,
+                "preserved_items": bool(selected['user_database'] and _preserved_path().exists()),
+                "referenced_files": referenced_files is not None,
                 "external_images_included": False,
                 "thumbnails_included": False,
                 "credentials_included": False,
                 "files": [],
             }
+            if index_owners:
+                manifest["index_owners"] = index_owners
             with zipfile.ZipFile(partial_path, "x", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
                 for key, (archive_name, source) in COMPONENTS.items():
                     if not selected[key]:
                         continue
                     actual_source = staged.get(key, source)
                     _write_tree(archive, actual_source, archive_name)
+                if "operational_database" in staged:
+                    _write_tree(archive,staged["operational_database"],"databases/jobs.sqlite")
+                if manifest['preserved_items']:
+                    for source in _preservation_files():
+                        archive.write(source,'preserved/'+source.relative_to(_preserved_path()).as_posix())
                 if selected[ATTACHMENTS_COMPONENT]:
                     for arcname, source in _attachment_records(staged.get("user_database", staged.get("attachment_user"))).items():
                         archive.write(source, f"{ATTACHMENTS_ARCHIVE_ROOT}/{arcname}")
+                if referenced_files is not None:
+                    _write_tree(archive,temporary/"referenced-files","referenced-files")
                 sanitized_config = runtime_config_snapshot()
                 archive.writestr("config.json", json.dumps(sanitized_config, indent=2, ensure_ascii=False))
                 manifest["files"] = [
@@ -601,6 +732,7 @@ def _verify_copy(source: Path, destination: Path) -> None:
             raise RuntimeError(f"Restore copy verification failed: {source.name}")
 
 
+@observed('suite', 'backup.restore')
 def restore_backup_bundle(name: str) -> dict[str, Any]:
     if not _bundle_lock.acquire(blocking=False):
         raise RuntimeError("A backup or restore is already running")
@@ -633,11 +765,15 @@ def restore_backup_bundle(name: str) -> dict[str, Any]:
             with zipfile.ZipFile(source, "r") as archive:
                 archive.extractall(staging, members=_safe_members(archive))
             replacements = []
+            index_owners = manifest.get("index_owners", {})
+            if not isinstance(index_owners,dict) or any(key not in COMPONENTS or not components.get(key)
+                    or _restore_kind(key) != "sqlite" for key in index_owners):
+                raise ValueError("Invalid index backup ownership")
             for key, (archive_name, live) in COMPONENTS.items():
                 if not components[key]:
                     continue
                 restored = staging / archive_name
-                if BACKUP_COMPONENTS[key].kind == "sqlite":
+                if _restore_kind(key) == "sqlite":
                     _check_sqlite(restored)
                 elif not restored.exists():
                     # Legacy ZIPs do not record empty directory entries.
@@ -647,55 +783,138 @@ def restore_backup_bundle(name: str) -> dict[str, Any]:
                 check_recovery_path(live)
                 replacements.append((key, live, restored))
 
+            operational=manifest.get("operational_database",False)
+            if type(operational) is not bool or operational and not components["user_database"]:
+                raise ValueError("Invalid operational backup selection")
+            restored_jobs=staging/"databases/jobs.sqlite"
+            if operational:
+                _check_sqlite(restored_jobs)
+                _validate_operational_pair(staging/"databases/user.sqlite",restored_jobs)
+                check_recovery_path(_jobs_path())
+                replacements.append(("operational_database",_jobs_path(),restored_jobs))
+            elif components["user_database"] and _jobs_path().exists():
+                # Old bundles have no jobs snapshot. Preserve the current file
+                # through the existing rollback archive, then start a new empty
+                # generation rather than pairing unrelated queues with old data.
+                if restored_jobs.exists():
+                    raise ValueError("Undeclared operational database in backup")
+                restored_jobs.parent.mkdir(parents=True,exist_ok=True)
+                with closing(sqlite3.connect(restored_jobs)) as fresh:
+                    from services.job_store_migration import initialize
+                    initialize(fresh)
+                check_recovery_path(_jobs_path())
+                replacements.append(("operational_database",_jobs_path(),restored_jobs))
+            preserved=manifest.get('preserved_items',False)
+            if type(preserved) is not bool or preserved and not components['user_database']:
+                raise ValueError('Invalid preservation backup selection')
+            restored_preserved=staging/'preserved'
+            if preserved:
+                restored_preserved.mkdir(exist_ok=True)
+                check_recovery_path(_preserved_path())
+                # Merge create-only evidence in staging. Restoring an older
+                # bundle must retain later captures and original source bytes.
+                for path in _preservation_files():
+                    relative=path.relative_to(_preserved_path())
+                    incoming=restored_preserved/relative
+                    if incoming.exists():
+                        _verify_copy(path,incoming)
+                    else:
+                        incoming.parent.mkdir(parents=True,exist_ok=True)
+                        _copy_verified(path,incoming)
+                replacements.append(('preserved_items',_preserved_path(),restored_preserved))
+            elif restored_preserved.exists():
+                raise ValueError('Undeclared preservation files in backup')
+            referenced=manifest.get("referenced_files",False)
+            if type(referenced) is not bool or referenced and not components["user_database"]:
+                raise ValueError("Invalid referenced-file backup selection")
+            if referenced:
+                from services.asset_preservation import validate_snapshot
+                validate_snapshot(staging/"referenced-files")
+            elif (staging/"referenced-files").exists():
+                raise ValueError("Undeclared referenced files in backup")
+            restored_config=staging/"config.json"
+            if components["user_database"] and restored_config.is_file():
+                incoming_config=json.loads(restored_config.read_text(encoding="utf-8"))
+                if not isinstance(incoming_config,dict):raise ValueError("Invalid restored configuration")
+                # Keep this machine's configured media/metadata/tool locations.
+                import config
+                merged={**config.runtime_config_snapshot(),**incoming_config}
+                for field in ("data_root","metadata_dir","gallery_dl_dir"):
+                    merged[field]=config._cfg.get(field,str(getattr(config,{"data_root":"DATA_ROOT","metadata_dir":"METADATA_DIR","gallery_dl_dir":"GALLERY_DL_DIR"}[field])))
+                restored_config.write_text(json.dumps(merged,ensure_ascii=False,indent=2),encoding="utf-8")
+                check_recovery_path(config.RUNTIME_CONFIG_FILE)
+                replacements.append(("runtime_configuration",config.RUNTIME_CONFIG_FILE,restored_config))
             with exclusive_database_access():
-                # Local preparations make the install/rollback renames atomic even
-                # when a module lives on a different volume from suite recovery.
-                prepared = []
-                applied = []
-                try:
-                    for key, live, restored in replacements:
-                        if BACKUP_COMPONENTS[key].kind == "sqlite":
-                            _quiesce_sqlite(live)
-                        live.parent.mkdir(parents=True, exist_ok=True)
-                        local = Path(tempfile.mkdtemp(prefix=".keivotos-restore-", dir=live.parent))
-                        prepared.append(local)
-                        _copy_verified(restored, local / "incoming")
-                        if live.exists():
-                            _copy_verified(live, rollback_dir / key)
-                        # Journals are moved with their database and restored on failure.
-                        paths = [live]
-                        if BACKUP_COMPONENTS[key].kind == "sqlite":
-                            paths += [Path(str(live) + suffix) for suffix in ("-wal", "-shm")]
-                        for index, path in enumerate(paths):
-                            previous = local / f"previous-{index}" if path.exists() else None
-                            if previous is not None:
-                                path.replace(previous)
-                            applied.append((path, previous, local / f"rejected-{index}"))
-                        (local / "incoming").replace(live)
-                    for key, live, _ in replacements:
-                        if BACKUP_COMPONENTS[key].kind == "sqlite":
-                            _check_sqlite(live)
-                except Exception as error:
-                    failures = []
-                    for live, previous, rejected in reversed(applied):
-                        try:
-                            if live.exists():
-                                live.replace(rejected)
-                            if previous is not None:
-                                previous.replace(live)
-                        except OSError as rollback_error:
-                            failures.append(str(rollback_error))
-                    if failures:
-                        # Never clean up local originals after a failed rollback.
-                        raise RuntimeError(f"Restore rollback needs recovery from {rollback_dir}; local copies: {prepared}") from error
-                    for local in prepared:
-                        shutil.rmtree(local)
-                    raise
+                if referenced:
+                    import config
+                    from services.asset_preservation import restore_snapshot
+                    restore_snapshot(staging/"referenced-files",config.SUITE_HOME)
+                import config
+                coordinated=(config.SUITE_HOME/'state/storage-active.json').exists()
+                if coordinated:
+                    from services import storage_authority as authority
+                    attempt=rollback_dir/'coordinated'
+                    databases,resources=authority.prepare_restore(config,replacements,attempt,operational_present=operational)
+                    authority.install_databases(config.SUITE_HOME,attempt,databases,resources=resources)
+                    authority._record(config.SUITE_HOME/'state/storage-restart-required.json',
+                                      dict(format=1,recovery=str(attempt)))
+                    if components[ATTACHMENTS_COMPONENT]:
+                        attachment_result=_restore_attachments(staging/ATTACHMENTS_ARCHIVE_ROOT,USER_DB_PATH)
                 else:
-                    for local in prepared:
-                        shutil.rmtree(local)
-                if components[ATTACHMENTS_COMPONENT]:
-                    attachment_result = _restore_attachments(staging / ATTACHMENTS_ARCHIVE_ROOT, USER_DB_PATH)
+                    # Local preparations make the install/rollback renames atomic even
+                    # when a module lives on a different volume from suite recovery.
+                    prepared = []
+                    applied = []
+                    try:
+                        for key, live, restored in replacements:
+                            if _restore_kind(key) == "sqlite":
+                                _quiesce_sqlite(live)
+                            live.parent.mkdir(parents=True, exist_ok=True)
+                            local = Path(tempfile.mkdtemp(prefix=".keivotos-restore-", dir=live.parent))
+                            prepared.append(local)
+                            owner = (_index_backup_owner(key,live,index_owners.get(key))
+                                     if _restore_kind(key) == "sqlite" and key != "operational_database" else None)
+                            if owner is not None and live.exists():
+                                from services.catalog_index import merge_owner_snapshot
+                                merge_owner_snapshot(live,restored,local/"incoming",owner)
+                            else:
+                                _copy_verified(restored, local / "incoming")
+                            if live.exists():
+                                _copy_verified(live, rollback_dir / key)
+                            # Journals are moved with their database and restored on failure.
+                            paths = [live]
+                            if _restore_kind(key) == "sqlite":
+                                paths += [Path(str(live) + suffix) for suffix in ("-wal", "-shm")]
+                            for index, path in enumerate(paths):
+                                previous = local / f"previous-{index}" if path.exists() else None
+                                if previous is not None:
+                                    path.replace(previous)
+                                applied.append((path, previous, local / f"rejected-{index}"))
+                            (local / "incoming").replace(live)
+                        for key, live, _ in replacements:
+                            if _restore_kind(key) == "sqlite":
+                                _check_sqlite(live)
+                    except Exception as error:
+                        failures = []
+                        for live, previous, rejected in reversed(applied):
+                            try:
+                                if live.exists():
+                                    live.replace(rejected)
+                                if previous is not None:
+                                    previous.replace(live)
+                            except OSError as rollback_error:
+                                failures.append(str(rollback_error))
+                        if failures:
+                            # Never clean up local originals after a failed rollback.
+                            raise RuntimeError(f"Restore rollback needs recovery from {rollback_dir}; local copies: {prepared}") from error
+                        for local in prepared:
+                            shutil.rmtree(local)
+                        raise
+                    else:
+                        for local in prepared:
+                            shutil.rmtree(local)
+                    if components[ATTACHMENTS_COMPONENT]:
+                        attachment_result = _restore_attachments(staging / ATTACHMENTS_ARCHIVE_ROOT, USER_DB_PATH)
 
         return {
             "status": "restored",

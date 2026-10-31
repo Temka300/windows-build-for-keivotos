@@ -119,6 +119,87 @@ class DanbooruNetworkTests(unittest.TestCase):
         self.assertEqual(from_cache.call_args.args[2], "connection failed")
         save.assert_not_called()
 
+    def test_denials_and_browser_challenges_are_not_rejected_credentials(self):
+        cases = [(401, {}, "authentication", "rejected the credentials"),
+                 (403, {}, "access denied", "denied access"),
+                 (403, {"CF-Mitigated": "challenge"}, "site challenge", "browser challenge")]
+        for status, headers, kind, message in cases:
+            with self.subTest(status=status, headers=headers):
+                error = urllib.error.HTTPError("https://example.test/?api_key=private", status,
+                                               "private", headers, None)
+                self.assertEqual(network.failure_kind(error), kind)
+                self.assertIsNone(network.retry_delay(error, 0))
+                detail = network.http_failure_detail(error)
+                self.assertIn(message, detail)
+                self.assertNotIn("private", detail)
+                with patch.object(client, "effective_credentials", return_value=(None, None, "none")), \
+                     patch.object(client, "read_json", side_effect=error):
+                    with self.assertRaises(HTTPException) as caught:
+                        client.danbooru_json("/wiki_pages/cat.json", {})
+                    self.assertEqual(caught.exception.status_code, 502)
+                    self.assertEqual(caught.exception.detail, detail)
+                with patch.object(tool_routes, "effective_credentials", return_value=("fixture", "dummy-key", "saved")), \
+                     patch.object(tool_routes.urllib.request, "urlopen", side_effect=error):
+                    with self.assertRaises(HTTPException) as caught:
+                        tool_routes.check_danbooru_credentials()
+                    self.assertEqual(caught.exception.status_code, 400 if status == 401 else 502)
+                    self.assertEqual(caught.exception.detail, detail)
+
+    def test_http_denials_are_never_retried_or_retained_as_response_html(self):
+        import io
+        import ssl
+        request = urllib.request.Request("https://example.test/posts.json")
+        for error in [urllib.error.HTTPError(request.full_url, 403, "Forbidden",
+                      {"cf-mitigated": "challenge"}, io.BytesIO(b"<html>private body</html>")),
+                      urllib.error.HTTPError(request.full_url, 403, "Forbidden", {}, None),
+                      urllib.error.URLError(ssl.SSLCertVerificationError("certificate failed"))]:
+            messages = []
+            with self.subTest(kind=network.failure_kind(error)), \
+                 patch.object(network.urllib.request, "urlopen", side_effect=error) as open_url, \
+                 patch.object(network.time, "sleep") as sleep:
+                with self.assertRaises(type(error)):
+                    network.read_json(request, timeout=1, retries=3, emit=messages.append)
+                self.assertEqual(open_url.call_count, 1)
+                sleep.assert_not_called()
+                self.assertNotIn("private body", "\n".join(messages))
+
+    def test_real_public_and_authenticated_reads_keep_headers_separate(self):
+        import base64
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        captured = []
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                captured.append((self.path, dict(self.headers)))
+                body = json.dumps({"id": 123, "tag_string": "sample_tag"}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def log_message(self, *args):
+                pass
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            base = f"http://127.0.0.1:{server.server_port}"
+            with patch.object(pipeline, "get_api_base_url", return_value=base):
+                for username, key in [(None, None), ("fixture", "dummy-key"), (None, None)]:
+                    result = pipeline.request_json("/posts/123.json", {}, username, key, 0)
+                    self.assertEqual(result["tag_string"], "sample_tag")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(5)
+        self.assertEqual(len(captured), 3)
+        self.assertIsNone(captured[0][1].get("Authorization"))
+        self.assertIsNone(captured[2][1].get("Authorization"))
+        expected = base64.b64encode(b"fixture:dummy-key").decode()
+        self.assertEqual(captured[1][1]["Authorization"], "Basic " + expected)
+        self.assertTrue(all("dummy-key" not in path for path, _ in captured))
+
     def test_filename_md5_lookup_does_not_read_media_before_the_request(self):
         name = "__amamiya_ren_akechi_goro_joker_arsene_and_crow_persona_and_2_more_drawn_by_doran_doran7280__88a41d15221a8e9536d94b7c1b6c665a.jpg"
         with tempfile.TemporaryDirectory() as directory:

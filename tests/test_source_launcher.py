@@ -5,6 +5,7 @@ import importlib.util
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,10 @@ class SourceLauncherTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         (self.root / "frontend").mkdir()
+        helpers=self.root / "backend/services"
+        helpers.mkdir(parents=True)
+        for name in ("log_bootstrap.py","diagnostic_policy.py","diagnostic_events.py"):
+            shutil.copyfile(ROOT / "backend/services" / name,helpers / name)
         self.root_patch = patch.object(launcher, "ROOT", self.root)
         self.root_patch.start()
         self.addCleanup(self.root_patch.stop)

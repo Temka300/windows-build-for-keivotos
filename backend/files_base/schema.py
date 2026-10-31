@@ -1,7 +1,9 @@
 """Disposable file-index schema for the Files base (V1.1.0).
 
 ``files.sqlite`` holds only facts derivable from disk (path, name, ext, size,
-mtime) plus a lazily-computed content hash. It is rebuildable at any time from
+mtime), a lazily-computed content hash and bounded on-demand audio metadata.
+The audio table contains only derived tags/properties, never personal state.
+It is rebuildable at any time from
 the filesystem, so it is never backed up and never authoritative. User-created
 data (sources, roles, favorites) belongs in ``user.sqlite`` instead — see
 docs/important/SUITE_MODULE_CONTRACT.md sections 3 and 5.
@@ -28,6 +30,14 @@ CREATE TABLE IF NOT EXISTS files_index (
     indexed_at TEXT,
     seen_at TEXT,
     available INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS files_audio_metadata (
+    source_id TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    identity TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (source_id, relative_path)
 );
 """
 

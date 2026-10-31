@@ -26,6 +26,9 @@ def _row_factory(cursor: sqlite3.Cursor, row: tuple) -> dict:
 class FolderRemovalTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = ROOT / "tests" / ".tmp-folder-removal"
+        jobs_patch=patch("config.JOBS_DB_PATH",self.temp/"state/jobs.sqlite")
+        jobs_patch.start()
+        self.addCleanup(jobs_patch.stop)
         shutil.rmtree(self.temp, ignore_errors=True)
         self.library = self.temp / "external-library"
         self.media = self.library / "characters" / "sample.jpg"
@@ -130,7 +133,7 @@ class FolderRemovalTests(unittest.TestCase):
         )
 
     def database_count(self, table: str) -> int:
-        connection = sqlite3.connect(self.data_db)
+        connection = sqlite3.connect(self.temp/"state/jobs.sqlite" if table=="ingest_state" else self.data_db)
         try:
             return int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
         finally:

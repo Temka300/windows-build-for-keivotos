@@ -100,8 +100,13 @@ export const activeModule = persistedWritable<ActiveModule>(
 // A module renders only when it is both the active surface AND enabled.
 export const enabledModules = writable<string[]>([]);
 export const suiteModules = writable<SuiteModule[]>([]);
+// Successful explicit scans can start owner work after the scan response.
+export const folderRescanChanges = writable(0);
 export const motionPreference = persistedWritable<MotionPreference>(persistentStorageKey('motion-preference'), 'system', normalizeMotionPreference);
 export const interfaceScale = persistedWritable<InterfaceScale>(persistentStorageKey('interface-scale'), 'default', normalizeInterfaceScale);
 
 export const settingsOpen = writable(false);
 export const settingsInitialSection = writable("appearance");
+
+// Suite utilities do not become modules or change the remembered module.
+export const suiteView = writable<'module' | 'downloads'>('module');

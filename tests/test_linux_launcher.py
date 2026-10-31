@@ -30,6 +30,9 @@ exit "${TEST_EXIT:-0}"
         if name != 'Keivotos': (stage / name).write_text('#!/bin/sh\nexit 0\n')
         (stage / name).chmod(0o755)
     (stage / 'linux-tools.txt').write_text('ffmpeg\n')
+    icon = stage / '_internal/assets/branding/keivotos/keivotos-icon-256.png'
+    icon.parent.mkdir(parents=True)
+    shutil.copyfile(ROOT / 'assets/branding/keivotos/keivotos-icon-256.png', icon)
     environment = os.environ.copy()
     for key in ('KEIVOTOS_HOME', 'XDG_DATA_HOME'):
         environment.pop(key, None)
@@ -123,10 +126,15 @@ def test_optional_desktop_install_is_user_local_and_create_only(package):
     assert launch(package, 'install-desktop.sh').returncode == 0
     original = target.read_bytes()
     assert b'Terminal=true' in original
+    icon = stage / '_internal/assets/branding/keivotos/keivotos-icon-256.png'
+    assert f'Icon={icon}\n' in original.decode()
+    assert icon.is_file()
     result = launch(package, 'install-desktop.sh')
     assert result.returncode == 73 and target.read_bytes() == original
     assert launch(package, 'install-desktop.sh', '--portable').returncode == 0
-    assert (target.parent / 'Keivotos-portable.desktop').is_file()
+    portable = target.parent / 'Keivotos-portable.desktop'
+    assert portable.is_file()
+    assert f'Icon={icon}\n' in portable.read_text()
     assert not Path(environment['TEST_RECORD']).exists()
     assert not Path(environment['TEST_DATA']).exists()
 
@@ -148,3 +156,67 @@ def test_desktop_exec_is_parsed_by_glib_without_path_injection(package):
     while not Path(environment['TEST_RECORD']).is_file() and time.monotonic() < deadline:
         time.sleep(.05)
     assert record(package) == [str(special), '']
+    assert desktop_icon(entry) == str(special / '_internal/assets/branding/keivotos/keivotos-icon-256.png')
+
+
+def desktop_icon(entry):
+    """Read the generated Icon through GLib's real desktop-keyfile parser."""
+    import ctypes
+    import ctypes.util
+    library = ctypes.util.find_library('gio-2.0')
+    if not library:
+        pytest.skip('GLib desktop parser library unavailable')
+    gio = ctypes.CDLL(library)
+    glib = ctypes.CDLL(ctypes.util.find_library('glib-2.0'))
+    gobject = ctypes.CDLL(ctypes.util.find_library('gobject-2.0'))
+    gio.g_desktop_app_info_new_from_filename.argtypes = [ctypes.c_char_p]
+    gio.g_desktop_app_info_new_from_filename.restype = ctypes.c_void_p
+    gio.g_desktop_app_info_get_string.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    gio.g_desktop_app_info_get_string.restype = ctypes.c_void_p
+    glib.g_free.argtypes = [ctypes.c_void_p]
+    glib.g_free.restype = None
+    gobject.g_object_unref.argtypes = [ctypes.c_void_p]
+    gobject.g_object_unref.restype = None
+    info = gio.g_desktop_app_info_new_from_filename(os.fsencode(entry))
+    assert info, 'Generated desktop entry is invalid'
+    value = None
+    try:
+        value = gio.g_desktop_app_info_get_string(info, b'Icon')
+        assert value
+        return ctypes.string_at(value).decode('utf-8')
+    finally:
+        if value: glib.g_free(value)
+        gobject.g_object_unref(info)
+
+
+@pytest.mark.parametrize('portable', [False, True])
+def test_missing_icon_never_creates_a_broken_entry(package, portable):
+    stage, environment = package
+    icon = stage / '_internal/assets/branding/keivotos/keivotos-icon-256.png'
+    icon.unlink()  # Generated package fixture only.
+    arguments = ('--portable',) if portable else ()
+    result = launch(package, 'install-desktop.sh', *arguments)
+    assert result.returncode == 66 and 'desktop icon is missing' in result.stderr
+    assert not (Path(environment['XDG_DATA_HOME']) / 'applications').exists()
+    assert not Path(environment['TEST_RECORD']).exists()
+    assert not Path(environment['TEST_DATA']).exists()
+
+
+def test_existing_desktop_entry_stays_untouched_even_when_icon_disappears(package):
+    stage, environment = package
+    assert launch(package, 'install-desktop.sh').returncode == 0
+    entry = Path(environment['XDG_DATA_HOME']) / 'applications/Keivotos.desktop'
+    original = entry.read_bytes()
+    (stage / '_internal/assets/branding/keivotos/keivotos-icon-256.png').unlink()
+    result = launch(package, 'install-desktop.sh')
+    assert result.returncode == 73 and entry.read_bytes() == original
+
+
+@pytest.mark.parametrize('portable', [False, True])
+def test_glib_reads_the_actual_existing_suite_icon(package, portable):
+    stage, environment = package
+    arguments = ('--portable',) if portable else ()
+    assert launch(package, 'install-desktop.sh', *arguments).returncode == 0
+    name = 'Keivotos-portable.desktop' if portable else 'Keivotos.desktop'
+    entry = Path(environment['XDG_DATA_HOME']) / 'applications' / name
+    assert desktop_icon(entry) == str(stage / '_internal/assets/branding/keivotos/keivotos-icon-256.png')

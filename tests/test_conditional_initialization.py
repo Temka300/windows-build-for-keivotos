@@ -17,6 +17,9 @@ import config, database, lifecycle
 from server import app
 from routers import files, user_settings, suite
 mode = __import__('os').environ['FIXTURE_MODE']
+active_user,active_index=database.USER_DB_PATH,database.DATA_DB_PATH
+database.USER_DB_PATH=config.LEGACY_USER_DB_PATH
+database.DATA_DB_PATH=config.LEGACY_DATA_DB_PATH
 if mode == 'enabled':
     database.init_user_db(set())
     with database.get_user_db() as conn:
@@ -33,12 +36,13 @@ if mode == 'preserved':
     with database.get_user_db() as conn:
         conn.execute("INSERT INTO favorites(file_id,added_at) VALUES(1,'2001-01-01')")
         conn.commit()
+database.USER_DB_PATH, database.DATA_DB_PATH=active_user,active_index
 async def run():
     async with lifecycle.lifespan(None):
         assert not any(t.get_name()=='suite-recovery-checkpoint' for t in asyncio.all_tasks())
         import local_recovery
         recovery = local_recovery.local_recovery_status()
-        assert Path(recovery['directory']) == config.SUITE_HOME / 'local_recovery' / 'user_database'
+        assert Path(recovery['directory']) == config.SUITE_HOME / 'recovery' / 'user_database'
         assert recovery['count'] == 0
         assert recovery['enabled'] is False
         if mode in {'disabled', 'absent'}:
@@ -55,6 +59,7 @@ async def run():
             assert '/api/ost/folders' not in app.openapi()['paths']
             assert '/api/ost/library' not in app.openapi()['paths']
             assert '/api/ost/cover' not in app.openapi()['paths']
+            assert not any(path.startswith('/api/twitter') for path in app.openapi()['paths'])
         import backup_bundle, zipfile
         created = backup_bundle.create_backup_bundle()
         manifest = backup_bundle.inspect_backup_bundle(Path(created['path']))
@@ -86,7 +91,7 @@ class ConditionalInitializationTests(unittest.TestCase):
             backend = ROOT / 'backend'
             if mode == 'absent':
                 backend = root / 'backend'
-                shutil.copytree(ROOT/'backend', backend, ignore=shutil.ignore_patterns('__pycache__','*.pyc','video','manga','youtube','language','ost'))
+                shutil.copytree(ROOT/'backend', backend, ignore=shutil.ignore_patterns('__pycache__','*.pyc','video','manga','youtube','language','ost','twitter'))
                 # Only the disposable copy is omitted; repository and user data are untouched.
                 shutil.rmtree(backend/'modules/danbooru')
             home = root/'home'
@@ -100,9 +105,9 @@ class ConditionalInitializationTests(unittest.TestCase):
             self.assertNotIn('failed',result.stderr.lower())
             return json.loads(result.stdout)
 
-    def test_disabled_starts_suite_without_index_or_module_tables(self):
+    def test_disabled_starts_suite_with_base_index_without_module_tables(self):
         result=self.run_fixture('disabled')
-        self.assertFalse(result['index'])
+        self.assertTrue(result['index'])
         self.assertEqual(result['tasks'],[])
         self.assertIn('user_settings',result['tables'])
         self.assertNotIn('favorites',result['tables'])
@@ -122,6 +127,6 @@ class ConditionalInitializationTests(unittest.TestCase):
 
     def test_physically_absent_module_starts_suite(self):
         result=self.run_fixture('absent')
-        self.assertFalse(result['index'])
+        self.assertTrue(result['index'])
         self.assertNotIn('favorites',result['tables'])
         self.assertEqual(result['tasks'],[])

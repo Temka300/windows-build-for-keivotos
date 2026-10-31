@@ -300,3 +300,146 @@ def migrate_user_tables(conn: sqlite3.Connection, data_db_path: Path, data_root:
         conn.execute("DETACH DATABASE datadb")
 
 
+def import_catalog_records(connection: sqlite3.Connection) -> int:
+    """Explicit danbooru.essential-records/version 1, without index/media IO.
+
+    The complete essential snapshot remains authoritative for personal values.
+    These profile-local aliases identify records, not inferred physical files.
+    Existing path/MD5/file-ID matching stays unchanged; references are retained
+    as observations for the later index bridge. No legacy row is rewritten.
+    """
+    import hashlib
+    import json
+    from uuid import NAMESPACE_URL, uuid4, uuid5
+    from services import item_catalog
+
+    if not connection.in_transaction:
+        raise ValueError('Import Danbooru records inside a caller transaction')
+    records = (
+        ('favorites', 'favorite', ('file_id',)),
+        ('collections', 'collection', ('id',)),
+        ('collection_items', 'collection-item', ('collection_id', 'file_id')),
+        ('favorite_tags', 'favorite-tag', ('tag_name', 'tag_category')),
+        ('favorite_tag_combos', 'tag-combo', ('id',)),
+        ('blacklist_tags', 'blacklist-tag', ('tag_name',)),
+        ('user_image_tags', 'user-tag', ('id',)),
+        ('image_views', 'image-view', ('file_id',)),
+        ('tag_wiki_cache', 'wiki', ('tag_name',)),
+        ('artist_follows', 'artist-follow', ('tag_name',)),
+        ('artist_follow_posts', 'artist-post', ('tag_name', 'danbooru_post_id')),
+        ('artist_profile_assets', 'profile-capture', ('id',)),
+        ('tag_removals', 'tag-removal', ('id',)),
+        ('registered_folders', 'registered-folder', ('name',)),
+    )
+    reference_tables = {'favorites', 'collection_items', 'user_image_tags', 'image_views', 'tag_removals'}
+    cursor = connection.cursor()
+    cursor.row_factory = sqlite3.Row
+    savepoint = 'danbooru_records_' + uuid4().hex
+    connection.execute('SAVEPOINT ' + savepoint)
+    try:
+        present = {row['name'] for row in cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        columns = {}
+        for table, _, keys in records:
+            if table not in present:
+                continue
+            columns[table] = {row['name'] for row in cursor.execute(f'PRAGMA table_info({table})')}
+            required = set(keys)
+            if table == 'artist_profile_assets':
+                required.update(('tag_name', 'platform', 'asset_kind', 'content_hash'))
+            if not required <= columns[table]:
+                raise ValueError('Unsupported Danbooru essential schema')
+            if cursor.execute(f'SELECT 1 FROM {table} GROUP BY ' + ','.join(keys) + ' HAVING count(*)>1 LIMIT 1').fetchone():
+                raise ValueError('Duplicate Danbooru record identity')
+        for child, parent, column, parent_key in (
+                ('collection_items', 'collections', 'collection_id', 'id'),
+                ('artist_follow_posts', 'artist_follows', 'tag_name', 'tag_name')):
+            if child not in columns:
+                continue
+            if parent not in columns:
+                orphan = cursor.execute(f'SELECT 1 FROM {child} LIMIT 1').fetchone()
+            else:
+                orphan = cursor.execute(f'SELECT 1 FROM {child} c LEFT JOIN {parent} p '
+                    f'ON p.{parent_key}=c.{column} WHERE p.{parent_key} IS NULL LIMIT 1').fetchone()
+            if orphan:
+                raise ValueError('Danbooru record has an unknown parent')
+
+        def key_value(name, value):
+            if name in ('id', 'file_id', 'collection_id', 'danbooru_post_id'):
+                if type(value) is not int or not 0 < value <= 2**63 - 1:
+                    raise ValueError('Invalid Danbooru numeric record identity')
+            elif not isinstance(value, str) or not value or len(value) > 4096 or '\0' in value:
+                raise ValueError('Invalid Danbooru text record identity')
+            return value
+
+        def encoded(values):
+            return json.dumps(values, ensure_ascii=False, separators=(',', ':'))
+
+        def identity(kind, key):
+            return str(uuid5(NAMESPACE_URL, 'urn:keivotos:danbooru:' + kind + ':' + encoded(key)))
+
+        count = 0
+        for table, kind, keys in records:
+            if table not in columns:
+                continue
+            selected = list(keys)
+            if table in reference_tables:
+                selected += [name for name in ('file_id', 'file_path', 'local_md5')
+                             if name in columns[table] and name not in selected]
+            if table == 'artist_profile_assets':
+                selected += ['tag_name', 'platform', 'asset_kind', 'content_hash']
+            if table == 'registered_folders' and 'root_id' in columns[table]:
+                selected.append('root_id')
+            for row in cursor.execute('SELECT ' + ','.join(selected) + f' FROM {table} ORDER BY ' + ','.join(keys)):
+                legacy_key = [key_value(name, row[name]) for name in keys]
+                canonical = legacy_key
+                if table == 'registered_folders' and 'root_id' in selected and row['root_id'] not in (None, ''):
+                    canonical = ['root', key_value('root_id', row['root_id'])]
+                record_id = identity(kind, canonical)
+                item_catalog.ensure_item(connection, namespace='danbooru.' + kind, legacy_key=encoded(legacy_key),
+                    owner='danbooru', item_type=kind, item_id=record_id)
+                if table == 'registered_folders' and canonical is not legacy_key:
+                    item_catalog.ensure_item(connection, namespace='danbooru.root', legacy_key=canonical[1],
+                        owner='danbooru', item_type=kind, item_id=record_id)
+                anchor = dict(table=table, key=canonical)
+                if table == 'artist_profile_assets':
+                    anchor.update({name: key_value(name, row[name]) for name in ('tag_name', 'platform', 'asset_kind', 'content_hash')})
+                item_catalog.record_capture(connection, item_id=record_id, namespace='danbooru.record',
+                    capture_key='identity', format_version=1, payload=anchor)
+                if table in reference_tables:
+                    values = {name: row[name] for name in ('file_id', 'file_path', 'local_md5') if name in selected}
+                    for name in ('file_path', 'local_md5'):
+                        value = values.get(name)
+                        if value is not None and (not isinstance(value, str) or '\0' in value):
+                            raise ValueError('Invalid Danbooru legacy file reference')
+                    if values.get('file_id') is not None:
+                        key_value('file_id', values['file_id'])
+                    mode = ('path' if values.get('file_path') is not None else 'md5' if values.get('local_md5') is not None
+                            else 'file-id' if values.get('file_id') is not None else 'unknown')
+                    payload = dict(match=mode, values=values)
+                    key = '1:' + hashlib.sha256(encoded(payload).encode('utf-8')).hexdigest()
+                    item_catalog.record_capture(connection, item_id=record_id, namespace='danbooru.file-reference',
+                        capture_key=key, format_version=1, payload=payload)
+                if table == 'collection_items':
+                    parent_id = identity('collection', [row['collection_id']])
+                    item_catalog.relate_items(connection, source_item_id=record_id, target_item_id=parent_id,
+                                              kind='in-collection')
+                if table == 'artist_follow_posts':
+                    parent_id = identity('artist-follow', [row['tag_name']])
+                    item_catalog.relate_items(connection, source_item_id=record_id, target_item_id=parent_id,
+                                              kind='followed-artist')
+                if table == 'artist_profile_assets':
+                    asset_id = str(uuid5(NAMESPACE_URL, 'urn:keivotos:danbooru:profile-asset:' + encoded(legacy_key)))
+                    item_catalog.record_asset(connection, asset_id=asset_id, media_type='application/octet-stream',
+                                              hash_algorithm='sha256', content_hash=row['content_hash'])
+                    item_catalog.link_asset(connection, item_id=record_id, asset_id=asset_id, role='profile-image')
+                count += 1
+        connection.execute('RELEASE ' + savepoint)
+        return count
+    except BaseException:
+        connection.execute('ROLLBACK TO ' + savepoint)
+        connection.execute('RELEASE ' + savepoint)
+        raise
+    finally:
+        cursor.close()
+
+

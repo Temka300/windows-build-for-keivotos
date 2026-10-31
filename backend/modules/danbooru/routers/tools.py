@@ -1,4 +1,5 @@
 from __future__ import annotations
+from modules.danbooru.operational_state import index_connection, ingest_table
 
 import base64
 import json
@@ -16,6 +17,7 @@ from modules.danbooru.credentials import clear_credentials, credential_environme
 from modules.danbooru.configuration import get_api_base_url, get_api_host, set_api_host
 from database import get_data_db
 from modules.danbooru.client import USER_AGENT
+from modules.danbooru.network import http_failure_detail
 from modules.danbooru.folder_registry import registered_folder_rows
 from modules.danbooru.tools import _cancel_tool, _extra_root_args, _import_discover_command, _import_enrich_command, _import_finalize_command, _launch_tool, _sync_command, _sync_scan_paths, _tool_base_command, tool_task_snapshot
 from modules.danbooru.models import AutomationStatus, AutomationUpdate, ImportRunRequest, ToolStatusInfo
@@ -86,9 +88,9 @@ def update_automation(update: AutomationUpdate):
 
 
 def _import_phase_counts() -> dict[str, int]:
-    with get_data_db() as connection:
+    with index_connection(get_data_db) as connection:
         row = connection.execute(
-            """
+            f"""
             SELECT
                 (SELECT COUNT(*) FROM files) AS total,
                 COALESCE(SUM(discovered_at IS NOT NULL), 0) AS discovered,
@@ -97,7 +99,7 @@ def _import_phase_counts() -> dict[str, int]:
                 COALESCE(SUM(finalized_at IS NOT NULL), 0) AS finalized,
                 COALESCE(SUM(status IN ('error', 'partial')), 0) AS errors,
                 COALESCE(SUM(status = 'no_match'), 0) AS no_match
-            FROM ingest_state
+            FROM {ingest_table(connection)}
             """
         ).fetchone()
     return {key: int(row[key]) for key in ("total", "discovered", "enriched", "metadata", "finalized", "errors", "no_match")}
@@ -154,7 +156,7 @@ def run_import(request: ImportRunRequest):
     return _launch_tool(
         "import",
         [phase_commands[item][0] for item in ordered],
-        environment=credential_environment(),
+        environment=credential_environment(use_saved_credentials=request.use_saved_credentials),
         stage_names=[phase_commands[item][1] for item in ordered],
         incomplete_steps={index for index, item in enumerate(ordered, 1) if item in {"metadata", "finalize"}},
     )
@@ -217,9 +219,7 @@ def check_danbooru_credentials():
         with urllib.request.urlopen(request, timeout=20) as response:
             profile = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        if exc.code in {401, 403}:
-            raise HTTPException(400, "Danbooru rejected these credentials") from exc
-        raise HTTPException(502, f"Danbooru returned HTTP {exc.code}") from exc
+        raise HTTPException(400 if exc.code == 401 else 502, http_failure_detail(exc)) from exc
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
         raise HTTPException(502, f"Could not reach Danbooru: {exc}") from exc
     return {

@@ -18,10 +18,11 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 import config
 from database import get_user_db
@@ -32,10 +33,12 @@ from files_base import (
     filesystem,
     hashing,
     index,
+    metadata as module_metadata,
     serving,
     sources,
 )
 from thumbnails import DEFAULT_THUMB_SIZE, SUPPORTED_IMAGES, SUPPORTED_VIDEOS, ensure_thumbnail
+from services import audio_metadata
 
 
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
@@ -114,6 +117,16 @@ class AnnotationLinkModel(BaseModel):
     kind: str = "source"
 
 
+class AnnotationDetailModel(BaseModel):
+    label: str = Field(min_length=1, max_length=128)
+    value: str = Field(min_length=1, max_length=262144)
+
+    @field_validator("label", "value", mode="before")
+    @classmethod
+    def strip_text(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+
 class AnnotationAttachmentModel(BaseModel):
     id: int
     content_hash: str
@@ -140,6 +153,8 @@ class AnnotationModel(BaseModel):
     updated_at: str | None = None
     links: list[AnnotationLinkModel] = []
     attachments: list[AnnotationAttachmentModel] = []
+    details: list[AnnotationDetailModel] = []
+    metadata_applied: bool = False
 
 
 class AnnotationRequest(BaseModel):
@@ -149,6 +164,15 @@ class AnnotationRequest(BaseModel):
     author: str = ""
     extra_info: str = ""
     links: list[AnnotationLinkModel] = []
+    details: list[AnnotationDetailModel] | None = Field(default=None, max_length=32)
+    metadata_applied: bool | None = None
+
+    @field_validator("details")
+    @classmethod
+    def unique_details(cls, value):
+        if value and len({item.label.casefold() for item in value}) != len(value):
+            raise ValueError("Each detail needs a different name")
+        return value
 
 
 class SubjectRef(BaseModel):
@@ -234,6 +258,8 @@ def _annotation_to_model(note: annotations.Annotation) -> AnnotationModel:
         description=note.description,
         author=note.author,
         extra_info=note.extra_info,
+        details=note.details,
+        metadata_applied=note.metadata_applied,
         created_at=note.created_at,
         updated_at=note.updated_at,
         links=[
@@ -330,6 +356,11 @@ def list_sources() -> list[SourceInfo]:
 
 @router.post("/api/files/sources", response_model=SourceInfo)
 def register_source(payload: SourceRegister) -> SourceInfo:
+    with index.source_work():
+        return _register_source(payload)
+
+
+def _register_source(payload: SourceRegister) -> SourceInfo:
     reason = sources.unsafe_source_reason(payload.path, _forbidden_source_paths())
     if reason is not None:
         raise HTTPException(status_code=400, detail=reason)
@@ -345,6 +376,11 @@ def register_source(payload: SourceRegister) -> SourceInfo:
 
 @router.post("/api/files/sources/{source_id}/scan", response_model=ScanSummary)
 def scan_source(source_id: str) -> ScanSummary:
+    with index.source_work():
+        return _scan_source(source_id)
+
+
+def _scan_source(source_id: str, *, notify_owner: bool = True) -> ScanSummary:
     with get_user_db() as user_conn:
         sources.ensure_sources_schema(user_conn)
         source = sources.get_source(user_conn, source_id)
@@ -353,6 +389,12 @@ def scan_source(source_id: str) -> ScanSummary:
         raise HTTPException(status_code=404, detail="Unknown source")
     with index.open_index(config.FILES_DB_PATH) as index_conn:
         summary = _scan_registered_source(index_conn, source, all_sources)
+    from services.item_manifest import scan_registered
+    with get_user_db() as user_conn:
+        scan_registered(source,all_sources,config.SUITE_HOME,config.FILES_DB_PATH,user_conn,config.MODULE_REGISTRY)
+    if notify_owner:
+        from services.folder_roles import after_index_scan
+        after_index_scan(source)
     return ScanSummary(**summary)
 
 
@@ -392,12 +434,14 @@ def serve_file(
     with get_user_db() as user_conn:
         sources.ensure_sources_schema(user_conn)
         source = sources.get_source(user_conn, source_id)
-    if source is None:
+        registered = sources.list_sources(user_conn)
+    if source is None or not source.visible:
         raise HTTPException(status_code=404, detail="Unknown source")
 
     try:
         resolved = serving.resolve_served_file(
-            source.path, path, _forbidden_source_paths()
+            source.path, path, [*_forbidden_source_paths(), *(Path(child.path)
+                for child in sources.descendant_sources(source, registered))]
         )
     except serving.ServeDenied as denied:
         raise HTTPException(status_code=denied.status_code, detail=denied.detail) from denied
@@ -553,7 +597,8 @@ def _attachment_cover(
     if stored is None or not stored.stored_root:
         return None
     ext = attachment_store.extension_for(stored.file_name, stored.media_type)
-    candidate = attachment_store.resolve_attachment(stored.stored_root, stored.content_hash, ext)
+    with get_user_db() as preserved_db:
+        candidate = attachment_store.resolve_stored_attachment(stored,preserved_db,config.SUITE_HOME)
     return candidate if candidate.is_file() else None
 
 
@@ -651,26 +696,23 @@ def search(
     q: str = Query(..., min_length=1),
     source_id: str | None = Query(None),
     limit: int = Query(200, ge=1, le=1000),
+    offset: Annotated[int, Query(ge=0)] = 0,
 ) -> list[FileNode]:
-    source_ids: list[str] | None = None
+    with get_user_db() as user_conn:
+        sources.ensure_sources_schema(user_conn)
+        registered = sources.list_sources(user_conn)
+    source_ids = None
     if source_id is not None:
-        with get_user_db() as user_conn:
-            sources.ensure_sources_schema(user_conn)
-            source = sources.get_source(user_conn, source_id)
-            if source is None:
-                raise HTTPException(status_code=404, detail="Unknown source")
-            all_sources = sources.list_sources(user_conn)
-        source_ids = [
-            source.source_id,
-            *(candidate.source_id for candidate in sources.descendant_sources(source, all_sources)),
-        ]
+        source = next((candidate for candidate in registered if candidate.source_id == source_id), None)
+        if source is None:
+            raise HTTPException(status_code=404, detail="Unknown source")
+        if not source.visible:
+            return []
+        source_ids = [source.source_id, *(child.source_id for child in sources.descendant_sources(source, registered))]
     with index.open_index(config.FILES_DB_PATH) as index_conn:
-        entries = index.search_by_name(
-            index_conn,
-            q,
-            source_ids=source_ids,
-            limit=limit,
-        )
+        scope = index.source_search_scope(index_conn, registered, source_ids=source_ids,
+                                          forbidden_paths=_forbidden_source_paths())
+        entries = index.search_by_name(index_conn, q, limit=limit, offset=offset, source_scope=scope)
     return [_entry_to_node(entry) for entry in entries]
 
 
@@ -678,6 +720,52 @@ def search(
 # A file is identified by content hash so its note survives a rename/move; a
 # folder is identified by its path. A file's hash is computed here on demand,
 # the moment the user enriches it (SUITE_MODULE_CONTRACT.md section 4.1).
+
+@router.get('/api/files/audio-metadata')
+def get_audio_metadata(response: Response, source_id: str = Query(..., max_length=256),
+                       path: str = Query(..., max_length=4096)) -> dict:
+    response.headers['Cache-Control'] = 'no-store'
+    with get_user_db() as connection:
+        registered = sources.list_sources(connection)
+    source = next((item for item in registered if item.source_id == source_id and item.visible), None)
+    if source is None:
+        raise HTTPException(404, 'Folder is unavailable')
+    forbidden = [config.SUITE_HOME, *(Path(item.path) for item in sources.descendant_sources(source, registered))]
+    try:
+        return audio_metadata.read(config.FILES_DB_PATH, source, path, forbidden)
+    except serving.ServeDenied as error:
+        raise HTTPException(error.status_code, error.detail) from error
+    except (OSError, ValueError) as error:
+        raise HTTPException(404, 'Audio file is unavailable') from error
+
+
+@router.get('/api/files/module-metadata')
+def get_module_metadata(response: Response, source_id: str = Query(..., max_length=256),
+                        path: str = Query('', max_length=4096)) -> dict:
+    response.headers['Cache-Control'] = 'no-store'
+    try:
+        with get_user_db() as connection:
+            context = module_metadata.context(connection, config.FILES_DB_PATH, config.SUITE_HOME, source_id, path)
+            return module_metadata.read(context, config.MODULE_REGISTRY)
+    except serving.ServeDenied as error:
+        raise HTTPException(error.status_code, error.detail) from error
+    except (OSError, ValueError) as error:
+        raise HTTPException(404, 'File metadata is unavailable') from error
+
+
+@router.get('/api/files/module-artwork')
+def get_module_artwork(source_id: str = Query(..., max_length=256), path: str = Query(..., max_length=4096),
+                       owner: str = Query(..., max_length=64), size: int = Query(300, ge=300, le=1200),
+                       v: str = Query('', max_length=128)):
+    try:
+        with get_user_db() as connection:
+            context = module_metadata.context(connection, config.FILES_DB_PATH, config.SUITE_HOME, source_id, path)
+            thumbnail = module_metadata.artwork(context, config.MODULE_REGISTRY, owner, size)
+        return FileResponse(thumbnail, media_type='image/webp', headers={'Cache-Control': 'no-store'})
+    except serving.ServeDenied as error:
+        raise HTTPException(error.status_code, error.detail) from error
+    except (OSError, ValueError) as error:
+        raise HTTPException(404, 'Local artwork is unavailable') from error
 
 @router.get("/api/files/info", response_model=AnnotationModel | None)
 def get_info(
@@ -734,11 +822,17 @@ def put_info(payload: AnnotationRequest) -> AnnotationModel | None:
             relative_path=payload.path,
         )
         # A note with no fields, no links, and no attachments is not worth keeping.
+        details = ([item.model_dump() for item in payload.details] if payload.details is not None
+                   else existing.details if existing else [])
+        metadata_applied = (payload.metadata_applied if payload.metadata_applied is not None
+                            else existing.metadata_applied if existing else False)
         if (
             not description
             and not author
             and not extra_info
             and not valid_links
+            and not details
+            and not metadata_applied
             and not (existing and existing.attachments)
         ):
             if existing is not None:
@@ -753,6 +847,8 @@ def put_info(payload: AnnotationRequest) -> AnnotationModel | None:
             description=description,
             author=author,
             extra_info=extra_info,
+            details=details,
+            metadata_applied=metadata_applied,
         )
         annotations.set_links(user_conn, note.id, valid_links)
         final = annotations.get_annotation(
@@ -874,6 +970,14 @@ def copy_info(payload: CopyInfoRequest) -> AnnotationModel:
     copy_extra = origin.extra_info.strip() or None
     if copy_extra and existing and existing.extra_info.strip():
         copy_extra = None
+    copy_details = list(existing.details) if existing else []
+    held_labels = {item['label'].casefold() for item in copy_details}
+    for item in origin.details:
+        if item['label'].casefold() not in held_labels:
+            copy_details.append(item)
+            held_labels.add(item['label'].casefold())
+    if len(copy_details) > 32:
+        raise HTTPException(status_code=409, detail="Copying would exceed 32 details; no origin info was changed")
 
     with get_user_db() as user_conn:
         annotations.ensure_annotations_schema(user_conn)
@@ -886,6 +990,7 @@ def copy_info(payload: CopyInfoRequest) -> AnnotationModel:
             description=origin.description.strip() or None,
             author=copy_author,
             extra_info=copy_extra,
+            details=copy_details,
         )
         merged = [
             {"url": link.url, "label": link.label, "kind": link.kind}
@@ -1068,7 +1173,8 @@ def serve_attachment(attachment_id: int, request: Request):
     if stored is None or not stored.stored_root:
         raise HTTPException(status_code=404, detail="Attachment not found")
     ext = attachment_store.extension_for(stored.file_name, stored.media_type)
-    resolved = attachment_store.resolve_attachment(stored.stored_root, stored.content_hash, ext)
+    with get_user_db() as preserved_db:
+        resolved = attachment_store.resolve_stored_attachment(stored,preserved_db,config.SUITE_HOME)
     if not resolved.is_file():
         raise HTTPException(status_code=404, detail="Attachment bytes are missing")
 

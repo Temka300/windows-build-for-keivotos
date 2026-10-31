@@ -35,6 +35,10 @@ def initialize_index(data_db_path: Path, connection_factory: Callable[[], Contex
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_posts_parent_id ON posts(parent_id)"
         )
+        from services.catalog_index import is_combined
+        if is_combined(conn):
+            conn.commit()
+            return
         rows = conn.execute(
             """SELECT id, path FROM files
                WHERE downloaded_at IS NULL

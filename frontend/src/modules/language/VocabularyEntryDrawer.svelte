@@ -1,25 +1,46 @@
 <script lang="ts">
   import {createEventDispatcher,onDestroy,tick} from 'svelte';
-  import {languageApi,type VocabularyCreate,type VocabularyEntry} from './api';
+  import {languageApi,type VocabularyCreate,type VocabularyEntry,type VocabularyEdit} from './api';
+  import {ApiError} from '../../lib/http';
   export let open=false;
+  export let entry:VocabularyEntry|null=null;
   const dispatch=createEventDispatcher<{close:void;saved:VocabularyEntry}>();
   let dialog:HTMLDivElement,wordInput:HTMLInputElement,decisionDialog:HTMLDivElement;
   let korean='',pronunciation='',english='',error='',busy=false,wasOpen=false,alive=true;
-  let submitted:VocabularyCreate|null=null;
+  let submitted:VocabularyCreate|VocabularyEdit|null=null;
+  let baseline={korean:'',pronunciation:'',english:''},revision:number|null=null,reading=false,conflict=false;
+  let request:AbortController|null=null;
   let decision:{resolve:(leave:boolean)=>void}|null=null;
   let returnFocus:HTMLElement|null=null;
-  $: dirty=!!(korean||pronunciation||english||submitted);
+  $: dirty=korean!==baseline.korean||pronunciation!==baseline.pronunciation||english!==baseline.english||!!submitted;
   $: invalid=!korean.trim()||!english.trim()||[...korean].length>256||[...pronunciation].length>256||[...english].length>2000;
   $: if(open&&!wasOpen){
-    wasOpen=true;korean='';pronunciation='';english='';error='';submitted=null;
+    wasOpen=true;setFields(entry??{korean:'',pronunciation:'',english:''});error='';submitted=null;revision=null;conflict=false;
+    if(entry)void loadEditing();
     void tick().then(()=>requestAnimationFrame(()=>{
       if(alive&&open){dialog?.getBoundingClientRect();wordInput?.focus({preventScroll:true});}
     }));
-  }else if(!open)wasOpen=false;
+  }else if(!open){wasOpen=false;request?.abort();}
+
+  function setFields(value:{korean:string;pronunciation:string;english:string}){baseline={korean:value.korean,pronunciation:value.pronunciation,english:value.english};korean=value.korean;pronunciation=value.pronunciation;english=value.english;}
+  async function loadEditing(){
+    if(!entry)return;request?.abort();const current=new AbortController();request=current;
+    const id=entry.id;reading=true;error='';revision=null;
+    try{const value=await languageApi.vocabularyEntry(id,current.signal);
+      if(!alive||!open||current.signal.aborted||entry?.id!==id)return;
+      if(value.archived)throw new Error('This entry was deleted. Close the drawer and refresh Vocabulary.');
+      setFields(value);revision=value.revision;submitted=null;conflict=false;
+    }catch(caught){if(alive&&!current.signal.aborted)error=caught instanceof Error?caught.message:'Could not load the saved entry.';}
+    finally{if(current===request){reading=false;await tick();if(alive&&open)wordInput?.focus({preventScroll:true});}}
+  }
 
   export function hasDraft(){return open&&(dirty||busy);}
   export async function beforeNavigate():Promise<boolean>{
     if(!open)return true;
+    if(!await confirmDiscard())return false;
+    dispatch('close');return true;
+  }
+  async function confirmDiscard():Promise<boolean>{
     if(busy||decision)return false;
     if(dirty){
       const leave=await new Promise<boolean>(resolve=>{
@@ -28,8 +49,9 @@
       });
       if(!alive||!leave)return false;
     }
-    dispatch('close');return true;
+    return true;
   }
+  async function reloadSaved(){if(!conflict||await confirmDiscard())await loadEditing();}
   function choose(leave:boolean){
     const pending=decision;decision=null;pending?.resolve(leave);
     if(!leave)void tick().then(()=>{if(alive&&open)(returnFocus&&dialog.contains(returnFocus)?returnFocus:wordInput)?.focus();});
@@ -52,37 +74,39 @@
     else trap(event,root);
   }
   async function save(){
-    if(busy||invalid||decision)return;
-    submitted??={request_id:crypto.randomUUID(),korean,pronunciation,english};
+    if(busy||reading||invalid||decision||conflict||entry&&(revision===null||!dirty))return;
+    submitted??={request_id:crypto.randomUUID(),korean,pronunciation,english,...(entry?{revision:revision!}:{})};
     const payload=submitted;busy=true;error='';
     try{
-      const entry=await languageApi.createVocabulary(payload);
-      if(alive&&open)dispatch('saved',entry);
+      const saved=entry?await languageApi.editVocabulary(entry.id,payload as VocabularyEdit):await languageApi.createVocabulary(payload);
+      if(alive&&open)dispatch('saved',saved);
     }catch(caught){
-      if(alive){error=caught instanceof Error?caught.message:'Could not save your entry. Retry saving it.';await tick();dialog?.focus();}
+      if(alive){conflict=!!entry&&caught instanceof ApiError&&caught.status===409;error=caught instanceof Error?caught.message:'Could not save your entry. Retry saving it.';await tick();dialog?.focus();}
     }finally{if(alive)busy=false;}
   }
-  onDestroy(()=>{alive=false;decision?.resolve(false);});
+  onDestroy(()=>{alive=false;request?.abort();decision?.resolve(false);});
 </script>
 
 <svelte:window on:keydown={keys}/>
 <div class="vocabulary-drawer-layer" class:open aria-hidden={!open}>
   <button class="vocabulary-shade" type="button" aria-label="Close vocabulary entry" tabindex="-1" disabled={!open||busy||!!decision} on:click={()=>void beforeNavigate()}></button>
   <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-  <div class="vocabulary-entry-drawer" class:open inert={!open||!!decision} role="dialog" aria-label="New vocabulary" tabindex="-1" bind:this={dialog}>
-    <header><h2>New vocabulary</h2><button class="close" type="button" aria-label="Close new vocabulary" disabled={busy} on:click={()=>void beforeNavigate()}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header>
+  <div class="vocabulary-entry-drawer" class:open inert={!open||!!decision} role="dialog" aria-label={entry?'Edit vocabulary':'New vocabulary'} tabindex="-1" bind:this={dialog}>
+    <header><h2>{entry?'Edit vocabulary':'New vocabulary'}</h2><button class="close" type="button" aria-label={entry?'Close edit vocabulary':'Close new vocabulary'} disabled={busy} on:click={()=>void beforeNavigate()}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header>
+    {#if reading}<p role="status">Loading saved entry…</p>{/if}
     <form on:submit|preventDefault={save}>
       <label for="vocabulary-korean">Korean word</label>
-      <input id="vocabulary-korean" lang="ko" autocomplete="off" bind:this={wordInput} bind:value={korean} disabled={busy} readonly={!!submitted} required aria-invalid={[...korean].length>256}/>
+      <input id="vocabulary-korean" lang="ko" autocomplete="off" bind:this={wordInput} bind:value={korean} disabled={busy||reading||!!entry&&revision===null} readonly={!!submitted} required aria-invalid={[...korean].length>256}/>
       {#if [...korean].length>256}<p class="error">Use up to 256 characters for the Korean word.</p>{/if}
       <label for="vocabulary-pronunciation">Pronunciation</label>
-      <input id="vocabulary-pronunciation" autocomplete="off" bind:value={pronunciation} disabled={busy} readonly={!!submitted} aria-invalid={[...pronunciation].length>256}/>
+      <input id="vocabulary-pronunciation" autocomplete="off" bind:value={pronunciation} disabled={busy||reading||!!entry&&revision===null} readonly={!!submitted} aria-invalid={[...pronunciation].length>256}/>
       {#if [...pronunciation].length>256}<p class="error">Use up to 256 characters for pronunciation.</p>{/if}
       <label for="vocabulary-english">English translation</label>
-      <textarea id="vocabulary-english" lang="en" rows="4" bind:value={english} disabled={busy} readonly={!!submitted} required aria-invalid={[...english].length>2000}></textarea>
+      <textarea id="vocabulary-english" lang="en" rows="4" bind:value={english} disabled={busy||reading||!!entry&&revision===null} readonly={!!submitted} required aria-invalid={[...english].length>2000}></textarea>
       {#if [...english].length>2000}<p class="error">Use up to 2000 characters for the English translation.</p>{/if}
       {#if error}<p class="error" role="alert">{error}</p><p class="kept-entry">Your entry is kept. Retry save to confirm it.</p>{/if}
-      <footer><button class="save" type="submit" disabled={busy||invalid}>{busy?'Saving…':error?'Retry save':'Save'}</button></footer>
+      {#if entry&&(conflict||revision===null)&&!reading}<button type="button" class="save" on:click={()=>void reloadSaved()}>{conflict?'Reload saved entry':'Retry loading entry'}</button>{/if}
+      <footer><button class="save" type="submit" disabled={busy||reading||invalid||conflict||!!entry&&(revision===null||!dirty)}>{busy?'Saving…':error&&submitted?'Retry save':'Save'}</button></footer>
     </form>
   </div>
 </div>

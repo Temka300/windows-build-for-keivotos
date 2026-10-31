@@ -6,7 +6,9 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
@@ -31,6 +33,11 @@ class ThumbnailTests(unittest.TestCase):
         thumbnails.THUMB_DIR = self.root / "cache"
 
     def tearDown(self) -> None:
+        # Keep this generated cache alive until its real maintenance finishes.
+        for worker in threading.enumerate():
+            if worker.name == "thumbnail-cache-prune":
+                worker.join(timeout=10)
+                self.assertFalse(worker.is_alive(), "Thumbnail pruning did not finish")
         thumbnails.THUMB_DIR = self.original_thumb_dir
         shutil.rmtree(self.root, ignore_errors=True)
 
@@ -67,6 +74,81 @@ class ThumbnailTests(unittest.TestCase):
         cleaned = thumbnails.cleanup_thumbnail_cache({content_md5})
         self.assertEqual(cleaned["removed"], 1)
         self.assertEqual(cleaned["tiers"], {"300": 1, "600": 1, "1200": 1})
+
+    def test_concurrent_reader_receives_only_a_complete_thumbnail(self) -> None:
+        source = self.root / "concurrent.png"
+        Image.new("RGB", (800, 400), "purple").save(source)
+        original = source.read_bytes()
+        key = hashlib.md5(original).hexdigest()
+        target = thumbnails.get_thumbnail_path(str(source), 300, key)
+        writing, release, reading = threading.Event(), threading.Event(), threading.Event()
+        save = Image.Image.save
+        calls = []
+
+        def delayed_save(image, destination, *args, **kwargs):
+            calls.append(True)
+            if hasattr(destination, "write"):
+                destination.write(b"partial image")
+                destination.flush()
+            else:
+                Path(destination).write_bytes(b"partial image")
+            writing.set()
+            self.assertTrue(release.wait(10))
+            if hasattr(destination, "seek"):
+                destination.seek(0)
+                destination.truncate()
+            return save(image, destination, *args, **kwargs)
+
+        def reader():
+            reading.set()
+            result = thumbnails.ensure_thumbnail(str(source), 300, key)
+            return result, result.read_bytes()
+
+        with patch.object(Image.Image, "save", delayed_save), ThreadPoolExecutor(max_workers=2) as pool:
+            writer = pool.submit(thumbnails.ensure_thumbnail, str(source), 300, key)
+            try:
+                self.assertTrue(writing.wait(10))
+                self.assertFalse(target.exists())
+                second = pool.submit(reader)
+                self.assertTrue(reading.wait(10))
+                with self.assertRaises(FutureTimeout):
+                    second.result(timeout=.1)
+            finally:
+                release.set()
+            self.assertEqual(writer.result(timeout=10), target)
+            result, content = second.result(timeout=10)
+        self.assertEqual(result, target)
+        self.assertEqual(content, target.read_bytes())
+        with Image.open(target) as image:
+            self.assertEqual(image.format, "WEBP")
+            image.verify()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(source.read_bytes(), original)
+        self.assertFalse(list(thumbnails.THUMB_DIR.glob(".thumbnail-*")))
+
+    def test_failed_thumbnail_write_or_publication_leaves_no_partial_cache(self) -> None:
+        source = self.root / "retry.png"
+        Image.new("RGB", (80, 40), "blue").save(source)
+        original = source.read_bytes()
+        key = hashlib.md5(original).hexdigest()
+        target = thumbnails.get_thumbnail_path(str(source), 300, key)
+
+        def fail_write(image, destination, *args, **kwargs):
+            destination.write(b"partial image")
+            raise OSError("generated write failure")
+
+        for failure in (patch.object(Image.Image, "save", fail_write),
+                        patch.object(Path, "replace", side_effect=OSError("generated publication failure"))):
+            with failure, self.assertLogs(thumbnails.logger, level="WARNING"):
+                self.assertIsNone(thumbnails.ensure_thumbnail(str(source), 300, key))
+            self.assertFalse(target.exists())
+            self.assertEqual(list(thumbnails.THUMB_DIR.iterdir()), [])
+            self.assertEqual(source.read_bytes(), original)
+        result = thumbnails.ensure_thumbnail(str(source), 300, key)
+        self.assertEqual(result, target)
+        with Image.open(result) as image:
+            image.verify()
+        self.assertEqual(source.read_bytes(), original)
 
     def test_warm_thumbnail_never_scans_cache_or_reencodes(self) -> None:
         source=self.root/'warm.png'

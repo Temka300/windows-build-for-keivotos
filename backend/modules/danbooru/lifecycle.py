@@ -10,6 +10,7 @@ The local-only watcher is owned by this module as well.
 """
 from __future__ import annotations
 
+from services.operation_diagnostics import observed
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 SIDECAR_LAYOUT_MIGRATION_KEY = "sidecar_layout_v2_complete"
 
 
+@observed('danbooru', 'sidecars.migrate')
 def run_sidecar_layout_migration() -> None:
     """Danbooru-only: fold legacy sidecars into the canonical layout, once."""
     try:

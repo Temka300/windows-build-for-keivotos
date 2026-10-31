@@ -18,7 +18,7 @@ def publish_sources(user_connection: sqlite3.Connection) -> None:
     folders = [(str(row["path"]), row["display_name"]) for row in rows]
     sources.reconcile_module_sources(user_connection, "danbooru", folders)
     for path, _name in folders:
-        source = sources.get_source(user_connection, sources.deterministic_source_id(path))
+        source = sources.get_source_by_path(user_connection, path)
         if source is not None:
             user_connection.execute(
                 "UPDATE registered_folders SET display_name=? WHERE path=?",
@@ -86,6 +86,24 @@ def _routers() -> list:
     ]
 
 
+
+def _startup():
+    from modules.danbooru.operational_state import recover,index_connection
+    with index_connection():
+        pass
+    recover()
+    from database import get_jobs_db
+    from modules.danbooru.downloads import recover as recover_downloads
+    with get_jobs_db() as connection:
+        from services.download_controls import recover_workers
+        recover_workers(connection,'danbooru')
+        recover_downloads(connection)
+
+
+async def _shutdown():
+    from modules.danbooru.tools import shutdown
+    await shutdown()
+
 def _background_tasks() -> list:
     """Danbooru's lifetime background work, imported lazily at startup."""
     from modules.danbooru.lifecycle import background_tasks
@@ -137,6 +155,10 @@ def _backup_components() -> tuple[BackupComponent, ...]:
 def descriptor(suite_home: Path, version: str) -> ModuleDescriptor:
     home = suite_home / "modules" / "danbooru"
     return ModuleDescriptor(
+        portable_provider=_portable,
+        download_history_provider=_download_history,
+        download_control_provider=_download_controls,
+        transfer_provider=_transfer,
         slug="danbooru",
         name="Danbooru",
         description="Browse your image library with Danbooru tags and metadata.",
@@ -160,7 +182,36 @@ def descriptor(suite_home: Path, version: str) -> ModuleDescriptor:
         relocate_hook=relocate_source,
         router_provider=_routers,
         background_tasks_hook=_background_tasks,
+        startup_hook=_startup,
+        shutdown_hook=_shutdown,
         index_initializer=_initialize_index,
+        catalog_index_provider=_catalog_index,
         user_schema_provider=_user_schema,
         user_migrator=_migrate_user_tables,
     )
+
+
+def _catalog_index():
+    from modules.danbooru.catalog_index import index_owner
+    from config import DATA_ROOT, SIDECAR_DIR
+    return index_owner(media_root=DATA_ROOT, sidecar_dir=SIDECAR_DIR)
+
+
+def _portable():
+    from modules.danbooru.portable import contribution
+    return contribution()
+
+
+def _transfer():
+    from modules.danbooru.transfer import contribution
+    return contribution()
+
+
+def _download_history(context):
+    from modules.danbooru.downloads import contribute
+    return contribute(context)
+
+
+def _download_controls():
+    from modules.danbooru.downloads import controls
+    return controls()

@@ -477,6 +477,12 @@ class ReleaseLayoutTests(unittest.TestCase):
         launcher = (ROOT / "app.py").read_text(encoding="utf-8")
         self.assertIn('CONSOLE_ICON_PATH = ROOT / "assets" / "branding" / "keivotos" / "keivotos.ico"', launcher)
         self.assertIn("SetConsoleTitleW(WEB_TITLE)", launcher)
+        self.assertIn('WINDOWS_APP_ID = "Keivotos.Desktop"', launcher)
+        self.assertIn("SetCurrentProcessExplicitAppUserModelID(WINDOWS_APP_ID)", launcher)
+        self.assertEqual(
+            (ROOT / "assets/branding/keivotos/keivotos.ico").read_bytes(),
+            (ROOT / "packaging/windows/assets/keivotos.ico").read_bytes(),
+        )
         self.assertIn("wm_seticon = 0x0080", launcher)
         self.assertIn("user32.SendMessageW(console_window, wm_seticon, icon_kind, icon)", launcher)
 

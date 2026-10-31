@@ -192,3 +192,30 @@ print(json.dumps(str(runtime)))
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+def test_structured_stream_keeps_legacy_callers_filters_and_crash_reference(tmp_path):
+    code = r'''
+import json, logging, sys
+sys.path.insert(0,sys.argv[1])
+from runtime_logging import configure_runtime_logging
+from config import DIAGNOSTIC_LOG_FILE
+configure_runtime_logging()
+error=RuntimeError('password=private-fixture')
+logger=logging.getLogger('keivotos.fixture')
+for index in range(2):
+    logger.error('boundary failed',exc_info=(type(error),error,None))
+logging.getLogger('uvicorn.access').info('%s %s %s %s %s','local','GET','/poll','1.1',200)
+logger.info('known secret fixture-key', extra={'diagnostic_secrets':('fixture-key',)})
+logging.shutdown()
+print(json.dumps(str(DIAGNOSTIC_LOG_FILE)))
+'''
+    result=subprocess.run([sys.executable,'-c',code,str(ROOT/'backend')],
+        env={**os.environ,'KEIVOTOS_HOME':str(tmp_path)},text=True,capture_output=True,check=True)
+    events=[json.loads(line) for line in Path(json.loads(result.stdout)).read_text(encoding='utf-8').splitlines()]
+    assert len(events)==3
+    assert events[0]['event_code']=='python.log' and 'exception' in events[0]
+    assert events[1]['exception_event_id']==events[0]['event_id'] and 'exception' not in events[1]
+    assert events[2]['message']=='known secret [redacted]'
+    assert 'fixture-key' not in result.stderr and 'private-fixture' not in result.stderr

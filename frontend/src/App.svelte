@@ -1,11 +1,13 @@
 <script lang="ts">
   import { accentStyle, settingsStyle, accents } from './lib/appearance';
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { get } from 'svelte/store';
   import './app.css';
+  import DownloadsView from './components/DownloadsView.svelte';
+  import NotificationOverlay from './components/NotificationOverlay.svelte';
   import { SUITE_NAME } from './lib/product';
   import { suiteApi } from './lib/suiteApi';
-  import { activeModule, enabledModules, interfaceScale, motionPreference, startupModule, suiteModules, settingsOpen, settingsInitialSection } from './lib/suiteStores';
+  import { activeModule, suiteView, enabledModules, interfaceScale, motionPreference, startupModule, suiteModules, settingsOpen, settingsInitialSection } from './lib/suiteStores';
   import { loadSettingsModal, type SettingsModalModule } from './lib/settingsLoader';
   let settingsModule: SettingsModalModule | null = null;
   let settingsLoading = false;
@@ -65,23 +67,48 @@
     activeModule.set(activeDescriptor.slug);
   }
   $: if (typeof document !== 'undefined') {
-    document.title = activeDescriptor && !activeDescriptor.is_base
+    document.title = $suiteView === 'downloads' ? SUITE_NAME + ' - Downloads' : activeDescriptor && !activeDescriptor.is_base
       ? `${SUITE_NAME} - ${activeDescriptor.name}`
       : SUITE_NAME;
+  }
+
+
+  type NavigationSurface = import('svelte').SvelteComponent & {beforeNavigate?: (slug: string) => boolean | Promise<boolean>};
+  let surfaceInstance: NavigationSurface | null = null;
+  let downloadsNavigation = false;
+  async function openDownloads(prepare: () => Promise<void>): Promise<boolean> {
+    if (downloadsNavigation || get(settingsOpen) || document.querySelector('dialog[open], [role="dialog"][aria-modal="true"]:not(.video-viewer)')) return false;
+    downloadsNavigation = true;
+    const previous = surfaceInstance;
+    const previousView = get(suiteView);
+    try {
+      if (previousView === 'module' && previous?.beforeNavigate && !await previous.beforeNavigate('@downloads')) return false;
+      if (surfaceInstance !== previous || get(suiteView) !== previousView || get(settingsOpen)) return false;
+      await prepare();
+      if (surfaceInstance !== previous || get(suiteView) !== previousView) return false;
+      suiteView.set('downloads');
+      await tick();
+      document.querySelector<HTMLElement>('.downloads-scroll')?.focus({preventScroll: true});
+      return true;
+    } finally { downloadsNavigation = false; }
   }
 
   onMount(() => { void initializeModules(); });
 </script>
 
 <div class="flex flex-col h-screen bg-[#0f0f14] text-gray-200">
-  {#if ActiveSurface}
-    <svelte:component this={ActiveSurface} />
+  {#if registryReady && $suiteView === 'downloads'}
+    <DownloadsView />
+  {:else if ActiveSurface}
+    <svelte:component this={ActiveSurface} bind:this={surfaceInstance} />
   {:else if registryError}
     <main class="flex flex-1 items-center justify-center gap-3" role="alert">{registryError}<button type="button" class="rounded-md border border-[#303040] px-3 py-2" on:click={initializeModules}>Retry</button></main>
   {:else}
     <main class="flex flex-1 items-center justify-center text-gray-400" role="status">Opening Keivotos…</main>
   {/if}
 </div>
+
+<NotificationOverlay {openDownloads} blocked={$settingsOpen} />
 
 {#if $settingsOpen && settingsModule}
   <svelte:component this={settingsModule.default} initialSection={$settingsInitialSection} on:close={() => settingsOpen.set(false)} />

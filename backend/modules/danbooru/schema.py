@@ -4,6 +4,20 @@ from __future__ import annotations
 import sqlite3
 
 
+INGEST_SCHEMA = """CREATE TABLE IF NOT EXISTS ingest_state (
+    media_path TEXT PRIMARY KEY,
+    root_id TEXT,
+    relative_path TEXT,
+    phase TEXT NOT NULL DEFAULT 'discovered',
+    status TEXT NOT NULL DEFAULT 'pending',
+    error TEXT,
+    discovered_at TEXT,
+    enriched_at TEXT,
+    metadata_at TEXT,
+    finalized_at TEXT
+);
+"""
+
 DATA_SCHEMA = """
 PRAGMA foreign_keys = ON;
 
@@ -68,19 +82,7 @@ CREATE TABLE IF NOT EXISTS sync_manifest (
     synced_at TEXT
 );
 
-CREATE TABLE IF NOT EXISTS ingest_state (
-    media_path TEXT PRIMARY KEY,
-    root_id TEXT,
-    relative_path TEXT,
-    phase TEXT NOT NULL DEFAULT 'discovered',
-    status TEXT NOT NULL DEFAULT 'pending',
-    error TEXT,
-    discovered_at TEXT,
-    enriched_at TEXT,
-    metadata_at TEXT,
-    finalized_at TEXT
-);
-"""
+""" + INGEST_SCHEMA
 
 
 DATA_INDEXES = """
@@ -119,6 +121,13 @@ def _ensure_column(connection: sqlite3.Connection, table: str, name: str, defini
 
 def ensure_data_schema(connection: sqlite3.Connection, create_indexes: bool = True) -> None:
     """Create and additively migrate the disposable library index."""
+    from services.catalog_index import is_combined
+    if is_combined(connection):
+        from services.catalog_index import ensure_owner
+        from modules.danbooru.catalog_index import index_owner
+        ensure_owner(connection, index_owner())
+        ensure_catalog_index_schema(connection, create_indexes=create_indexes)
+        return
     connection.executescript(DATA_SCHEMA)
     _ensure_column(connection, "files", "downloaded_at", "TEXT")
     _ensure_column(connection, "files", "root_id", "TEXT")
@@ -131,4 +140,19 @@ def ensure_data_schema(connection: sqlite3.Connection, create_indexes: bool = Tr
 
 
 def create_data_indexes(connection: sqlite3.Connection) -> None:
-    connection.executescript(DATA_INDEXES)
+    from services.catalog_index import is_combined
+    sql = DATA_INDEXES
+    if is_combined(connection):
+        sql = sql[:sql.index('CREATE INDEX IF NOT EXISTS idx_ingest_state_phase')]
+    connection.executescript(sql)
+
+
+def ensure_catalog_index_schema(connection, create_indexes=True):
+    """Only this owner's derived tables; operational ingest stays in jobs."""
+    connection.executescript(DATA_SCHEMA.removesuffix(INGEST_SCHEMA))
+    for name, definition in (('downloaded_at', 'TEXT'), ('root_id', 'TEXT'), ('relative_path', 'TEXT')):
+        _ensure_column(connection, 'files', name, definition)
+    for name, definition in (('parent_id', 'INTEGER'), ('has_children', 'INTEGER'), ('child_ids_json', 'TEXT')):
+        _ensure_column(connection, 'posts', name, definition)
+    if create_indexes:
+        connection.executescript(DATA_INDEXES[:DATA_INDEXES.index('CREATE INDEX IF NOT EXISTS idx_ingest_state_phase')])

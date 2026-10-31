@@ -44,7 +44,7 @@ print(json.dumps({"module": config.DANBOORU_MODULE, "base": str(config.BASE_HOME
                                     env={**os.environ, "KEIVOTOS_HOME":temp, "PYTHONPATH":str(ROOT/"backend")},
                                     capture_output=True, text=True)
             self.assertEqual(json.loads(result.stdout), {"module":None, "base":str(Path(temp).resolve()/"base"),
-                                                        "user":str(Path(temp)/"user.sqlite"), "backups":str(Path(temp)/"backups")})
+                                                        "user":str(Path(temp)/"keivotos.sqlite"), "backups":str(Path(temp)/"backups")})
             self.assertFalse((Path(temp)/"modules/danbooru").exists())
 
     def test_watcher_settings_preserve_coercion_and_bounds(self):

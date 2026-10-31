@@ -12,11 +12,22 @@ from pydantic import BaseModel, ConfigDict
 
 import suite_modules
 from database import get_user_db, init_data_db, init_user_db
-from services import folder_roles
+from services import folder_roles, release_metadata
 from maintenance import module_transition
 import lifecycle
 
 router = APIRouter()
+
+
+class ReleasePublication(BaseModel):
+    version: str
+    tag_name: str
+    published_at: str | None = None
+
+
+@router.get("/api/suite/release", response_model=ReleasePublication)
+def installed_release() -> ReleasePublication:
+    return ReleasePublication(**release_metadata.installed_release())
 
 
 class SuiteModule(BaseModel):

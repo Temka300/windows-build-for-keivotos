@@ -12,11 +12,11 @@ import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.error
 import urllib.request
-import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "backend"))
@@ -85,10 +85,38 @@ def smoke(stage: Path, home: Path) -> None:
 
 
 def archive(stage: Path, destination: Path) -> None:
-    # ZipInfo.from_file preserves Unix execute bits for unzip on Linux.
-    with zipfile.ZipFile(destination, "x", zipfile.ZIP_DEFLATED) as output:
-        for item in sorted(stage.rglob("*")):
-            output.write(item, Path(stage.name) / item.relative_to(stage))
+    if not destination.name.endswith('.tar.gz'):
+        raise ValueError('Linux portable archives must use .tar.gz')
+    def neutral_owner(item):
+        item.uid = item.gid = 0
+        item.uname = item.gname = ''
+        return item
+    with tarfile.open(destination, 'x:gz') as output:
+        output.add(stage, arcname=stage.name, filter=neutral_owner)
+
+
+def install_launchers(source: Path, stage: Path) -> None:
+    for name in ('start-keivotos.sh', 'start-portable.sh', 'install-desktop.sh', 'Keivotos.desktop.in'):
+        target = stage / name
+        shutil.copy2(source / 'packaging/linux' / name, target)
+        target.chmod(0o755 if name.endswith('.sh') else 0o644)
+    tools = [tool.name for tool in delivery_plan('linux').tools]
+    if any(not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', name) for name in tools):
+        raise RuntimeError('Unsupported Linux tool filename')
+    (stage / 'linux-tools.txt').write_text(''.join(name + '\n' for name in tools), encoding='utf-8')
+    (stage / 'LINUX-START-HERE.txt').write_text(
+        'Extract the entire application folder to a location your Linux user owns.\n'
+        'Normal launch: sh ./start-keivotos.sh\n'
+        'Portable launch (adjacent data/): sh ./start-portable.sh\n'
+        'Check execution and data permissions: sh ./start-portable.sh --launcher-check\n'
+        'Keep the terminal open while using the app; Ctrl+C stops it.\n'
+        'Your browser opens when the server is ready. --no-browser disables opening it.\n'
+        'Default address: http://localhost:52325/\n'
+        'KEIVOTOS_HOME and existing portable.txt settings keep their precedence.\n'
+        'Do not delete or replace an existing data/ folder when updating the app.\n'
+        'Optional menu shortcut: sh ./install-desktop.sh [--portable]\n'
+        'No Python, Node, uv, sudo or system-package installation is needed to run this build.\n'
+        'See docs/user/installation.md and troubleshooting.md for host requirements.\n', encoding='utf-8')
 
 
 def windows_tools() -> tuple[str, str]:
@@ -158,9 +186,9 @@ def main(argv=None) -> int:
             parser.error(f"Use Linux {tool}, not the Windows installation")
     name = f"Keivotos-V{version}-linux-x64"
     output.mkdir(parents=True, exist_ok=True)
-    destination = output / f"{name}.zip"
-    checksum = output / f"{name}.zip.sha256"
-    if destination.exists() or checksum.exists():
+    destination = output / f"{name}.tar.gz"
+    checksum = destination.with_name(destination.name + '.sha256')
+    if any(path.exists() for path in (destination, checksum)):
         parser.error("Artifact already exists; choose another --output-directory")
     with tempfile.TemporaryDirectory(prefix="keivotos-linux-build-") as temporary:
         work = Path(temporary)
@@ -199,14 +227,12 @@ def main(argv=None) -> int:
         result = subprocess.run([str(stage / "ffmpeg"), "-L"], check=True, capture_output=True, text=True)
         (ffmpeg_licenses / "LICENSE.txt").write_text(result.stdout + result.stderr)
         shutil.copy2(source / "packaging/linux/FFMPEG_SOURCE.md", ffmpeg_licenses)
+        install_launchers(source, stage)
         smoke(stage, work / "smoke-home")
         archive(stage, destination)
-        with destination.open("rb") as stream:
-            hasher = hashlib.sha256()
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                hasher.update(chunk)
-            digest = hasher.hexdigest()
-        checksum.write_text(f"{digest}  {destination.name}\n")
+        with destination.open('rb') as stream:
+            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        checksum.write_text(f'{digest}  {destination.name}\n')
     print(f"Portable archive: {destination}")
     if args.target == "both":
         build_windows(version, output, native_tools)

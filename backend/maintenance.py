@@ -13,6 +13,7 @@ _tool_operation_lock = threading.RLock()
 _active_tool_id: str | None = None
 _module_transition = False
 _module_operations = 0
+_storage_owner: int | None = None
 
 
 def active_tool_id() -> str | None:
@@ -27,6 +28,8 @@ def exclusive_tool_operation(operation_name: str, *, wait: bool = True):
     if not _tool_operation_lock.acquire(blocking=wait):
         raise RuntimeError("Another maintenance operation is running")
     try:
+        if _storage_owner not in (None,threading.get_ident()):
+            raise RuntimeError("Storage recovery is running")
         if _module_transition:
             raise RuntimeError("Wait for the module transition to finish")
         with _tool_state_lock:
@@ -44,6 +47,8 @@ def module_transition():
     if not _tool_operation_lock.acquire(blocking=False):
         raise RuntimeError("Wait for maintenance to finish before changing modules")
     try:
+        if _storage_owner not in (None,threading.get_ident()):
+            raise RuntimeError("Storage recovery is running")
         if _module_transition:
             raise RuntimeError("Wait for the module transition to finish")
         if _module_operations:
@@ -66,6 +71,8 @@ def module_operation():
     """Keep a live transition from racing an admitted module request."""
     global _module_operations
     with _tool_operation_lock:
+        if _storage_owner not in (None,threading.get_ident()):
+            raise RuntimeError("Storage recovery is running")
         if _module_transition:
             raise RuntimeError("Wait for the module transition to finish")
         _module_operations += 1
@@ -74,3 +81,17 @@ def module_operation():
     finally:
         with _tool_operation_lock:
             _module_operations -= 1
+
+
+@contextmanager
+def storage_operation():
+    global _storage_owner
+    with _tool_operation_lock:
+        if _module_transition or _module_operations or _storage_owner is not None:
+            raise RuntimeError('Wait for module operations to finish before restoring')
+        with _tool_state_lock:
+            if _active_tool_id:raise RuntimeError('Wait for the active tool before restoring')
+        _storage_owner=threading.get_ident()
+    try:yield
+    finally:
+        with _tool_operation_lock:_storage_owner=None

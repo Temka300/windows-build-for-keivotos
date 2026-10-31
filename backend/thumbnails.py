@@ -126,7 +126,8 @@ def _video_frame(source_path: Path) -> Image.Image:
         "-ss", "0.1", "-i", str(source_path), "-frames:v", "1",
         "-f", "image2pipe", "-vcodec", "png", "-",
     ]
-    result = subprocess.run(command, capture_output=True, timeout=30, check=True)
+    from services.tool_diagnostics import run
+    result = run("thumbnails", command, binary_stdout=True, capture_output=True, timeout=30, check=True)
     if not result.stdout:
         raise RuntimeError("Video produced no thumbnail frame")
     image = Image.open(io.BytesIO(result.stdout))
@@ -223,7 +224,17 @@ def ensure_thumbnail(
                     img.thumbnail((max_size, max_size), Image.LANCZOS)
                     if img.mode != "RGB":
                         img = img.convert("RGB")
-                img.save(thumb_path, "WEBP", quality=WEBP_QUALITY, method=5)
+                # A cache hit must only see a complete image. Same-key readers
+                # can arrive before the writer releases its generation lock.
+                temporary = None
+                try:
+                    with tempfile.NamedTemporaryFile(dir=THUMB_DIR, prefix=".thumbnail-", delete=False) as stream:
+                        temporary = Path(stream.name)
+                        img.save(stream, "WEBP", quality=WEBP_QUALITY, method=5)
+                    temporary.replace(thumb_path)
+                finally:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
                 should_prune = False
                 with _prune_state_lock:
                     _writes_since_prune += 1
@@ -234,7 +245,9 @@ def ensure_thumbnail(
                     _schedule_thumbnail_prune()
                 return thumb_path
             except Exception as exc:  # noqa: BLE001 - failed previews degrade to placeholders.
-                logger.warning("Could not create thumbnail for %s: %s", src, exc)
+                logger.warning("Could not create thumbnail for %s: %s", src, exc,
+                               extra={"event_code":"thumbnail.failed","event_details":{"error_type":type(exc).__name__}},
+                               exc_info=None if isinstance(exc,(OSError,ValueError,subprocess.CalledProcessError)) else (type(exc),exc,exc.__traceback__))
                 return None
 
 

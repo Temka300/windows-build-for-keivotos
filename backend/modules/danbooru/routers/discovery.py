@@ -34,6 +34,7 @@ from modules.danbooru.home import (
     HOME_IMAGE_RAIL_CATEGORIES,
     HOME_TAGS_CACHE,
     HOME_TAG_CATEGORIES,
+    home_cache_key,
     home_cache_get,
     home_cache_set,
     home_cover_rows_for_tags,
@@ -120,7 +121,7 @@ def home_tags(
     featured_limit: int = Query(18, ge=1, le=40),
     group_limit: int = Query(24, ge=5, le=80),
 ):
-    cache_key = ("home-tags", rating or "", featured_limit, group_limit)
+    cache_key = home_cache_key("home-tags", rating or "", featured_limit, group_limit)
     cached = home_cache_get(HOME_TAGS_CACHE, cache_key)
     if cached is not None:
         return cached
@@ -185,7 +186,7 @@ def home_image_rails(
     rating: str | None = Query(None, pattern=RATING_QUERY_PATTERN),
     per_rail: int = Query(24, ge=8, le=60),
 ):
-    cache_key = ("home-image-rails", rating or "", per_rail)
+    cache_key = home_cache_key("home-image-rails", rating or "", per_rail)
     cached = home_cache_get(HOME_IMAGE_RAILS_CACHE, cache_key)
     if cached is not None:
         return cached

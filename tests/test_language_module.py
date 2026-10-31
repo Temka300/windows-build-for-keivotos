@@ -39,6 +39,7 @@ def local(tmp_path, monkeypatch):
     monkeypatch.setattr(router, "get_user_db", connect)
     monkeypatch.setattr(router, "_enabled", lambda: None)
     monkeypatch.setattr(router.config, "SUITE_HOME", home)
+    monkeypatch.setattr(router.config, "ASSETS_DIR", home / "assets")
     monkeypatch.setattr(router.config, "FILES_DB_PATH", db)
     monkeypatch.setattr(router.config, "MODULE_REGISTRY", build_registry(home, "test"))
     return source, media, home, db, connect
@@ -48,7 +49,7 @@ def test_descriptor_folder_role_and_history_owner(local):
     source, media, home, db, connect = local
     descriptor = router.config.MODULE_REGISTRY.require("language")
     assert descriptor.experimental and descriptor.disableable and descriptor.adopt_hook
-    assert descriptor.backup_components()[0].source == home / "modules/language/revisions"
+    assert descriptor.backup_components()[0].source == home / "assets/language/revisions"
     with connect() as connection:
         sources.update_source(connection, source.source_id, role="files")
     import database
@@ -85,7 +86,7 @@ def test_create_collision_rename_save_history_and_index(local, monkeypatch):
         name=renamed["name"], content="Second edit", revision=saved["revision"],
         session_id=session))
     assert (media / "My note.md").read_text(encoding="utf-8") == "Second edit"
-    history = list((home / "modules/language/revisions").rglob("*.md"))
+    history = list((home / "assets/language/revisions").rglob("*.md"))
     assert len(history) == 1 and history[0].read_bytes() == b""
     with index.open_index(db) as connection:
         rows = connection.execute("SELECT name, available, size FROM files_index WHERE source_id=?",
@@ -106,7 +107,7 @@ def test_external_edit_conflict_preserves_both_versions(local):
             session_id="b" * 32))
     assert conflict.value.status_code == 409
     assert (media / created["name"]).read_text() == "external edit"
-    assert not list((home / "modules/language").rglob("*.md"))
+    assert not list((home / "assets/language").rglob("*.md"))
 
 
 def test_revision_history_link_cannot_escape_suite_home(local, tmp_path):
@@ -114,7 +115,7 @@ def test_revision_history_link_cannot_escape_suite_home(local, tmp_path):
     created = router.create_document(router.CreateRequest(source_id=source.source_id))
     outside = tmp_path / "outside"
     outside.mkdir()
-    history_home = home / "modules/language"
+    history_home = home / "assets/language"
     history_home.mkdir(parents=True)
     (history_home / "revisions").symlink_to(outside, target_is_directory=True)
     with pytest.raises(HTTPException) as error:
@@ -167,7 +168,7 @@ def test_interrupted_revision_write_cannot_authorize_unpreserved_retry(local, mo
     previous = b"# Original\nEvery byte must survive.\n"
     note.write_bytes(previous)
     opened = router.read_document(source.source_id, note.name)
-    history_home = home / "modules/language"
+    history_home = home / "assets/language"
     original_open = Path.open
     original_temporary = documents.tempfile.NamedTemporaryFile
 
@@ -222,7 +223,7 @@ def test_process_exit_during_revision_write_keeps_original_and_safe_retry(local)
     previous = b"# Original before process exit\n"
     note.write_bytes(previous)
     opened = router.read_document(source.source_id, note.name)
-    history_home = home / "modules/language"
+    history_home = home / "assets/language"
     code = """
 import os, sys
 from pathlib import Path
@@ -256,7 +257,7 @@ def test_legacy_partial_history_is_preserved_but_never_trusted(local):
     previous = b"Complete original before a legacy failed write"
     note.write_bytes(previous)
     opened = router.read_document(source.source_id, note.name)
-    history_home = home / "modules/language"
+    history_home = home / "assets/language"
     identity = hashlib.sha256(f"{source.source_id}\0{note.name}".encode()).hexdigest()
     legacy = history_home / "revisions" / identity / f"{'a' * 32}.md"
     legacy.parent.mkdir(parents=True)
@@ -279,7 +280,7 @@ def test_revision_flush_failure_blocks_note_replacement_and_retry_is_safe(local,
     previous = b"Original before failed flush"
     note.write_bytes(previous)
     opened = router.read_document(source.source_id, note.name)
-    history_home = home / "modules/language"
+    history_home = home / "assets/language"
     payload = router.SaveRequest(source_id=source.source_id, name=note.name,
         content="After flush recovery", revision=opened["revision"], session_id="f" * 32)
     def failed_flush(fd):
@@ -302,7 +303,7 @@ def test_revision_publication_failure_keeps_original_without_unsafe_fallback(loc
     previous = b"Original before unavailable atomic publication"
     note.write_bytes(previous)
     opened = router.read_document(source.source_id, note.name)
-    history_home = home / "modules/language"
+    history_home = home / "assets/language"
     def denied(*args):
         raise OSError(errno.EPERM, "injected unavailable atomic publication")
     with monkeypatch.context() as fault:
@@ -324,7 +325,7 @@ def test_invalid_complete_revision_targets_preserve_every_file(local, tmp_path, 
     previous = b"Original note that must remain"
     note.write_bytes(previous)
     opened = router.read_document(source.source_id, note.name)
-    history_home = home / "modules/language"
+    history_home = home / "assets/language"
     identity = hashlib.sha256(f"{source.source_id}\0{note.name}".encode()).hexdigest()
     history = history_home / "revisions" / identity / "complete" / f"{'c' * 32}.md"
     outside = tmp_path / "unrelated"
@@ -355,7 +356,7 @@ def test_concurrent_complete_revision_publication_never_overwrites_winner(local,
     previous = b"Current note bytes"
     note.write_bytes(previous)
     opened = router.read_document(source.source_id, note.name)
-    history_home = home / "modules/language"
+    history_home = home / "assets/language"
     original_link, original_rename = documents.os.link, Path.rename
     winner = b"First completed session snapshot"
     def competing_link(candidate, target):
@@ -373,3 +374,239 @@ def test_concurrent_complete_revision_publication_never_overwrites_winner(local,
     assert len(histories) == 1 and histories[0].read_bytes() == winner
     assert saved["content"] == note.read_text() == "Next edit"
     assert not list(history_home.rglob("*.tmp"))
+
+
+# Exercise the real ASGI response, without adding a TestClient dependency.
+def language_http(monkeypatch, method, path, payload, enabled=True):
+    import asyncio
+    import json
+    from fastapi import FastAPI
+    if enabled:
+        monkeypatch.setattr(router, "require_enabled", lambda slug: None)
+    app = FastAPI()
+    app.include_router(router.router)
+
+    async def request():
+        messages = []
+        async def receive():
+            return {"type": "http.request", "body": json.dumps(payload).encode(), "more_body": False}
+        async def send(message):
+            messages.append(message)
+        try:
+            await app({"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+                       "method": method, "scheme": "http", "path": path, "raw_path": path.encode(),
+                       "root_path": "", "query_string": b"", "headers": [(b"content-type", b"application/json")],
+                       "client": ("127.0.0.1", 1), "server": ("127.0.0.1", 80)}, receive, send)
+        except Exception:
+            if not any(m.get("status") == 500 for m in messages):
+                raise
+        status = next(m["status"] for m in messages if m["type"] == "http.response.start")
+        body = b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
+        return status, json.loads(body) if status != 500 else body.decode()
+    return asyncio.run(request())
+
+
+@pytest.fixture
+def study_local(tmp_path, monkeypatch):
+    from contextlib import closing
+    path = tmp_path / 'personal.sqlite'
+    @contextmanager
+    def connect():
+        with closing(sqlite3.connect(path, timeout=0.02)) as connection:
+            connection.row_factory = sqlite3.Row
+            yield connection
+    with connect() as connection:
+        connection.execute('CREATE TABLE precious(value TEXT)')
+        connection.execute("INSERT INTO precious VALUES ('retained personal data')")
+        connection.commit()
+        language.descriptor(tmp_path, 'test').publish(connection)
+    monkeypatch.setattr(router, 'get_user_db', connect)
+    return path, connect
+
+
+def test_practice_defaults_do_not_write_and_settings_survive_process_restart(study_local, monkeypatch):
+    import json
+    path, connect = study_local
+    status, defaults = language_http(monkeypatch, 'GET', '/api/language/study/preferences', None)
+    assert status == 200 and defaults == {'category':'sino','answer_language':'english','minimum':1,'maximum':99}
+    with connect() as connection:
+        assert connection.execute('SELECT COUNT(*) FROM language_study_preferences').fetchone()[0] == 0
+        assert connection.execute('SELECT COUNT(*) FROM language_study_preferences_v2').fetchone()[0] == 0
+    choice = {'category':'minutes','answer_language':'korean','minimum':16,'maximum':59}
+    assert language_http(monkeypatch, 'PUT', '/api/language/study/preferences', choice) == (200, choice)
+    code = '''import json,sqlite3,sys
+from contextlib import closing
+sys.path.insert(0,sys.argv[2])
+from modules.language import study
+with closing(sqlite3.connect(sys.argv[1])) as connection:
+ connection.row_factory=sqlite3.Row
+ print(json.dumps(study.read(connection).model_dump()))
+'''
+    result = subprocess.run([sys.executable,'-c',code,str(path),str(Path(__file__).resolve().parents[1]/'backend')],
+                            capture_output=True,text=True,check=True)
+    assert json.loads(result.stdout) == choice
+    with connect() as connection:
+        language.descriptor(path.parent, 'test').publish(connection)
+        assert dict(connection.execute('SELECT * FROM language_study_preferences_v2').fetchone()) == {'id':1,**choice}
+        assert connection.execute('SELECT COUNT(*) FROM language_study_preferences').fetchone()[0] == 0
+        assert connection.execute('SELECT value FROM precious').fetchone()[0] == 'retained personal data'
+
+
+@pytest.mark.parametrize('category,maximum', [('sino',99),('native',20),('months',12),('dates',31),('hours',12),('minutes',59),
+                                            ('month_date',365),('hour_minute',720),('date_time',262800)])
+def test_practice_category_ranges_and_payload_bounds(study_local, monkeypatch, category, maximum):
+    path, connect = study_local
+    choice = {'category':category,'answer_language':'english','minimum':1,'maximum':maximum}
+    assert language_http(monkeypatch,'PUT','/api/language/study/preferences',choice) == (200,choice)
+    for change in ({'maximum':maximum+1},{'minimum':0},{'minimum':maximum+1},{'minimum':1.5},
+                   {'minimum':True},{'answer_language':'romanized'},{'category':'other'},{'answer':'personal typed answer'}):
+        assert language_http(monkeypatch,'PUT','/api/language/study/preferences',{**choice,**change})[0] == 422
+    assert language_http(monkeypatch,'GET','/api/language/study/preferences',None) == (200,choice)
+
+
+def test_practice_upgrade_preserves_legacy_choices_and_repeated_publish(study_local, monkeypatch):
+    from modules.language import study
+    path, connect = study_local
+    legacy = {'category':'native','answer_language':'korean','minimum':17,'maximum':20}
+    with connect() as connection:
+        connection.execute('INSERT INTO language_study_preferences VALUES (1,?,?,?,?)', tuple(legacy.values()))
+        connection.commit()
+        original_schema = connection.execute("SELECT sql FROM sqlite_master WHERE name='language_study_preferences'").fetchone()[0]
+        for _ in range(2):language.descriptor(path.parent,'test').publish(connection)
+        assert connection.execute("SELECT sql FROM sqlite_master WHERE name='language_study_preferences'").fetchone()[0] == original_schema
+        assert study.read(connection).model_dump() == legacy
+        assert connection.execute('SELECT COUNT(*) FROM language_study_preferences_v2').fetchone()[0] == 0
+    choice = {'category':'date_time','answer_language':'english','minimum':1,'maximum':262800}
+    assert language_http(monkeypatch,'PUT','/api/language/study/preferences',choice) == (200,choice)
+    for selected in (choice, {'category':'months','answer_language':'korean','minimum':6,'maximum':10}):
+        assert language_http(monkeypatch,'PUT','/api/language/study/preferences',selected) == (200,selected)
+        with connect() as connection:
+            language.descriptor(path.parent,'test').publish(connection)
+            assert study.read(connection).model_dump() == selected
+            assert dict(connection.execute('SELECT * FROM language_study_preferences').fetchone()) == {'id':1,**legacy}
+            assert connection.execute('SELECT value FROM precious').fetchone()[0] == 'retained personal data'
+
+
+@pytest.mark.parametrize('failure', ['locked','corrupt','unavailable'])
+@pytest.mark.parametrize('compound', [False,True])
+def test_practice_storage_failure_preserves_choices_and_recovers(study_local, monkeypatch, failure, compound):
+    from contextlib import closing
+    path, connect = study_local
+    choice = {'category':'date_time' if compound else 'native','answer_language':'korean','minimum':1,'maximum':262800 if compound else 20}
+    assert language_http(monkeypatch,'PUT','/api/language/study/preferences',choice)[0] == 200
+    original = path.read_bytes()
+    if failure == 'locked':
+        blocker = sqlite3.connect(path);blocker.execute('BEGIN IMMEDIATE')
+        try:
+            assert language_http(monkeypatch,'PUT','/api/language/study/preferences',{**choice,'maximum':10})[0] == 503
+        finally:
+            blocker.rollback();blocker.close()
+    else:
+        broken = path.parent / 'broken.sqlite'
+        if failure == 'corrupt':broken.write_bytes(b'generated corrupt scratch database')
+        else:broken.mkdir()
+        @contextmanager
+        def broken_connect():
+            with closing(sqlite3.connect(broken)) as connection:yield connection
+        with monkeypatch.context() as m:
+            m.setattr(router,'get_user_db',broken_connect)
+            assert language_http(m,'GET','/api/language/study/preferences',None)[0] == 503
+            assert language_http(m,'PUT','/api/language/study/preferences',{**choice,'maximum':10})[0] == 503
+        assert path.read_bytes() == original
+    assert language_http(monkeypatch,'GET','/api/language/study/preferences',None) == (200,choice)
+    assert language_http(monkeypatch,'PUT','/api/language/study/preferences',{**choice,'maximum':10})[0] == 200
+    with connect() as connection:
+        assert connection.execute('SELECT value FROM precious').fetchone()[0] == 'retained personal data'
+
+
+def test_practice_disabled_owner_rejects_before_database_access(study_local, monkeypatch):
+    path, connect = study_local
+    def disabled(slug):raise RuntimeError('Language is disabled')
+    monkeypatch.setattr(router,'require_enabled',disabled)
+    monkeypatch.setattr(router,'get_user_db',lambda:pytest.fail('disabled request opened user database'))
+    for method,body in [('GET',None),('PUT',{'category':'sino','answer_language':'english','minimum':1,'maximum':99})]:
+        assert language_http(monkeypatch,method,'/api/language/study/preferences',body,enabled=False)[0] == 409
+    with connect() as connection:
+        assert connection.execute('SELECT value FROM precious').fetchone()[0] == 'retained personal data'
+
+
+@pytest.mark.parametrize("operation", ["save", "create", "rename"])
+def test_committed_mutation_acknowledged_under_real_index_lock(local, monkeypatch, operation):
+    source, media, home, db, connect = local
+    original = b"# Original before index contention\n"
+    (media / "Original.md").write_bytes(original)
+    opened = router.read_document(source.source_id, "Original.md")
+    documents.refresh_index(source, db, "Original.md")
+    payload = {"source_id": source.source_id}
+    if operation == "save":
+        method, path = "PUT", "/api/language/document"
+        payload.update(name="Original.md", content="Saved during index contention", revision=opened["revision"], session_id="f" * 32)
+    elif operation == "rename":
+        method, path = "POST", "/api/language/document/rename"
+        payload.update(name="Original.md", new_name="Renamed.md", revision=opened["revision"])
+    else:
+        method, path = "POST", "/api/language/documents"
+    lock = sqlite3.connect(db)
+    lock.execute("BEGIN IMMEDIATE")
+    try:
+        status, result = language_http(monkeypatch, method, path, payload)
+    finally:
+        lock.rollback()
+        lock.close()
+    assert status == 200, result
+    assert result["index_refresh"]["status"] == "failed"
+    assert (media / result["name"]).read_text() == result["content"]
+    assert hashlib.sha256((media / result["name"]).read_bytes()).hexdigest() == result["revision"]
+    if operation == "save":
+        assert [p.read_bytes() for p in (home / "assets/language/revisions").rglob("*.md")] == [original]
+    repaired_status, repaired = language_http(monkeypatch, "POST", "/api/language/document/index", {
+        "source_id": source.source_id, "name": result["name"],
+        "previous_names": ["Original.md"] if operation == "rename" else []})
+    assert repaired_status == 200 and repaired["status"] == "complete"
+    with index.open_index(db) as connection:
+        row = connection.execute("SELECT size,available FROM files_index WHERE source_id=? AND name=?", (source.source_id, result["name"])).fetchone()
+        assert row["available"] and row["size"] == len(result["content"].encode())
+        if operation == "rename":
+            assert not connection.execute("SELECT available FROM files_index WHERE name='Original.md'").fetchone()[0]
+    second = router.save_document(router.SaveRequest(source_id=source.source_id, name=result["name"],
+        content="Another edit after repair", revision=result["revision"], session_id="f" * 32))
+    assert second["content"] == (media / result["name"]).read_text()
+
+
+@pytest.mark.parametrize("failure", ["corrupt", "directory"])
+def test_index_failure_keeps_original_acknowledgement(local, failure):
+    source, media, home, db, connect = local
+    if failure == "corrupt":
+        db.write_bytes(b"preserve this invalid index")
+    else:
+        db.mkdir()
+    created = router.create_document(router.CreateRequest(source_id=source.source_id))
+    assert created["index_refresh"]["status"] == "failed"
+    assert (media / created["name"]).read_bytes() == b""
+    saved = router.save_document(router.SaveRequest(source_id=source.source_id, name=created["name"],
+        content="Original persists", revision=created["revision"], session_id="e" * 32))
+    assert saved["index_refresh"]["status"] == "failed"
+    assert (media / saved["name"]).read_text() == "Original persists"
+    if failure == "corrupt":
+        assert db.read_bytes() == b"preserve this invalid index"
+
+
+def test_index_retry_checks_fresh_original_and_preserves_recreated_name(local, monkeypatch):
+    source, media, home, db, connect = local
+    (media / "Current.md").write_text("current")
+    (media / "Old.md").write_text("recreated externally")
+    status, result = language_http(monkeypatch, "POST", "/api/language/document/index", {
+        "source_id": source.source_id, "name": "Current.md", "previous_names": ["Old.md"]})
+    assert status == 200 and result["status"] == "complete"
+    with index.open_index(db) as connection:
+        assert connection.execute("SELECT available FROM files_index WHERE name='Old.md'").fetchone()[0]
+    for name, previous_names, expected in [("Missing.md", [], 404), ("Current.md", ["../outside.md"], 400)]:
+        status, _ = language_http(monkeypatch, "POST", "/api/language/document/index", {
+            "source_id": source.source_id, "name": name, "previous_names": previous_names})
+        assert status == expected
+    with connect() as connection:
+        sources.update_source(connection, source.source_id, visible=False)
+    assert language_http(monkeypatch, "POST", "/api/language/document/index", {
+        "source_id": source.source_id, "name": "Current.md"})[0] == 404
+    assert (media / "Current.md").read_text() == "current"
+    assert (media / "Old.md").read_text() == "recreated externally"

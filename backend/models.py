@@ -38,3 +38,19 @@ class BackupRestoreRequest(BaseModel):
 
 class ThumbnailCacheLimitUpdate(BaseModel):
     limit_gb: int = Field(ge=1, le=100)
+
+
+class CollectionExportRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    source_ids: list[str] = Field(min_length=1,max_length=64)
+    destination: str = Field(default='',max_length=4096)
+    include_personal: StrictBool = False
+    request_id: str = Field(default='',max_length=64)
+
+
+class CollectionImportRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    directory: str = Field(min_length=1,max_length=4096)
+    destination: str = Field(min_length=1,max_length=4096)
+    include_personal: StrictBool = False
+    request_id: str = Field(default='',max_length=64)

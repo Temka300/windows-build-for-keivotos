@@ -1,5 +1,6 @@
 <script lang="ts">
   import SettingsSwitch from './SettingsSwitch.svelte';
+  import CollectionTransferSettings from './CollectionTransferSettings.svelte';
   import { settingsError } from '../lib/http';
   import { getContext, onMount, tick } from 'svelte';
   import { suiteDataApi as api } from '../lib/suiteDataApi';
@@ -334,6 +335,7 @@
     {/each}
   </section>
   <section id="setting-restore" class="backup-card backup-heading"><div><h3>Restore</h3></div><button class="backup-button" disabled={blocked} on:click={openRestore}>Restore now</button></section>
+  <CollectionTransferSettings toolRunning={blocked}/>
   <div class="backup-footer"><span>Estimated compressed size: {estimate?.estimated_compressed_display ?? 'Calculating…'}</span></div>
   {#if backupMessage}<p aria-live="polite" class="backup-notice success">{backupMessage}</p>{/if}
   {#if backupError}<p role="alert" class="backup-notice error">{backupError}</p>{/if}
@@ -355,6 +357,7 @@
           <div class="restore-summary"><h4>{SUITE_NAME} backup</h4><p class="backup-hint">{new Date(inspected.created_at).toLocaleString()} · {configuration?.backups.find(backup => backup.name === selectedBackup)?.display_size}</p><div class="restore-included"><p class="backup-hint">Included</p>{#each includedLabels as label}<p>✓ {label}</p>{/each}</div></div>
           {#if inspected.components.user_database}<p class="backup-hint">Replaces user data for Files and every module together.</p>{/if}
           {#if inspected.omitted_components?.length}<p class="backup-hint">Not included: {inspected.omitted_components.map(componentLabel).join(', ')}</p>{/if}
+          <p class="backup-hint">This restore includes {includedLabels.length} data components.</p>
           <p class="backup-hint">A recovery copy of your current data will be preserved. Original media and browser preferences stay unchanged.</p>
         {/if}
         {#if error}<p role="alert" class="backup-notice error">{error}</p>{/if}
